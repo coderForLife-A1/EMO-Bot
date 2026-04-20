@@ -10,8 +10,8 @@ import wave
 from pathlib import Path
 from typing import Optional
 
-import pyaudio
 import pvporcupine
+import sounddevice as sd
 import requests
 
 
@@ -160,7 +160,6 @@ def synthesize_with_elevenlabs(text: str) -> Optional[str]:
 
 def wakeword_listener(stop_event: threading.Event, wake_queue: "queue.Queue[bool]") -> None:
     porcupine = None
-    pa = None
     audio_stream = None
     try:
         if not PORCUPINE_ACCESS_KEY:
@@ -177,17 +176,16 @@ def wakeword_listener(stop_event: threading.Event, wake_queue: "queue.Queue[bool
                 keywords=["porcupine"],
             )
 
-        pa = pyaudio.PyAudio()
-        audio_stream = pa.open(
-            rate=porcupine.sample_rate,
+        audio_stream = sd.RawInputStream(
+            samplerate=porcupine.sample_rate,
             channels=1,
-            format=pyaudio.paInt16,
-            input=True,
-            frames_per_buffer=porcupine.frame_length,
+            dtype="int16",
+            blocksize=porcupine.frame_length,
         )
+        audio_stream.start()
 
         while not stop_event.is_set():
-            pcm = audio_stream.read(porcupine.frame_length, exception_on_overflow=False)
+            pcm, _overflowed = audio_stream.read(porcupine.frame_length)
             pcm_unpacked = struct.unpack_from("h" * porcupine.frame_length, pcm)
             keyword_index = porcupine.process(pcm_unpacked)
             if keyword_index >= 0:
@@ -200,9 +198,8 @@ def wakeword_listener(stop_event: threading.Event, wake_queue: "queue.Queue[bool
         print(f"Wakeword listener error: {exc}")
     finally:
         if audio_stream is not None:
+            audio_stream.stop()
             audio_stream.close()
-        if pa is not None:
-            pa.terminate()
         if porcupine is not None:
             porcupine.delete()
 
