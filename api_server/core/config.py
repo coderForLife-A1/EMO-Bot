@@ -1,10 +1,12 @@
 from dataclasses import dataclass
+from pathlib import Path
 import os
 
 from dotenv import load_dotenv
 
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parents[2]
+load_dotenv(BASE_DIR / ".env")
 
 
 @dataclass(frozen=True)
@@ -19,6 +21,19 @@ class Settings:
     whisper_model: str = os.getenv("WHISPER_MODEL", "whisper-1")
     chat_model: str = os.getenv("CHAT_MODEL", "gpt-4o")
     api_timeout_seconds: float = float(os.getenv("API_TIMEOUT_SECONDS", "15"))
+
+    def missing_required_keys(self) -> list[str]:
+        missing: list[str] = []
+        if not self.openai_api_key:
+            missing.append("OPENAI_API_KEY")
+        if not self.elevenlabs_api_key:
+            missing.append("ELEVENLABS_API_KEY")
+        if not self.porcupine_access_key:
+            missing.append("PORCUPINE_ACCESS_KEY")
+        return missing
+
+    def is_ready(self) -> bool:
+        return not self.missing_required_keys()
 
 
 def get_settings() -> Settings:
