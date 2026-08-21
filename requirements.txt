@@ -4,3 +4,13 @@ httpx
 python-dotenv
 python-multipart
 pydantic
+pyserial
+paho-mqtt
+pvporcupine
+pyaudio
+openai
+elevenlabs
+opencv-python
+mediapipe
+py-trees
+python-dotenv
