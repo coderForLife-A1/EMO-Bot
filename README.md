@@ -209,6 +209,8 @@ The simplest option is a USB cable (`SERIAL_PORT=/dev/ttyUSB0`). To use the Pi's
 - Pi physical pin 8, GPIO14/TXD -> ESP32 GPIO16 (RX2).
 - ESP32 GPIO17 (TX2) -> Pi physical pin 10, GPIO15/RXD.
 - Pi physical pin 6 (`GND`) -> ESP32 `GND`.
+- The sketch passes GPIO16/17 to `Serial2.begin()` explicitly: arduino-esp32 core 3.x defaults `Serial2` to GPIO4/25.
+- ESP32-WROVER modules use GPIO16/17 for PSRAM: change `LINK_RX_PIN` / `LINK_TX_PIN` there.
 
 **Nano:**
 

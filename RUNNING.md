@@ -214,6 +214,8 @@ arduino-cli compile --fqbn esp32:esp32:esp32 firmware/emo_esp32
 arduino-cli upload  --fqbn esp32:esp32:esp32 -p /dev/ttyUSB0 firmware/emo_esp32
 ```
 
+- Verified: compiles with no warnings on `esp32:esp32` core 3.3.11 (about 24% flash, 7% RAM), USB and UART links.
+- Pi GPIO UART instead of USB: set `#define LINK_UART2 1` (Serial2 on GPIO16 RX / GPIO17 TX), `SERIAL_PORT=/dev/serial0`.
 - Upload fails with `Failed to connect to ESP32` / `Wrong boot mode`: hold **BOOT** while the upload starts.
 - The ESP32 prints ROM boot text before `READY`; the Pi skips it.
 - Some USB bridges don't reset the board when the port opens: the Pi logs `No READY ... continuing anyway` and carries on.
