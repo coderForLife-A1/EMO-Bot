@@ -25,9 +25,14 @@ def _env_float(name: str, default: float) -> float:
     return float(raw) if raw else default
 
 
-# MQTT broker (Mosquitto on the Pi)
+# MQTT broker (Mosquitto on the Pi). Anyone who can reach the broker can drive the robot, so keep it on
+# localhost, or use a login (password_file + ACLs in Mosquitto) and TLS for a broker on the network.
 MQTT_HOST = os.getenv("MQTT_HOST", "127.0.0.1")
-MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_TLS = _env_bool("MQTT_TLS", False)
+MQTT_PORT = int(os.getenv("MQTT_PORT", "").strip() or ("8883" if MQTT_TLS else "1883"))
+MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
+MQTT_CA_CERTS = os.getenv("MQTT_CA_CERTS", "")  # CA file for a self-signed broker certificate; empty = system CAs
 
 TOPIC_STATE = "robot/state"  # POSTURE_POOR / POSTURE_OK
 TOPIC_FACE_ERROR = "robot/vision/face_error"  # "<x_err>,<y_err>" in pixels

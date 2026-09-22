@@ -182,10 +182,95 @@ def test_estop_latches_once_and_restands_after_release(robot):
     assert audio == [bt.AUDIO_EMERGENCY_STOP]
     assert state.legs_standing is False
 
-    loco(state, "stop")
+    # #18: no "stop" here on purpose: the E-stop itself must have cancelled the 5 s walk
     bt.apply_topic_payload(state, config.TOPIC_ERROR, "clear")
     motor, _ = tick(tree, bus, 2)
     assert motor == ["R", "S"]
+    nano(state, "ACK,S")
+    motor, _ = tick(tree, bus, 5)
+    assert not any(m.startswith("W,50") for m in motor)  # does not walk off again after "clear"
+
+
+# ---------------------------------------------------------------- round 2 (#14, #15, #19, #20)
+
+def test_estop_survives_a_command_flood(robot):
+    """#14: a flood of tuning commands used to fill the motor queue so E was silently dropped."""
+    state, bus, tree = standing(robot)
+    for _ in range(1000):
+        loco(state, "gesture")
+        loco(state, "telemetry,1")
+    assert len(state.outbox) <= bt.OUTBOX_MAX  # the flood is capped, not buffered
+    for _ in range(bus.motor_queue.maxsize):  # and even with the motor queue completely full...
+        bus.put_motor("G,1")
+    bt.apply_topic_payload(state, config.TOPIC_ERROR, "error")
+    motor, _ = tick(tree, bus)
+    assert motor[0] == "E"  # ...E goes out first
+    assert "G,1" not in motor  # queued commands are discarded behind it
+
+
+def test_estop_latches_only_once_queued(robot):
+    state, bus, tree = standing(robot)
+    bus.put_urgent = lambda command: False  # simulate E failing to queue
+    bt.apply_topic_payload(state, config.TOPIC_ERROR, "error")
+    tick(tree, bus)
+    guard = tree.root.children[0]
+    assert isinstance(guard, bt.EStopGuard) and guard.latched is False  # retried next tick
+
+
+def test_stood_up_without_imu_is_relaxed_again(robot, monkeypatch):
+    """#15: after a retry the controller answered ACK,S,NOIMU and stood with no balance."""
+    monkeypatch.setattr(config, "ALLOW_NO_IMU", False)
+    state, bus, tree = robot
+    nano(state, "READY,NOIMU")
+    assert tick(tree, bus)[0] == ["O"]
+    loco(state, "stand")
+    assert tick(tree, bus)[0] == ["S"]  # one retry
+    nano(state, "ACK,S,NOIMU")  # IMU still absent: stood anyway
+    assert state.imu_fault is True
+    assert tick(tree, bus)[0] == ["O"]  # relaxed again
+
+
+def test_bench_mode_calibrate_without_imu_is_not_a_fault(robot, monkeypatch):
+    """#15: with ALLOW_NO_IMU=1, NACK,C,NOIMU (calibrate needs the IMU) must not lock the robot up."""
+    monkeypatch.setattr(config, "ALLOW_NO_IMU", True)
+    state, bus, tree = robot
+    nano(state, "READY,NOIMU")
+    nano(state, "NACK,C,NOIMU")
+    assert state.imu_fault is False
+    tick(tree, bus)
+    nano(state, "ACK,S,NOIMU")
+    assert state.imu_fault is False and state.legs_standing
+
+
+def test_flash_writes_are_rate_limited(robot):
+    """#19: every gains/calibrate rewrites the controller's flash; one per second at most."""
+    state, bus, tree = standing(robot)
+    for i in range(50):
+        loco(state, f"gains,0.{i + 10},3,0.03")
+    loco(state, "calibrate")
+    motor, _ = tick(tree, bus)
+    assert [m for m in motor if m.startswith(("K,", "C"))] == ["K,10,300,3"]
+    state.last_flash_write -= bt.FLASH_WRITE_MIN_S  # a second later
+    loco(state, "calibrate")
+    assert tick(tree, bus)[0][:2] == ["O", "C"]
+
+
+def test_oversized_mqtt_payloads_are_dropped_unread():
+    """#20: payloads over MAX_PAYLOAD_BYTES are dropped before decoding."""
+    from mqtt_client import MAX_PAYLOAD_BYTES
+
+    delivered = []
+    client = bt.build_mqtt_client(lambda t, p: delivered.append(p))
+    client.loop_stop()
+
+    class Msg:
+        topic = config.TOPIC_LOCOMOTION_CMD
+        payload = b"x" * (MAX_PAYLOAD_BYTES + 1)
+
+    client.on_message(client, None, Msg())
+    Msg.payload = b"stand"
+    client.on_message(client, None, Msg())
+    assert delivered == ["stand"]
 
 
 def test_estop_ignores_unknown_payloads():
@@ -342,3 +427,24 @@ def test_walking_resumes_after_posture_window(robot):
     state.posture_alert_ts -= bt.POSTURE_GESTURE_S + 0.1
     motor, _ = tick(tree, bus)
     assert motor == ["W,40,0"]
+
+
+def test_estop_discards_queued_tuning_commands(robot):
+    state, bus, tree = standing(robot)
+    for _ in range(5):
+        loco(state, "gesture")
+    bt.apply_topic_payload(state, config.TOPIC_ERROR, "error")
+    tick(tree, bus)
+    bt.apply_topic_payload(state, config.TOPIC_ERROR, "clear")
+    motor, _ = tick(tree, bus, 3)
+    assert "G,1" not in motor  # nothing stale fires after the emergency stop
+
+
+def test_command_flood_logs_once(robot, caplog):
+    import logging
+
+    state, _, _ = robot
+    with caplog.at_level(logging.WARNING, logger="behavior_tree_module"):
+        for _ in range(500):
+            loco(state, "gesture")
+    assert caplog.text.count("Too many queued tuning commands") == 1

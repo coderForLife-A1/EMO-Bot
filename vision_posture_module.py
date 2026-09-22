@@ -14,21 +14,16 @@ from dataclasses import dataclass
 from typing import Optional
 
 import cv2
-import paho.mqtt.client as mqtt
 
 import config
 
 logger = logging.getLogger(__name__)
 
-# Kept for backwards compatibility with older imports; the source of truth is config.
-TOPIC_STATE = config.TOPIC_STATE
-TOPIC_FACE_ERROR = config.TOPIC_FACE_ERROR
-
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 FRAME_FPS = 30
 
-POSE_EVERY_N_FRAMES = 2
+POSE_PERIOD_S = 0.2  # pose at ~5 Hz: posture timing (3 s confirm, 1 s clear) needs no more
 FACE_PUBLISH_MIN_INTERVAL_S = 0.03
 
 POSTURE_CONFIRM_S = 3.0  # continuous poor posture before an alert
@@ -62,13 +57,6 @@ class PostureMetrics:
     head_height: float
 
 
-def build_mqtt_client() -> mqtt.Client:
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="robot-vision-posture")
-    client.connect_async(config.MQTT_HOST, config.MQTT_PORT, keepalive=30)
-    client.loop_start()
-    return client
-
-
 class _Picamera2Capture:
     """cv2.VideoCapture-like wrapper around Picamera2 (Pi 5 CSI cameras go through libcamera)."""
 
@@ -86,6 +74,9 @@ class _Picamera2Capture:
 
     def read(self):
         return True, self._cam.capture_array()
+
+    def grab(self):
+        return True
 
     def release(self) -> None:
         self._cam.stop()
@@ -173,7 +164,11 @@ def posture_metrics(pose_landmarks) -> Optional[PostureMetrics]:
 
 def is_poor_posture(pose_landmarks, baseline_head_height: Optional[float] = None) -> Optional[bool]:
     """True/False for poor/good posture, None when the user isn't clearly visible."""
-    metrics = posture_metrics(pose_landmarks)
+    return judge_posture(posture_metrics(pose_landmarks), baseline_head_height)
+
+
+def judge_posture(metrics: Optional[PostureMetrics], baseline_head_height: Optional[float] = None) -> Optional[bool]:
+    """is_poor_posture() for metrics that were already computed."""
     if metrics is None:
         return None
 
@@ -271,6 +266,7 @@ class ResilientCamera:
     """Camera that survives unplugging: reopens after repeated read failures, with backoff.
 
     ``read()`` returns a frame or None (no frame right now; the caller just tries again).
+    ``grab()`` takes the next frame without decoding it (for frames nobody will look at).
     ``on_state("UP" | "DOWN")`` is called whenever frames start or stop arriving.
     """
 
@@ -302,6 +298,12 @@ class ResilientCamera:
         self._set_up(False)
 
     def read(self):
+        return self._fetch(decode=True)
+
+    def grab(self) -> bool:
+        return self._fetch(decode=False) is not None
+
+    def _fetch(self, decode: bool):
         now = time.monotonic()
         if self.cap is None:
             if now < self.next_open:
@@ -317,7 +319,10 @@ class ResilientCamera:
             self.failures = 0
 
         try:
-            ok, frame = self.cap.read()
+            if decode or not hasattr(self.cap, "grab"):
+                ok, frame = self.cap.read()
+            else:
+                ok, frame = self.cap.grab(), True
         except Exception:  # noqa: BLE001 - e.g. picamera2 raising when the ribbon comes loose
             ok, frame = False, None
         if ok:
@@ -370,12 +375,18 @@ class VisionPipeline:
         self.posture = PostureMonitor()
         self.baseline = HeadHeightBaseline()
         self.last_face_pub = 0.0
-        self.frame_idx = 0
+        self.last_pose = float("-inf")
+
+    def wants_frame(self, now: float) -> bool:
+        """False when process() would ignore this frame: grab it without decoding instead."""
+        return self.face_detector is not None or now - self.last_pose >= POSE_PERIOD_S
 
     def process(self, frame, now: float) -> list[tuple[str, str]]:
         messages: list[tuple[str, str]] = []
+        if not self.wants_frame(now):
+            return messages
         frame_h, frame_w = frame.shape[:2]
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # only for frames a detector will look at
 
         if self.face_detector is not None:
             face_result = self.face_detector.process(rgb)
@@ -386,18 +397,18 @@ class VisionPipeline:
                 messages.append((config.TOPIC_FACE_ERROR, f"{x_err},{y_err}"))
                 self.last_face_pub = now
 
-        if self.frame_idx % POSE_EVERY_N_FRAMES == 0:
+        if now - self.last_pose >= POSE_PERIOD_S:
+            self.last_pose = now
             pose_result = self.pose_detector.process(rgb)
-            metrics = posture_metrics(pose_result.pose_landmarks)
+            metrics = posture_metrics(pose_result.pose_landmarks)  # once per pose frame
             if metrics is not None:
                 self.baseline.add(metrics.head_height, now)
-            poor = is_poor_posture(pose_result.pose_landmarks, self.baseline.value)
+            poor = judge_posture(metrics, self.baseline.value)
             event = self.posture.update(poor, now)
             if event is not None:
                 logger.info("Posture %s (metrics=%s, baseline=%s)", event, metrics, self.baseline.value)
                 messages.append((config.TOPIC_STATE, event))
 
-        self.frame_idx += 1
         return messages
 
     def close(self) -> None:
@@ -406,28 +417,56 @@ class VisionPipeline:
         self.pose_detector.close()
 
 
-def run() -> None:
-    """Standalone mode: publish posture events (and face errors if enabled) straight to MQTT."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
-    mqtt_client = build_mqtt_client()
-    cap = ResilientCamera(on_state=lambda s: mqtt_client.publish(config.TOPIC_VISION_STATE, s, qos=1, retain=True))
-    pipeline = VisionPipeline()
-    print(f"Vision running on camera {config.CAMERA_SOURCE!r} (Ctrl+C to stop)")
+def run_vision(stop, publish, camera=None, pipeline=None) -> None:
+    """The camera loop shared by main.py and standalone mode.
 
+    Runs until ``stop.is_set()``. Every message goes to ``publish(topic, payload)``, including
+    robot/vision/state UP/DOWN when the camera starts or stops delivering frames. Frames the
+    pipeline doesn't need are grabbed without decoding.
+    """
+
+    def on_state(state: str) -> None:
+        (logger.info if state == "UP" else logger.warning)("Camera %r is %s", config.CAMERA_SOURCE, state)
+        publish(config.TOPIC_VISION_STATE, state)
+
+    pipeline = pipeline or VisionPipeline()
+    camera = camera or ResilientCamera(on_state=on_state)
     try:
-        while True:
-            frame = cap.read()
+        while not stop.is_set():
+            if not pipeline.wants_frame(time.monotonic()):
+                camera.grab()
+                continue
+            frame = camera.read()
             if frame is None:
                 continue
             for topic, payload in pipeline.process(frame, time.monotonic()):
-                mqtt_client.publish(topic, payload, qos=0, retain=False)
+                publish(topic, payload)
+    finally:
+        pipeline.close()
+        camera.release()
+
+
+def publish_options(topic: str) -> dict:
+    """UP/DOWN is retained so late subscribers still see the camera state."""
+    retained = topic == config.TOPIC_VISION_STATE
+    return {"qos": 1 if retained else 0, "retain": retained}
+
+
+def run() -> None:
+    """Standalone mode: publish posture events (and face errors if enabled) straight to MQTT."""
+    import threading
+
+    from mqtt_client import make_client, stop_client
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    mqtt_client = make_client("robot-vision-posture")
+    print(f"Vision running on camera {config.CAMERA_SOURCE!r} (Ctrl+C to stop)")
+    try:
+        run_vision(threading.Event(), lambda t, p: mqtt_client.publish(t, p, **publish_options(t)))
     except KeyboardInterrupt:
         pass
     finally:
-        pipeline.close()
-        cap.release()
-        mqtt_client.loop_stop()
-        mqtt_client.disconnect()
+        stop_client(mqtt_client)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ import paho.mqtt.client as mqtt
 import py_trees
 
 import config
+from mqtt_client import MAX_PAYLOAD_BYTES, make_client, stop_client
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,8 @@ WALK_MAX_S = 10.0  # a walk command never runs longer than this (desk robot: don
 POSTURE_GESTURE_S = 2.0  # how long the posture branch owns the robot after an alert
 STAND_RETRY_S = 1.0  # resend S if no ACK,S arrived within this time
 CONVERSATION_TIMEOUT_S = 30.0  # wake flag older than this is ignored (recording + API + playback)
+OUTBOX_MAX = 16  # queued tuning commands (gesture/telemetry/gains/calibrate); more are dropped
+FLASH_WRITE_MIN_S = 1.0  # gains and calibrate rewrite the controller's flash: at most one per second
 
 AUDIO_EMERGENCY_STOP = "AUDIO,EMERGENCY_STOP"
 AUDIO_POSTURE_WARNING = "AUDIO,POSTURE_WARNING"
@@ -64,7 +67,9 @@ class SharedState:
     walk_turn: int = 0  # -100..100
     walk_until: float = 0.0  # monotonic deadline of the current walk command
     walking: bool = False  # we sent a non-zero W that hasn't been stopped yet
-    outbox: collections.deque = field(default_factory=collections.deque)  # raw tuning commands
+    outbox: collections.deque = field(default_factory=collections.deque)  # raw tuning commands (max OUTBOX_MAX)
+    last_flash_write: float = float("-inf")  # last gains/calibrate sent (each one writes the controller's flash)
+    last_outbox_warning: float = float("-inf")
 
 
 @dataclass
@@ -78,6 +83,15 @@ class CommandBus:
         except queue.Full:
             return False
         return True
+
+    def put_urgent(self, command: str) -> bool:
+        """Empty the motor queue and queue ``command`` (E-stop): it can't be crowded out by a full queue."""
+        while True:
+            try:
+                self.motor_queue.get_nowait()
+            except queue.Empty:
+                break
+        return self.put_motor(command)
 
     def put_audio(self, command: str) -> None:
         try:
@@ -134,10 +148,13 @@ class EStopGuard(py_trees.behaviour.Behaviour):
 
     def update(self) -> py_trees.common.Status:
         if self.state.estop_active:
-            if not self.latched:
-                self.bus.put_motor("E")  # main.py sends E ahead of anything already queued
+            # Latch only once E is really queued (put_urgent clears the queue first); else retry next tick.
+            # main.py also sends E ahead of anything already waiting on the serial link.
+            if not self.latched and self.bus.put_urgent("E"):
                 self.bus.put_audio(AUDIO_EMERGENCY_STOP)
                 _legs_off(self.state)
+                self.state.walk_until = 0.0  # an E-stop cancels the walk; "clear" must not resume it
+                self.state.outbox.clear()  # ...and any queued tuning commands: nothing stale after "clear"
                 self.latched = True
             return py_trees.common.Status.SUCCESS
 
@@ -164,8 +181,10 @@ class ImuFaultGuard(py_trees.behaviour.Behaviour):
             self.handled = False
             return py_trees.common.Status.FAILURE
         if not self.handled:
-            self.bus.put_motor("O")
             self.bus.put_audio(AUDIO_IMU_FAULT)
+        if not self.handled or self.state.legs_standing:
+            # Also when the controller stood up anyway (ACK,S,NOIMU after a retry): relax it again.
+            self.bus.put_motor("O")
             _legs_off(self.state)
             self.handled = True
         if self.state.imu_retry:
@@ -328,6 +347,29 @@ def _clamp_int(text: str, low: int, high: int) -> int:
     return max(low, min(high, int(_finite(text))))
 
 
+def _queue_raw(state: SharedState, *commands: str) -> None:
+    """Queue tuning commands for the controller; a flood beyond OUTBOX_MAX is dropped, not buffered."""
+    if len(state.outbox) + len(commands) > OUTBOX_MAX:
+        now = time.monotonic()
+        if now - state.last_outbox_warning > 1.0:  # a flood logs once a second, not once per message
+            state.last_outbox_warning = now
+            logger.warning("Too many queued tuning commands; dropping %s (and any more this second)",
+                           ", ".join(commands))
+        return
+    state.outbox.extend(commands)
+
+
+def _flash_write_allowed(state: SharedState, cmd: str) -> bool:
+    """gains/calibrate each rewrite the controller's settings in flash: allow one per FLASH_WRITE_MIN_S."""
+    now = time.monotonic()
+    if now - state.last_flash_write < FLASH_WRITE_MIN_S:
+        logger.warning("Ignoring %r: only one gains/calibrate per %.0f s (each one writes flash)",
+                       cmd, FLASH_WRITE_MIN_S)
+        return False
+    state.last_flash_write = now
+    return True
+
+
 def apply_locomotion_command(state: SharedState, payload: str) -> None:
     """robot/locomotion/cmd payloads:
 
@@ -356,19 +398,21 @@ def apply_locomotion_command(state: SharedState, payload: str) -> None:
             state.walk_until = time.monotonic() + max(0.0, min(WALK_MAX_S, seconds))
             state.resting = False
         elif cmd == "gesture":
-            state.outbox.append(GESTURE_BOB)
+            _queue_raw(state, GESTURE_BOB)
         elif cmd == "telemetry":
-            state.outbox.append(f"T,{1 if parse_bool(args[0]) else 0}")
+            _queue_raw(state, f"T,{1 if parse_bool(args[0]) else 0}")
         elif cmd == "gains":
             kp, ki, kd = (round(_finite(a) * 100) for a in args[:3])
             if min(kp, ki, kd) < 0 or max(kp, ki, kd) > 100_000:
                 raise ValueError("gains must be between 0 and 1000")
-            state.outbox.append(f"K,{kp},{ki},{kd}")
+            if _flash_write_allowed(state, cmd):
+                _queue_raw(state, f"K,{kp},{ki},{kd}")
         elif cmd == "calibrate":
-            # Calibration needs the balance loop off: relax, measure, then stay relaxed until "stand".
-            state.resting = True
-            state.walk_until = 0.0
-            state.outbox.extend(["O", "C"])
+            if _flash_write_allowed(state, cmd):
+                # Calibration needs the balance loop off: relax, measure, then stay relaxed until "stand".
+                state.resting = True
+                state.walk_until = 0.0
+                _queue_raw(state, "O", "C")
         else:
             logger.warning("Unknown locomotion command %r", payload)
     except (IndexError, ValueError, OverflowError):
@@ -384,8 +428,9 @@ def apply_serial_line(state: SharedState, line: str) -> None:
     if line in ("ACK,S", "ACK,S,NOIMU"):
         state.legs_standing = True
         state.stand_sent_at = None
-        if line == "ACK,S":
-            state.imu_fault = False
+        # ACK,S: the IMU answered (the firmware retries it on every S). ACK,S,NOIMU: standing without
+        # balance, which is only acceptable on the bench (ImuFaultGuard relaxes it again otherwise).
+        state.imu_fault = line == "ACK,S,NOIMU" and not config.ALLOW_NO_IMU
         return
     if line in ("ACK,O", "ACK,E"):
         _legs_off(state)
@@ -394,7 +439,8 @@ def apply_serial_line(state: SharedState, line: str) -> None:
         state.fallen = True
         _legs_off(state)
         return
-    if line == "EVT,IMU_FAIL" or (line.startswith("NACK,") and line.endswith(",NOIMU")):
+    if line == "EVT,IMU_FAIL" or line in ("NACK,S,NOIMU", "NACK,W,NOIMU"):
+        # (NACK,C,NOIMU only means calibration needs the IMU: not a fault on a bench without one.)
         state.imu_fault = True
         _legs_off(state)
         return
@@ -465,11 +511,6 @@ def safe_apply(state: SharedState, topic: str, payload: str) -> None:
         logger.exception("Error handling %s payload %r", topic, payload)
 
 
-def on_mqtt_message(state: SharedState, _client: mqtt.Client, _userdata, msg: mqtt.MQTTMessage) -> None:
-    payload = msg.payload.decode("utf-8", errors="ignore").strip()
-    safe_apply(state, msg.topic, payload)
-
-
 def build_tree(state: SharedState, bus: CommandBus) -> py_trees.trees.BehaviourTree:
     root = py_trees.composites.Selector(name="Priority Selector", memory=False)
 
@@ -480,8 +521,8 @@ def build_tree(state: SharedState, bus: CommandBus) -> py_trees.trees.BehaviourT
     posture_seq.add_children([CheckPosturePoor(state), PostureCorrectionAction(state, bus)])
 
     root.add_children([
+        EStopGuard(state, bus),  # first: nothing may run (or fill the queue) ahead of the E-stop
         ServiceCommands(state, bus),
-        EStopGuard(state, bus),
         ImuFaultGuard(state, bus),
         FallenGuard(state, bus),
         RestGuard(state, bus),
@@ -510,7 +551,7 @@ def build_mqtt_client(deliver: Deliver) -> mqtt.Client:
     ``deliver`` runs on paho's network thread; it must hand the message to the tick thread
     rather than touching SharedState itself.
     """
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="robot-behavior-tree")
+    last_oversize_warning = [0.0]
 
     def on_connect(client: mqtt.Client, _userdata, _flags, reason_code, _properties) -> None:
         if reason_code == 0:
@@ -521,15 +562,18 @@ def build_mqtt_client(deliver: Deliver) -> mqtt.Client:
 
     def on_message(_client: mqtt.Client, _userdata, msg: mqtt.MQTTMessage) -> None:
         try:
+            if len(msg.payload) > MAX_PAYLOAD_BYTES:  # checked before decoding anything
+                now = time.monotonic()
+                if now - last_oversize_warning[0] > 1.0:
+                    last_oversize_warning[0] = now
+                    logger.warning("Dropping %d-byte MQTT message on %s (limit %d)",
+                                   len(msg.payload), msg.topic, MAX_PAYLOAD_BYTES)
+                return
             deliver(msg.topic, msg.payload.decode("utf-8", errors="ignore").strip())
         except Exception:  # noqa: BLE001 - an exception here would kill paho's network thread
             logger.exception("Dropping MQTT message on %s", msg.topic)
 
-    client.on_connect = on_connect
-    client.on_message = on_message
-    client.connect_async(config.MQTT_HOST, config.MQTT_PORT, keepalive=30)
-    client.loop_start()
-    return client
+    return make_client("robot-behavior-tree", on_connect=on_connect, on_message=on_message)
 
 
 def drain_queues(bus: CommandBus) -> None:
@@ -573,8 +617,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        mqtt_client.loop_stop()
-        mqtt_client.disconnect()
+        stop_client(mqtt_client)
 
 
 if __name__ == "__main__":

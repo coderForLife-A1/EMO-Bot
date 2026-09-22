@@ -33,11 +33,13 @@ STEP_MS = 10
 FIRMWARES = ("esp32", "nano")
 
 
-def build(firmware: str) -> Path:
+def build(firmware: str, out_dir: Path) -> Path:
+    """Compile the firmware into ``out_dir``: a private directory from mkdtemp(), so nobody else on the
+    machine can pre-create or swap the executable we are about to run."""
     if shutil.which("g++") is None:
         sys.exit("g++ not found: install build-essential (Linux), MinGW (Windows) or Xcode CLT (macOS)")
     sketch = ROOT / "firmware" / f"emo_{firmware}" / f"emo_{firmware}.ino"
-    exe = Path(tempfile.gettempdir()) / (f"emo_sim_{firmware}" + (".exe" if sys.platform == "win32" else ""))
+    exe = out_dir / (f"emo_sim_{firmware}" + (".exe" if sys.platform == "win32" else ""))
     subprocess.run(["g++", "-std=c++11", "-O1", f'-DFIRMWARE_SKETCH="{sketch.as_posix()}"',
                     "-I", str(HARNESS_DIR), str(HARNESS_DIR / "harness.cpp"), "-o", str(exe)], check=True)
     return exe
@@ -122,7 +124,14 @@ def main() -> None:
     parser.add_argument("--firmware", choices=FIRMWARES, default="esp32")
     args = parser.parse_args()
 
-    exe = build(args.firmware)
+    build_dir = Path(tempfile.mkdtemp(prefix="emo_sim_"))  # private (0700), removed on exit
+    try:
+        serve(args, build(args.firmware, build_dir))
+    finally:
+        shutil.rmtree(build_dir, ignore_errors=True)
+
+
+def serve(args, exe: Path) -> None:
     commands: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=console, args=(commands,), daemon=True).start()
 

@@ -32,6 +32,7 @@ from behavior_tree_module import (
     on_nano_reset,
     safe_apply,
 )
+from mqtt_client import make_client, stop_client
 from serial_module import offer, offer_urgent, serial_task
 
 
@@ -87,47 +88,17 @@ def _serial_line_handler(state: SharedState, publisher: mqtt.Client) -> Callable
     return handle
 
 
-def _build_publisher() -> mqtt.Client:
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="robot-main")
-    client.connect_async(config.MQTT_HOST, config.MQTT_PORT, keepalive=30)
-    client.loop_start()
-    return client
-
-
-def _vision_worker(
-    stop_flag: threading.Event,
-    loop: asyncio.AbstractEventLoop,
-    out_queue: asyncio.Queue[tuple[str, str]],
-) -> None:
-    from vision_posture_module import ResilientCamera, VisionPipeline
-
-    def on_camera_state(state: str) -> None:
-        log = logger.info if state == "UP" else logger.warning
-        log("Camera %r is %s", config.CAMERA_SOURCE, state)
-        loop.call_soon_threadsafe(offer, out_queue, (config.TOPIC_VISION_STATE, state))
-
-    pipeline = VisionPipeline()
-    cap = ResilientCamera(on_state=on_camera_state)  # reopens with backoff if the camera drops out
-    try:
-        while not stop_flag.is_set():
-            frame = cap.read()
-            if frame is None:
-                continue
-            for message in pipeline.process(frame, time.monotonic()):
-                loop.call_soon_threadsafe(offer, out_queue, message)
-    finally:
-        pipeline.close()
-        cap.release()
-
-
 async def vision_task(publisher: mqtt.Client) -> None:
+    from vision_posture_module import publish_options, run_vision
+
     publish_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=200)
     loop = asyncio.get_running_loop()
     stop_flag = threading.Event()
-    worker = asyncio.create_task(
-        asyncio.to_thread(_vision_worker, stop_flag, loop, publish_queue),
-        name="vision_worker",
-    )
+
+    def publish(topic: str, payload: str) -> None:  # called on the camera thread
+        loop.call_soon_threadsafe(offer, publish_queue, (topic, payload))
+
+    worker = asyncio.create_task(asyncio.to_thread(run_vision, stop_flag, publish), name="vision_worker")
 
     getter: asyncio.Task | None = None
     try:
@@ -139,14 +110,25 @@ async def vision_task(publisher: mqtt.Client) -> None:
                 worker.result()  # surface the camera/mediapipe error to the supervisor
                 raise RuntimeError("Vision worker exited unexpectedly")
             topic, payload = getter.result()
-            retain = topic == config.TOPIC_VISION_STATE  # late subscribers still see UP/DOWN
-            publisher.publish(topic, payload, qos=1 if retain else 0, retain=retain)
+            publisher.publish(topic, payload, **publish_options(topic))
     finally:
         if getter is not None:
             getter.cancel()
         stop_flag.set()
         with contextlib.suppress(asyncio.TimeoutError, Exception):
             await asyncio.wait_for(asyncio.shield(worker), timeout=2.0)
+
+
+def queue_cue(speech_queue: asyncio.Queue, phrase: str) -> None:
+    """Queue a spoken cue, or drop the cue itself when the queue is full.
+
+    Never evict older jobs: one of them may be a recording (LISTEN_JOB) whose completion releases
+    the wake-word listener.
+    """
+    try:
+        speech_queue.put_nowait((SAY_JOB, phrase))
+    except asyncio.QueueFull:
+        logger.warning("Speech queue full; not saying %r", phrase)
 
 
 async def behavior_tree_task(
@@ -186,7 +168,7 @@ async def behavior_tree_task(
                     break
                 publisher.publish(config.TOPIC_AUDIO_INTENT, cue, qos=0, retain=False)
                 if cue in CUE_PHRASES:
-                    offer(speech_queue, (SAY_JOB, CUE_PHRASES[cue]))
+                    queue_cue(speech_queue, CUE_PHRASES[cue])
 
             next_tick += period
             sleep_time = next_tick - time.monotonic()
@@ -196,9 +178,7 @@ async def behavior_tree_task(
                 next_tick = time.monotonic()
                 await asyncio.sleep(0)
     finally:
-        mqtt_client.loop_stop()
-        with contextlib.suppress(Exception):
-            mqtt_client.disconnect()
+        stop_client(mqtt_client)
 
 
 async def _run_guarded(
@@ -233,7 +213,7 @@ async def main() -> None:
     serial_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=200)
     speech_queue: asyncio.Queue = asyncio.Queue(maxsize=20)
     conversation_busy = threading.Event()
-    publisher = _build_publisher()
+    publisher = make_client("robot-main")
 
     def end_conversation() -> None:
         # The speech side died: nobody will lower the wake flag, so do it here.
@@ -279,9 +259,7 @@ async def main() -> None:
             task.cancel()
         await asyncio.gather(*worker_tasks, return_exceptions=True)
 
-        publisher.loop_stop()
-        with contextlib.suppress(Exception):
-            publisher.disconnect()
+        stop_client(publisher)
         logger.info("EMO-Bot stopped")
 
 

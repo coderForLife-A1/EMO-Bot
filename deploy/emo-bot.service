@@ -1,4 +1,4 @@
-# systemd unit for the EMO-Bot runtime. Install: see RUNNING.md, section 9.
+# systemd unit for the EMO-Bot runtime. Install: see RUNNING.md, section 10.
 # Change User= and the /home/pi/EMO-Bot paths if your setup differs.
 [Unit]
 Description=EMO-Bot desk robot runtime

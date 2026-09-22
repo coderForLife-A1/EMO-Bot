@@ -54,7 +54,8 @@ keeps the robot safe even if the Pi stalls.
 | File | What it is |
 | --- | --- |
 | `main.py` | **Entry point.** Starts every task in one asyncio process and supervises them. If a critical task (serial, behavior tree) crashes, the robot shuts down. If an optional one (vision, wake word, speech) crashes, it is logged and the robot keeps running. Routes the controller's events to MQTT and turns behavior-tree cues into speech. |
-| `config.py` | **All settings in one place.** Loads `.env` first, then exposes every setting (serial port, camera, audio devices, API keys, timeouts, feature switches) and every MQTT topic name. |
+| `config.py` | **All settings in one place.** Loads `.env` first, then exposes every setting (serial port, camera, audio devices, API keys, timeouts, feature switches, MQTT login/TLS) and every MQTT topic name. |
+| `mqtt_client.py` | **Shared MQTT connection.** Every module connects through it, so they all use the same broker login and TLS settings, and callbacks are attached before connecting. Also defines the 256-byte payload limit. |
 | `behavior_tree_module.py` | **The robot's decision-making.** A 10 Hz py_trees priority tree: E-stop > IMU fault > fallen > rest > conversation > posture reminder > walk > stand. Turns MQTT commands (`walk,70,0,3`, `stand`, ...) into controller commands, only counts the robot as standing once the controller confirms it (`ACK,S`), and re-sends walk commands as a heartbeat. Runs standalone for testing: `python behavior_tree_module.py`. |
 | `serial_module.py` | **Link to the ESP32 (or Nano).** Opens the serial port (or `socket://` for the simulator), waits for the `READY` banner, sends one command at a time and matches each ACK/NACK to its command, gives the E-stop priority, forwards events (`EVT,FALLEN`) and telemetry, detects controller resets, parks the servos on shutdown and reconnects forever. `SERIAL_PORT=sim` only logs commands. |
 | `vision_posture_module.py` | **Camera vision.** MediaPipe pose estimation decides good or poor posture relative to your own upright baseline and publishes `POSTURE_POOR` / `POSTURE_OK`. Reopens the camera if it drops out and publishes `robot/vision/state` `UP`/`DOWN`. Face detection is optional (`FACE_DETECTION=1`). Supports the Pi CSI camera (Picamera2), USB cameras and laptop webcams. Runs standalone. |
@@ -106,6 +107,7 @@ keeps the robot safe even if the Pi stalls.
 | `tests/test_vision.py` | Face selection, posture rules at any distance, personal baseline, alert timing. |
 | `tests/test_api_routing.py` | The speech pipeline against a mocked HTTP server: WAV output, timeouts, missing keys, fallback, phrase cache. |
 | `tests/test_main.py` | The whole runtime starts without hardware and stands the legs up. |
+| `tests/test_round2_misc.py` | Round-2 review checks that span modules: MQTT login/TLS, every module using the shared MQTT client, speech cues never evicting a recording, the simulator's private build directory. |
 | `tests/conftest.py` | pytest setup that makes the modules importable. |
 
 ---
@@ -347,6 +349,12 @@ The simplest option is a USB cable (`SERIAL_PORT=/dev/ttyUSB0`). To use the Pi's
 ---
 
 ## Safety
+
+- **Keep the MQTT broker private.** Anyone who can publish to it can drive the robot. By default everything
+  runs on `127.0.0.1`. For control from another machine, use a broker login, ACLs and TLS
+  (`MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_TLS`; see [RUNNING.md section 13](RUNNING.md#13-secure-mqtt)).
+- **Bad input is rejected.** Oversized payloads (over 256 bytes) are dropped unread, a flood of tuning commands
+  can't crowd out the E-stop, and gains/calibration are limited to one per second to spare the controller's flash.
 
 - `mosquitto_pub -t robot/error -m error` latches an E-stop: the controller turns every servo output off
   and refuses commands until `mosquitto_pub -t robot/error -m clear`. The E-stop skips ahead of any

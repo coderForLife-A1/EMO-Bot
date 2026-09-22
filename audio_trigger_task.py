@@ -8,15 +8,14 @@ import io
 import json
 import logging
 import struct
-import tempfile
 import threading
 import wave
-from pathlib import Path
 from typing import Optional
 
 import paho.mqtt.client as mqtt
 
 import config
+from mqtt_client import make_client, stop_client
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +28,7 @@ LISTEN_JOB = "listen"  # must match api_routing_task.LISTEN_JOB (kept here to av
 
 
 def build_mqtt_client(client_id: str = "robot-audio-trigger") -> mqtt.Client:
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
-    client.connect_async(config.MQTT_HOST, config.MQTT_PORT, keepalive=30)
-    client.loop_start()
-    return client
+    return make_client(client_id)
 
 
 def _create_porcupine():
@@ -58,7 +54,8 @@ def _write_wav_to_memory(samples: bytes) -> bytes:
     return wav_buffer.getvalue()
 
 
-def _record_after_wake(stream, frame_length: int) -> str:
+def _record_after_wake(stream, frame_length: int) -> bytes:
+    """Record RECORD_SECONDS of audio and return it as WAV bytes (kept in memory, never on disk)."""
     remaining = SAMPLE_RATE * RECORD_SECONDS
     recorded = bytearray()
     while remaining > 0:
@@ -66,13 +63,7 @@ def _record_after_wake(stream, frame_length: int) -> str:
         audio_chunk, _overflowed = stream.read(frames_to_read)
         recorded.extend(audio_chunk)
         remaining -= frames_to_read
-
-    temp_dir = "/dev/shm" if Path("/dev/shm").is_dir() else None
-    with tempfile.NamedTemporaryFile(
-        mode="wb", suffix=".wav", prefix="robot_input_", dir=temp_dir, delete=False,
-    ) as wav_file:
-        wav_file.write(_write_wav_to_memory(bytes(recorded)))
-        return wav_file.name
+    return _write_wav_to_memory(bytes(recorded))
 
 
 def _audio_worker(
@@ -92,6 +83,7 @@ def _audio_worker(
         dtype="int16",
     )
 
+    pcm_format = struct.Struct(f"<{porcupine.frame_length}h")  # built once, not per audio frame
     try:
         stream.start()
         logger.info("Wake-word listener started (mic=%s)", config.AUDIO_INPUT_DEVICE or "default")
@@ -99,14 +91,13 @@ def _audio_worker(
             pcm, _overflowed = stream.read(porcupine.frame_length)
             if busy_event.is_set():
                 continue  # the robot is thinking/speaking; don't wake on its own voice
-            pcm_unpacked = struct.unpack_from("h" * porcupine.frame_length, pcm)
-            if porcupine.process(pcm_unpacked) < 0:
+            if porcupine.process(pcm_format.unpack_from(pcm)) < 0:
                 continue
 
             busy_event.set()
             loop.call_soon_threadsafe(events.put_nowait, ("wake", None))
-            wav_path = _record_after_wake(stream, porcupine.frame_length)
-            loop.call_soon_threadsafe(events.put_nowait, ("recorded", wav_path))
+            wav_bytes = _record_after_wake(stream, porcupine.frame_length)
+            loop.call_soon_threadsafe(events.put_nowait, ("recorded", wav_bytes))
     finally:
         stream.stop()
         stream.close()
@@ -122,7 +113,7 @@ async def audio_trigger_task(
     llm_processing_queue: asyncio.Queue,
     busy_event: Optional[threading.Event] = None,
 ) -> None:
-    """Wake word -> record 5 s -> queue (LISTEN_JOB, wav_path) for api_routing_task.
+    """Wake word -> record 5 s -> queue (LISTEN_JOB, wav_bytes) for api_routing_task.
 
     ``busy_event`` stays set from the wake word until api_routing_task has finished replying.
     """
@@ -169,13 +160,13 @@ async def _standalone() -> None:
     print("Say the wake word ('porcupine' by default). Ctrl+C to stop.")
     try:
         while True:
-            _, wav_path = await jobs.get()
-            print(f"Recorded {wav_path}")
+            _, wav_bytes = await jobs.get()
+            print(f"Recorded {len(wav_bytes)} bytes of WAV")
             busy.clear()
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-        client.loop_stop()
+        stop_client(client)
 
 
 if __name__ == "__main__":

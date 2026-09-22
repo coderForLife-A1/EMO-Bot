@@ -200,3 +200,112 @@ def test_mediapipe_version_message(monkeypatch):
     monkeypatch.setitem(sys.modules, "mediapipe", fake)
     with pytest.raises(RuntimeError, match="0.10.18"):
         vp.VisionPipeline()
+
+
+# ---------------------------------------------------------------- round 2 (#24, #26)
+
+class CountingCapture:
+    def __init__(self):
+        self.reads = self.grabs = 0
+
+    def read(self):
+        self.reads += 1
+        return True, "frame"
+
+    def grab(self):
+        self.grabs += 1
+        return True
+
+    def release(self):
+        pass
+
+
+def test_grab_skips_decoding(monkeypatch):
+    monkeypatch.setattr(vp.time, "sleep", lambda s: None)
+    cap = CountingCapture()
+    cam = vp.ResilientCamera(opener=lambda _s: cap)
+    assert cam.grab() is True and cam.read() == "frame"
+    assert (cap.grabs, cap.reads) == (1, 1)
+
+
+class FakePipeline:
+    """Stands in for VisionPipeline (no MediaPipe): wants every 3rd frame."""
+
+    def __init__(self, stop, frames):
+        self.stop, self.frames, self.calls, self.processed = stop, frames, 0, 0
+
+    def wants_frame(self, now):
+        self.calls += 1
+        if self.calls >= self.frames:
+            self.stop.set()  # the loop finishes this frame, then exits
+        return self.calls % 3 == 0
+
+    def process(self, frame, now):
+        self.processed += 1
+        return [("robot/state", "POSTURE_OK")]
+
+    def close(self):
+        pass
+
+
+def test_shared_camera_loop_grabs_unwanted_frames(monkeypatch):
+    """#24/#26: one camera loop for main.py and standalone mode; frames nobody needs aren't decoded."""
+    import threading
+
+    monkeypatch.setattr(vp.time, "sleep", lambda s: None)
+    stop = threading.Event()
+    cap = CountingCapture()
+    published = []
+    pipeline = FakePipeline(stop, frames=30)
+    vp.run_vision(stop, lambda t, p: published.append((t, p)),
+                  camera=vp.ResilientCamera(opener=lambda _s: cap, on_state=lambda s: published.append(("state", s))),
+                  pipeline=pipeline)
+    assert cap.reads == pipeline.processed == 10
+    assert cap.grabs == 20
+    assert published[0] == ("state", "UP")
+
+
+def test_pose_runs_at_about_5_hz(monkeypatch):
+    """#24: pose estimation is time-based (~5 Hz) and colour conversion only runs when it's due."""
+    import sys
+
+    calls = {"pose": 0, "convert": 0}
+
+    class Pose:
+        def __init__(self, **kw):
+            pass
+
+        def process(self, rgb):
+            calls["pose"] += 1
+            return SimpleNamespace(pose_landmarks=None)
+
+        def close(self):
+            pass
+
+    fake = SimpleNamespace(__version__="0.10.18", solutions=SimpleNamespace(pose=SimpleNamespace(Pose=Pose)))
+    monkeypatch.setitem(sys.modules, "mediapipe", fake)
+
+    def convert(frame, code):
+        calls["convert"] += 1
+        return frame
+
+    monkeypatch.setattr(vp.cv2, "cvtColor", convert)
+    pipe = vp.VisionPipeline(face_detection=False)
+    frame = SimpleNamespace(shape=(480, 640, 3))
+    for i in range(30):  # 1 s of video at 30 fps
+        pipe.process(frame, i / 30)
+    assert calls["pose"] == calls["convert"] == 5
+
+
+def test_posture_metrics_computed_once(monkeypatch):
+    """#24: metrics used to be computed twice per pose frame."""
+    calls = []
+    real = vp.posture_metrics
+
+    def counting(landmarks):
+        calls.append(1)
+        return real(landmarks)
+
+    monkeypatch.setattr(vp, "posture_metrics", counting)
+    assert vp.judge_posture(real(person(0.2, 0.5))) is False
+    assert calls == []  # judge_posture works on metrics, it doesn't recompute them

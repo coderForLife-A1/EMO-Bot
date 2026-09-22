@@ -16,6 +16,7 @@ next one depends on it.
 10. [Start on boot (systemd)](#10-start-on-boot-systemd)
 11. [Tuning the balance PID and gait](#11-tuning-the-balance-pid-and-gait)
 12. [Troubleshooting](#12-troubleshooting)
+13. [Secure MQTT](#13-secure-mqtt)
 
 ---
 
@@ -122,7 +123,8 @@ Start an MQTT broker:
 
 ```bash
 # Docker (any OS)
-docker run -d --name mosquitto -p 1883:1883 eclipse-mosquitto:2 mosquitto -c /mosquitto-no-auth.conf
+# localhost only: anyone who can reach the broker can drive the robot (see section 13)
+docker run -d --name mosquitto -p 127.0.0.1:1883:1883 eclipse-mosquitto:2 mosquitto -c /mosquitto-no-auth.conf
 # or Debian/Ubuntu: sudo apt install mosquitto mosquitto-clients
 # or macOS: brew install mosquitto && brew services start mosquitto
 ```
@@ -346,7 +348,9 @@ access once.
 | `ENABLE_VISION` / `ENABLE_AUDIO` | `1` | Set to `0` to skip a subsystem |
 | `FACE_DETECTION` | `0` | Run MediaPipe face detection and publish `robot/vision/face_error`. Off by default: nothing uses it yet and it costs Pi CPU |
 | `ALLOW_NO_IMU` | `0` | Let the robot stand and walk when the controller booted without an IMU (no balance, no fall detection). Bench tests only |
-| `MQTT_HOST` / `MQTT_PORT` | `127.0.0.1` / `1883` | |
+| `MQTT_HOST` / `MQTT_PORT` | `127.0.0.1` / empty | Empty port = 1883, or 8883 with `MQTT_TLS=1` |
+| `MQTT_USERNAME` / `MQTT_PASSWORD` | empty | Broker login (section 13) |
+| `MQTT_TLS` / `MQTT_CA_CERTS` | `0` / empty | Connect with TLS; CA file for a self-signed broker certificate |
 
 Never commit `.env` (it is in `.gitignore`).
 
@@ -490,3 +494,44 @@ Also worth tuning:
 | `API ... job failed: ... 401` / `TimeoutError` | Bad key / slow network | Check `.env`; raise `API_TIMEOUT_SECONDS` |
 | `PORCUPINE_ACCESS_KEY is not set` | No wake-word key | Add it, or `ENABLE_AUDIO=0` |
 | Nothing reacts to `mosquitto_pub` | Broker not running / wrong host | `systemctl status mosquitto`, `MQTT_HOST` |
+
+---
+
+## 13. Secure MQTT
+
+Anyone who can publish to the broker can drive the robot: E-stop it, make it walk, change its gains or
+recalibrate it. Keep the broker private:
+
+- **Default (recommended): localhost only.** apt's Mosquitto 2.x only listens on `127.0.0.1` unless you add
+  a listener, and the Docker example above binds to `127.0.0.1` too. Don't publish port 1883 on all interfaces.
+- **Remote control from another machine:** give the broker a login and ACLs, and preferably TLS.
+
+  ```bash
+  sudo mosquitto_passwd -c /etc/mosquitto/passwd robot      # prompts for a password
+  ```
+
+  `/etc/mosquitto/conf.d/emo-bot.conf`:
+
+  ```
+  listener 8883
+  certfile /etc/mosquitto/certs/server.crt
+  keyfile  /etc/mosquitto/certs/server.key
+  allow_anonymous false
+  password_file /etc/mosquitto/passwd
+  acl_file /etc/mosquitto/acl
+  message_size_limit 1024        # every EMO-Bot message is tiny; the robot also drops anything over 256 bytes
+  ```
+
+  `/etc/mosquitto/acl`:
+
+  ```
+  user robot
+  topic readwrite robot/#
+  ```
+
+  Then set `MQTT_USERNAME`, `MQTT_PASSWORD` and `MQTT_TLS=1` in `.env` (port defaults to 8883 with TLS; set
+  `MQTT_CA_CERTS` to your CA file for a self-signed certificate) and `sudo systemctl restart mosquitto emo-bot`.
+  Every EMO-Bot module connects through `mqtt_client.py`, so they all use these settings.
+
+The API keys in `.env` are only ever sent over HTTPS: an `http://` `OPENAI_BASE_URL` or `ELEVENLABS_TTS_URL`
+is refused unless it points at this machine (`localhost`, `127.0.0.1`, `::1`).

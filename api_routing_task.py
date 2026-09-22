@@ -8,13 +8,11 @@ import asyncio
 import contextlib
 import io
 import logging
-import os
 import sys
-import tempfile
 import threading
 import wave
-from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -22,7 +20,7 @@ import config
 
 logger = logging.getLogger(__name__)
 
-LISTEN_JOB = "listen"  # (LISTEN_JOB, wav_path): full Whisper -> LLM -> TTS cascade
+LISTEN_JOB = "listen"  # (LISTEN_JOB, wav_bytes): full Whisper -> LLM -> TTS cascade
 SAY_JOB = "say"  # (SAY_JOB, text): speak a fixed phrase (behavior tree cues)
 
 # ElevenLabs returns MP3 unless output_format is set; the Accept header is ignored.
@@ -42,12 +40,21 @@ def _missing_keys() -> list[str]:
     return [name for name in ("OPENAI_API_KEY", "ELEVENLABS_API_KEY") if not getattr(config, name)]
 
 
-async def _transcribe(client: httpx.AsyncClient, wav_path: str) -> str:
-    audio = await asyncio.to_thread(Path(wav_path).read_bytes)
+def require_https(url: str) -> None:
+    """API keys go in request headers: refuse plain HTTP unless the server is on this machine."""
+    parts = urlsplit(url)
+    if parts.scheme == "https":
+        return
+    if parts.scheme == "http" and parts.hostname in ("localhost", "127.0.0.1", "::1"):
+        return
+    raise RuntimeError(f"refusing to send API keys to {parts.scheme}://{parts.hostname}: use https")
+
+
+async def _transcribe(client: httpx.AsyncClient, wav_bytes: bytes) -> str:
     response = await client.post(
         f"{config.OPENAI_BASE_URL}/audio/transcriptions",
         headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
-        files={"file": (Path(wav_path).name, audio, "audio/wav")},
+        files={"file": ("speech.wav", wav_bytes, "audio/wav")},
         data={"model": config.WHISPER_MODEL},
     )
     response.raise_for_status()
@@ -105,25 +112,15 @@ async def _synthesize(client: httpx.AsyncClient, response_text: str) -> bytes:
     return pcm_to_wav(response.content)
 
 
-def _write_temp_wav(wav_bytes: bytes) -> str:
-    with tempfile.NamedTemporaryFile(
-        mode="wb",
-        suffix=".wav",
-        prefix="robot_tts_",
-        dir="/dev/shm" if Path("/dev/shm").is_dir() else None,
-        delete=False,
-    ) as audio_file:
-        audio_file.write(wav_bytes)
-        return audio_file.name
-
-
-async def _play_audio(audio_path: str) -> None:
+async def _aplay(source: str, data: Optional[bytes] = None) -> None:
+    """Play a WAV file, or WAV bytes piped into aplay's stdin when ``source`` is "-"."""
     args = ["aplay", "-q"]
     if config.AUDIO_OUTPUT_DEVICE:
         args += ["-D", config.AUDIO_OUTPUT_DEVICE]
-    process = await asyncio.create_subprocess_exec(*args, audio_path)
+    process = await asyncio.create_subprocess_exec(
+        *args, source, stdin=asyncio.subprocess.PIPE if data is not None else None)
     try:
-        await process.wait()
+        await process.communicate(data)
     except asyncio.CancelledError:
         with contextlib.suppress(ProcessLookupError):
             process.kill()
@@ -133,12 +130,7 @@ async def _play_audio(audio_path: str) -> None:
 
 
 async def _play_wav_bytes(wav_bytes: bytes) -> None:
-    path = _write_temp_wav(wav_bytes)
-    try:
-        await _play_audio(path)
-    finally:
-        with contextlib.suppress(OSError):
-            os.remove(path)
+    await _aplay("-", wav_bytes)  # straight from memory, no temp file
 
 
 async def _play_fallback() -> None:
@@ -146,20 +138,20 @@ async def _play_fallback() -> None:
         logger.warning("Fallback sound %s is missing", config.NETWORK_ERROR_FILE)
         return
     try:
-        await _play_audio(str(config.NETWORK_ERROR_FILE))
+        await _aplay(str(config.NETWORK_ERROR_FILE))
     except Exception as exc:  # noqa: BLE001 - fallback must never raise
         logger.warning("Fallback audio failed: %s", exc)
 
 
-async def _cascade(client: httpx.AsyncClient, wav_path: str) -> bytes:
-    transcript = await _transcribe(client, wav_path)
-    logger.info("Heard: %r", transcript)
+async def _cascade(client: httpx.AsyncClient, wav_bytes: bytes) -> bytes:
+    transcript = await _transcribe(client, wav_bytes)
+    logger.debug("Heard: %r", transcript)  # DEBUG: keep conversations out of the system journal
     response_text = await _request_response(client, transcript)
-    logger.info("Replying: %r", response_text)
+    logger.debug("Replying: %r", response_text)
     return await _synthesize(client, response_text)
 
 
-async def _speech_for(client: httpx.AsyncClient, kind: str, value: str) -> bytes:
+async def _speech_for(client: httpx.AsyncClient, kind: str, value) -> bytes:
     if kind == SAY_JOB:
         if value not in _phrase_cache:
             _phrase_cache[value] = await _synthesize(client, value)
@@ -167,21 +159,23 @@ async def _speech_for(client: httpx.AsyncClient, kind: str, value: str) -> bytes
     return await _cascade(client, value)
 
 
-async def handle_job(client: httpx.AsyncClient, kind: str, value: str) -> bool:
-    """Run one job end to end. Returns False if the fallback sound was played instead."""
+async def handle_job(client: httpx.AsyncClient, kind: str, value) -> bool:
+    """Run one job end to end (``value``: WAV bytes for LISTEN_JOB, text for SAY_JOB).
+
+    Returns False if the fallback sound was played instead.
+    """
     try:
         missing = _missing_keys()
         if missing:
             raise RuntimeError(f"missing {', '.join(missing)} in .env")
+        require_https(config.ELEVENLABS_TTS_URL)
+        if kind == LISTEN_JOB:
+            require_https(config.OPENAI_BASE_URL)
         wav_bytes = await asyncio.wait_for(_speech_for(client, kind, value), timeout=config.API_TIMEOUT_SECONDS)
     except Exception as exc:  # noqa: BLE001 - any failure falls back to the local sound
         logger.warning("API %s job failed: %r", kind, exc)
         await _play_fallback()
         return False
-    finally:
-        if kind == LISTEN_JOB:
-            with contextlib.suppress(OSError):
-                os.remove(value)
 
     try:
         await _play_wav_bytes(wav_bytes)
@@ -196,7 +190,7 @@ async def api_routing_task(
     busy_event: Optional[threading.Event] = None,
     client: Optional[httpx.AsyncClient] = None,
 ) -> None:
-    """Consume (LISTEN_JOB, wav_path) and (SAY_JOB, text) jobs.
+    """Consume (LISTEN_JOB, wav_bytes) and (SAY_JOB, text) jobs.
 
     After each LISTEN_JOB the conversation flag is cleared on MQTT and ``busy_event`` is released
     so the wake-word listener re-arms.
