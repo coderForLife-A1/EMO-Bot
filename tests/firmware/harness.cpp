@@ -1,5 +1,7 @@
-// Host-side tests for firmware/emo_nano/emo_nano.ino. Run via tests/test_firmware.py, or:
+// Host-side tests for the robot firmware. Run via tests/test_firmware.py, or:
 //   g++ -std=c++11 -I tests/firmware tests/firmware/harness.cpp -o harness && ./harness all
+// This builds firmware/emo_esp32/emo_esp32.ino. For the Nano sketch add:
+//   -DFIRMWARE_SKETCH='"../../firmware/emo_nano/emo_nano.ino"'
 //
 // Closed-loop scenarios use a simple planar model of the biped:
 //   - each servo follows its command with a first-order lag (TAU_S), limp servos hold still
@@ -22,7 +24,10 @@ std::vector<PwmCall> g_pwm;
 uint16_t g_chan[16];
 bool g_chanOff[16];
 
-#include "../../firmware/emo_nano/emo_nano.ino"
+#ifndef FIRMWARE_SKETCH
+#define FIRMWARE_SKETCH "../../firmware/emo_esp32/emo_esp32.ino"
+#endif
+#include FIRMWARE_SKETCH
 
 // ------------------------------------------------------------------ plant model
 #ifndef SIM_TAU_S

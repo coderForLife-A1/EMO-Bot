@@ -2,7 +2,7 @@
 
 Code review of `main` @ `b6aa2b2`. API layer (`api_routing_task.py`) out of scope. Line numbers refer to that commit.
 
-**Status: all 13 issues are fixed.** Each section ends with a *Resolution* note: what changed and which test covers it. Run `pytest` to check them (98 tests, including 11 firmware scenarios compiled for the PC).
+**Status: all 13 issues are fixed.** Each section ends with a *Resolution* note: what changed and which test covers it. Run `pytest` to check them (109 tests, including 11 firmware scenarios run against both the ESP32 and the Nano firmware, compiled for the PC). The firmware fixes are in both sketches (`firmware/emo_esp32`, `firmware/emo_nano`).
 
 Severity: 🔴 **Critical** (safety / robot stops responding) · 🟠 **High** (wrong behaviour) · 🟡 **Medium** · ⚪ **Low**
 
@@ -43,7 +43,7 @@ Severity: 🔴 **Critical** (safety / robot stops responding) · 🟠 **High** (
 - **What:** firmware `C` samples the IMU for ~340 ms before `ACK`. Pi times out at 300 ms and sends the next command.
 - **Effect:** the late `ACK,C` is read as the reply to the next command; every later reply is matched to the wrong command (off by one) until reconnect.
 - **Fix:** per-command timeout (e.g. 1 s for `C`), and match replies by command letter (`ACK,<cmd>`), discarding mismatches.
-- **Resolution:** Every NACK now names the command it answers (`NACK,<cmd>,<reason>`, firmware) and the Pi matches
+- **Resolution:** Every NACK now names the command it answers (`NACK,<cmd>,<reason>`, ESP32 and Nano firmware) and the Pi matches
   replies by command letter (`serial_module.is_reply_to`), so a late `ACK,C` is skipped instead of being taken as
   the next command's reply. Slow commands get longer timeouts (`C` 1.5 s, `S` 1 s). Tests: `test_reply_matching`,
   `test_late_reply_is_not_taken_for_the_next_commands_reply`, `test_slow_commands_get_longer_timeouts`, firmware
@@ -56,7 +56,7 @@ Severity: 🔴 **Critical** (safety / robot stops responding) · 🟠 **High** (
 - **What:** on IMU loss the firmware keeps servos powered in balance mode; Pi keeps commanding stand/walk.
 - **Effect:** no balance and no fall detection while the robot is live.
 - **Fix:** treat `EVT,IMU_FAIL` (and `NACK,NOIMU`) as fault → send `O`/`R`, set a fault flag, block Stand/Walk until `READY,IMU`.
-- **Resolution:** Firmware: on IMU loss walking stops at once, and `W` (and `S` from rest) is refused with
+- **Resolution:** Firmware (ESP32 and Nano): on IMU loss walking stops at once, and `W` (and `S` from rest) is refused with
   `NACK,<cmd>,NOIMU` until the IMU answers again; `S` first tries to re-initialise it (e.g. reseated cable).
   Pi: `EVT,IMU_FAIL`, `NACK,*,NOIMU` and `READY,NOIMU` set an IMU fault that relaxes the servos (`O`), announces it,
   and blocks stand/walk; a `stand` command makes one re-init attempt. Booting without an IMU is only allowed with
@@ -169,5 +169,5 @@ Severity: 🔴 **Critical** (safety / robot stops responding) · 🟠 **High** (
 
 - **Where:** `firmware/emo_nano/emo_nano.ino:6` ("RUNNING.md, section 10"). Section 10 is systemd; tuning is section 11.
 - **Fix:** change to section 11.
-- **Resolution:** The sketch header now points to RUNNING.md section 4 (flashing), 5 (first power-up) and 11
-  (tuning).
+- **Resolution:** Both sketch headers (ESP32 and Nano) now point to RUNNING.md section 4 (flashing), 5 (first power-up)
+  and 11 (tuning).

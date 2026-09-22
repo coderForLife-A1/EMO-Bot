@@ -1,8 +1,9 @@
 """10 Hz behavior tree for the two-legged EMO-Bot.
 
-The Nano runs the fast loop (IMU balance PID + gait at 100 Hz). This tree only decides *what* the
-legs should do and sends high-level commands: S (stand), W,<speed>,<turn> (walk), G,1 (gesture),
-O (relax), E/R (E-stop). See firmware/emo_nano/emo_nano.ino for the protocol.
+The controller (ESP32, or the Arduino Nano alternative) runs the fast loop (IMU balance PID + gait
+at 100 Hz). This tree only decides *what* the legs should do and sends high-level commands:
+S (stand), W,<speed>,<turn> (walk), G,1 (gesture), O (relax), E/R (E-stop). See
+firmware/emo_esp32/emo_esp32.ino (same protocol as firmware/emo_nano/emo_nano.ino).
 
 Threading: SharedState is only touched on one thread (the tick thread). MQTT callbacks don't
 modify it directly; they hand each message to a ``deliver`` function that queues it for that
@@ -55,7 +56,7 @@ class SharedState:
     # Legs
     fallen: bool = False  # EVT,FALLEN / NACK,S,TILTED; cleared by a "stand" command
     imu_fault: bool = False  # EVT,IMU_FAIL / NACK,*,NOIMU / READY,NOIMU; cleared by ACK,S or READY,IMU
-    imu_retry: bool = False  # "stand" while imu_fault: send one S so the Nano tries to re-init the IMU
+    imu_retry: bool = False  # "stand" while imu_fault: send one S so the controller tries to re-init the IMU
     resting: bool = False  # "rest" command: servos off until "stand"
     legs_standing: bool = False  # confirmed by ACK,S; cleared by NACKs, O, E, falls, resets
     stand_sent_at: Optional[float] = None  # when the last unanswered S was sent
@@ -95,7 +96,7 @@ def request_stand(state: SharedState, bus: CommandBus) -> None:
 
 
 def ensure_standing(state: SharedState, bus: CommandBus) -> None:
-    """Stop any walk and make sure the Nano is balancing."""
+    """Stop any walk and make sure the controller is balancing."""
     if state.walking:
         bus.put_motor("W,0,0")
         state.walking = False
@@ -123,7 +124,7 @@ class ServiceCommands(py_trees.behaviour.Behaviour):
 
 
 class EStopGuard(py_trees.behaviour.Behaviour):
-    """Latches the Nano's E-stop ('E' = all servos off) once, and releases it ('R') when cleared."""
+    """Latches the controller's E-stop ('E' = all servos off) once, and releases it ('R') when cleared."""
 
     def __init__(self, state: SharedState, bus: CommandBus):
         super().__init__(name="E-Stop")
@@ -149,7 +150,7 @@ class EStopGuard(py_trees.behaviour.Behaviour):
 class ImuFaultGuard(py_trees.behaviour.Behaviour):
     """No balance or fall detection without the IMU: relax the servos and don't stand or walk.
 
-    A "stand" command sends one S, which makes the Nano try to re-initialise the IMU.
+    A "stand" command sends one S, which makes the controller try to re-initialise the IMU.
     """
 
     def __init__(self, state: SharedState, bus: CommandBus):
@@ -174,7 +175,7 @@ class ImuFaultGuard(py_trees.behaviour.Behaviour):
 
 
 class FallenGuard(py_trees.behaviour.Behaviour):
-    """After a fall the Nano has switched the servos off. Ask for help once and wait for "stand"."""
+    """After a fall the controller has switched the servos off. Ask for help once and wait for "stand"."""
 
     def __init__(self, state: SharedState, bus: CommandBus):
         super().__init__(name="Fallen")
@@ -375,7 +376,7 @@ def apply_locomotion_command(state: SharedState, payload: str) -> None:
 
 
 def apply_serial_line(state: SharedState, line: str) -> None:
-    """Update the leg state from any line the Nano sends (replies, events, banners)."""
+    """Update the leg state from any line the controller sends (replies, events, banners)."""
     if line.startswith("READY"):
         on_nano_reset(state)
         state.imu_fault = line == "READY,NOIMU" and not config.ALLOW_NO_IMU
@@ -407,7 +408,7 @@ def apply_serial_line(state: SharedState, line: str) -> None:
 
 
 def on_nano_reset(state: SharedState) -> None:
-    """The Nano (re)booted with its servos off: stand again on the next tick."""
+    """The controller (re)booted with its servos off: stand again on the next tick."""
     _legs_off(state)
 
 
@@ -532,7 +533,7 @@ def build_mqtt_client(deliver: Deliver) -> mqtt.Client:
 
 
 def drain_queues(bus: CommandBus) -> None:
-    # Standalone mode: print what would be sent to the Nano / audio pipeline.
+    # Standalone mode: print what would be sent to the controller / audio pipeline.
     while not bus.motor_queue.empty():
         print(f"MOTOR_CMD: {bus.motor_queue.get_nowait()}")
     while not bus.audio_queue.empty():
@@ -540,9 +541,9 @@ def drain_queues(bus: CommandBus) -> None:
 
 
 def main() -> None:
-    """Standalone mode: run the tree without a Nano, printing the commands it would send.
+    """Standalone mode: run the tree without a controller, printing the commands it would send.
 
-    Every command is treated as acknowledged, as if a healthy Nano were attached.
+    Every command is treated as acknowledged, as if a healthy controller were attached.
     """
     state = SharedState()
     bus = CommandBus()

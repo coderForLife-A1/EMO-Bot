@@ -1,4 +1,4 @@
-"""Serial link between the Pi and the Arduino Nano.
+"""Serial link between the Pi and the controller (ESP32; Arduino Nano kept as alternative).
 
 Opens the port (device path, or a socket:// URL for tools/sim_nano.py), waits for the firmware's
 READY banner, sends one command at a time and matches the ACK/NACK reply to it by command letter,
@@ -18,9 +18,9 @@ import config
 
 logger = logging.getLogger(__name__)
 
-READY_TIMEOUT_S = 3.0  # opening the port resets a USB Nano; its bootloader takes ~1-2 s
+READY_TIMEOUT_S = 3.0  # opening the port resets a USB-attached board; its bootloader takes ~1-2 s
 REPLY_TIMEOUT_S = 0.3
-# Commands that take longer on the Nano: C samples the IMU for ~0.35 s; S may re-initialise a lost IMU.
+# Commands that take longer on the controller: C samples the IMU for ~0.35 s; S may re-initialise a lost IMU.
 SLOW_REPLY_TIMEOUT_S = {"C": 1.5, "S": 1.0}
 IDLE_POLL_S = 0.5  # ping when idle so events (EVT,FALLEN) are read promptly
 PARK_COMMANDS = ("W,0,0", "O")  # sent on shutdown: stop walking, then switch the servos off
@@ -86,7 +86,7 @@ def wait_for_ready(ser, timeout_s: float = READY_TIMEOUT_S) -> Optional[str]:
 
 
 def send_and_wait(ser, payload: str, timeout_s: Optional[float] = None, on_line: Optional[LineHandler] = None) -> str:
-	"""Write one command and return its reply (ACK/NACK), a "READY..." banner if the Nano rebooted,
+	"""Write one command and return its reply (ACK/NACK), a "READY..." banner if the controller rebooted,
 	or "" on timeout.
 
 	Every line read, including the reply, is passed to ``on_line``. A late reply to an earlier
@@ -145,9 +145,9 @@ async def serial_task(
 	on_connect: Optional[Callable[[], None]] = None,
 	on_line: Optional[LineHandler] = None,
 ) -> None:
-	"""Send commands to the Nano, checking each reply. Reconnects forever on errors.
+	"""Send commands to the controller, checking each reply. Reconnects forever on errors.
 
-	``on_connect`` runs after every (re)connect. ``on_line`` receives every line from the Nano:
+	``on_connect`` runs after every (re)connect. ``on_line`` receives every line from the controller:
 	replies (ACK/NACK), events (EVT,...), telemetry (T,...) and READY banners. Both run on the
 	event loop thread. On cancellation (shutdown) the servos are parked before the port closes.
 	"""
@@ -173,7 +173,7 @@ async def serial_task(
 			if banner is None:
 				logger.warning("No READY from %s within %.0fs; continuing anyway", port, READY_TIMEOUT_S)
 			else:
-				logger.info("Nano ready: %s", banner)
+				logger.info("Controller ready: %s", banner)
 				if on_line is not None:
 					on_line(banner)
 			logger.info("Serial connected: %s @ %s", port, baudrate)
@@ -190,7 +190,7 @@ async def serial_task(
 					payload = command if command.endswith("\n") else f"{command}\n"
 					reply = await asyncio.to_thread(send_and_wait, ser, payload, None, forward)
 					if reply.startswith("READY"):
-						logger.warning("Nano reset detected (%s); standing up again", reply)
+						logger.warning("Controller reset detected (%s); standing up again", reply)
 						if on_connect:
 							on_connect()
 					elif reply.startswith("NACK") and ",ESTOP" not in reply:

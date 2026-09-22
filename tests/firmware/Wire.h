@@ -16,8 +16,10 @@ struct FakeWire
     uint8_t buf[14];
     uint8_t len = 0, pos = 0;
     void begin() {}
+    void begin(int, int) {} // ESP32: SDA, SCL pins
     void setClock(uint32_t) {}
-    void setWireTimeout(uint32_t, bool) {}
+    void setWireTimeout(uint32_t, bool) {} // AVR
+    void setTimeOut(uint16_t) {}           // ESP32
     void beginTransmission(uint8_t a) { addr = a; }
     void write(uint8_t) {}
     uint8_t endTransmission(bool = true) { return (addr == 0x68 && !g_imu.present) ? 2 : 0; }

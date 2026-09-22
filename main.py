@@ -1,6 +1,6 @@
 """EMO-Bot entry point: starts and supervises every runtime task in one asyncio process.
 
-Critical tasks (the robot stops if they crash): serial link to the Nano, behavior tree.
+Critical tasks (the robot stops if they crash): serial link to the controller, behavior tree.
 Optional tasks (logged and skipped if they crash): vision, wake word, cloud speech pipeline.
 Run with `python main.py`; settings come from `.env` via config.py.
 """
@@ -72,7 +72,7 @@ def _install_signal_handlers(shutdown_event: asyncio.Event) -> None:
 
 
 def _serial_line_handler(state: SharedState, publisher: mqtt.Client) -> Callable[[str], None]:
-    """Route every Nano line: replies/events update the behavior tree; events and refusals are
+    """Route every controller line: replies/events update the behavior tree; events and refusals are
     published on robot/locomotion/event, telemetry on robot/locomotion/telemetry."""
 
     def handle(line: str) -> None:
@@ -80,7 +80,7 @@ def _serial_line_handler(state: SharedState, publisher: mqtt.Client) -> Callable
             publisher.publish(config.TOPIC_LOCOMOTION_TELEMETRY, line, qos=0, retain=False)
             return
         if line.startswith(("EVT,", "NACK,", "READY")):
-            logger.info("Nano: %s", line)
+            logger.info("Controller: %s", line)
             publisher.publish(config.TOPIC_LOCOMOTION_EVENT, line, qos=0, retain=False)
         apply_serial_line(state, line)
 
