@@ -131,3 +131,10 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+
+# ========================
+# Local Claude workspace (not shared)
+# ========================
+.claude/
+CLAUDE.md
+docs/
