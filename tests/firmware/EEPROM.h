@@ -7,6 +7,8 @@ struct FakeEEPROM
 {
     uint8_t mem[1024];
     FakeEEPROM() { memset(mem, 0xFF, sizeof(mem)); } // erased AVR EEPROM reads 0xFF
+    bool begin(size_t size) { return size <= sizeof(mem); } // ESP32 flash emulation
+    bool commit() { return true; }                          // ESP32: persisted on commit
     template <class T>
     T &get(int addr, T &obj)
     {

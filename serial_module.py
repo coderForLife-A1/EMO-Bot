@@ -1,4 +1,4 @@
-"""Serial link between the Pi and the Arduino Nano.
+"""Serial link between the Pi and the controller (ESP32; Arduino Nano kept as alternative).
 
 Opens the port (device path, or a socket:// URL for tools/sim_nano.py), waits for the firmware's
 READY banner, sends one command at a time and checks the ACK/NACK reply, forwards unsolicited
@@ -17,7 +17,7 @@ import config
 
 logger = logging.getLogger(__name__)
 
-READY_TIMEOUT_S = 3.0  # opening the port resets a USB Nano; its bootloader takes ~1-2 s
+READY_TIMEOUT_S = 3.0  # opening the port resets a USB-attached board; its bootloader takes ~1-2 s
 REPLY_TIMEOUT_S = 0.3
 IDLE_POLL_S = 0.5  # ping when idle so events (EVT,FALLEN) are read promptly
 
@@ -50,7 +50,7 @@ def wait_for_ready(ser, timeout_s: float = READY_TIMEOUT_S) -> Optional[str]:
 def send_and_wait(ser, payload: str, timeout_s: float = REPLY_TIMEOUT_S, on_line: Optional[LineHandler] = None) -> str:
 	"""Write one frame and return the firmware's reply ("ACK,..."/"NACK,...") or "" on timeout.
 
-	A "READY..." line means the Nano rebooted (brown-out or reset) and is returned as the reply.
+	A "READY..." line means the controller rebooted (brown-out or reset) and is returned as the reply.
 	Unsolicited lines (EVT,..., T,... telemetry) are passed to ``on_line``.
 	Runs in a worker thread, so reads never overlap between commands.
 	"""
@@ -80,9 +80,9 @@ async def serial_task(
 	on_connect: Optional[Callable[[], None]] = None,
 	on_line: Optional[LineHandler] = None,
 ) -> None:
-	"""Send commands to the Nano, checking each reply. Reconnects forever on errors.
+	"""Send commands to the controller, checking each reply. Reconnects forever on errors.
 
-	``on_connect`` runs after every (re)connect or detected Nano reset (the Nano boots with its
+	``on_connect`` runs after every (re)connect or detected controller reset (the controller boots with its
 	servos off). ``on_line`` receives every line that isn't a plain ACK: events, telemetry,
 	NACKs and READY banners. Both run on the event loop thread.
 	"""
@@ -108,9 +108,9 @@ async def serial_task(
 			if banner is None:
 				logger.warning("No READY from %s within %.0fs; continuing anyway", port, READY_TIMEOUT_S)
 			else:
-				logger.info("Nano ready: %s", banner)
+				logger.info("Controller ready: %s", banner)
 				if banner == "READY,NOIMU":
-					logger.warning("Nano reports no MPU6050: standing/walking without balance")
+					logger.warning("Controller reports no MPU6050: standing/walking without balance")
 			logger.info("Serial connected: %s @ %s", port, baudrate)
 			if on_connect:
 				on_connect()
@@ -125,7 +125,7 @@ async def serial_task(
 					payload = command if command.endswith("\n") else f"{command}\n"
 					reply = await asyncio.to_thread(send_and_wait, ser, payload, REPLY_TIMEOUT_S, forward)
 					if reply.startswith("READY"):
-						logger.warning("Nano reset detected (%s); standing up again", reply)
+						logger.warning("Controller reset detected (%s); standing up again", reply)
 						if on_connect:
 							on_connect()
 					elif reply.startswith("NACK"):
