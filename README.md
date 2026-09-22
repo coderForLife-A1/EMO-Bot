@@ -171,7 +171,7 @@ All topics and the controller's serial protocol are listed in [RUNNING.md sectio
 | Arduino Nano *(alternative)* | Balance and gait controller | USB/UART at 115200 baud; 5 V logic on typical Nano boards |
 | PCA9685 | 16-channel, 12-bit PWM servo driver | I2C address `0x40` on the controller's I2C bus (ESP32 GPIO21/22, Nano A4/A5); separate servo supply |
 | MPU6050 | 6-axis IMU for torso pitch (balance, fall detection) | I2C address `0x68` on the same I2C bus, shared with the PCA9685; flat on the pelvis, X arrow forward |
-| 4x MG90S servos (2 hip, 2 knee) | Legs | PCA9685 channels 0-3; 5-6 V servo supply (3 A or more), never the Pi or controller rail |
+| 4x MG90S servos (2 hip, 2 knee) | Legs | PCA9685 channels 0-3; 5-6 V regulated servo supply (5 A recommended), never the Pi or controller rail |
 | ReSpeaker HAT | Microphone input | ALSA card 0; check with `arecord -l` and `python -m sounddevice` |
 | CSI/USB camera | Posture sensing | `CAMERA_SOURCE=picamera2` (Pi 5 CSI) or a V4L2 device such as `/dev/video0` |
 | Speaker + amplifier | Speech output | ALSA playback, e.g. `plughw:0` |
@@ -189,25 +189,29 @@ vary. Pin numbers below are **physical header pins** on the Pi and **GPIO number
 flowchart LR
     subgraph PWR[Power]
         USBC[5 V 5 A USB-C PSU]
-        SPSU[5-6 V servo PSU, 3 A or more]
+        SPSU[5-6 V regulated servo PSU, 5 A recommended]
     end
     subgraph PI[Raspberry Pi 5]
         PI_USB[USB-A]
-        PI_I2C[I2C1: GPIO2/3]
-        PI_SPI[SPI0: GPIO10/11/8 + GPIO24/25/13]
+        PI_I2C[I2C1: GPIO2 SDA / GPIO3 SCL]
+        PI_SPI[SPI0: GPIO10 MOSI / GPIO11 SCLK / GPIO8 CE0]
+        PI_TFT[TFT control: GPIO24 RESET / GPIO25 DC / GPIO13 backlight]
     end
     subgraph ESP[ESP32 DevKit]
         ESP_USB[Micro-USB]
-        ESP_I2C[I2C: GPIO21/22]
+        ESP_I2C[I2C: GPIO21 SDA / GPIO22 SCL]
     end
     USBC --> PI
     PI_USB -- "USB serial 115200 (5 V power + data)" --> ESP_USB
     PI_I2C -- "I2C 0x29" --> TOF[VL53L0X ToF]
-    PI_SPI -- SPI --> TFT[2.8in ILI9341 TFT 240x320]
+    PI_SPI -- "MOSI / SCLK / CS" --> TFT[2.8in ILI9341 TFT 240x320]
+    PI_TFT -- "RESET / DC / LED" --> TFT
     ESP_I2C -- "I2C 0x68" --> IMU[MPU6050]
     ESP_I2C -- "I2C 0x40" --> PCA[PCA9685]
     PCA -- "ch 0-3, 50 Hz PWM" --> SERVOS[4x MG90S: L hip, R hip, L knee, R knee]
     SPSU -- "V+ servo rail" --> PCA
+    SPSU -- "GND (common)" --> PCA
+    SPSU -- "GND (common)" --> ESP
 ```
 
 ### Raspberry Pi 5 header
@@ -272,7 +276,8 @@ flowchart LR
 | Channel 3 | Right knee MG90S | Mirrored: `LEG_DIR` = -1 |
 
 MG90S lead colours on each 3-pin PCA9685 header: **brown** = `GND`, **red** = `V+` (4.8-6 V), **orange** = PWM signal.
-Size the servo PSU for stall current: about 0.7 A per MG90S, so 3 A or more for four.
+Size the servo PSU for stall current: about 0.7-0.9 A per MG90S (clones vary), so 2.8-3.6 A for four. A 5 A supply leaves margin for
+the start-up surge and wiring losses; 3 A is the bare minimum.
 
 ### MPU6050 (GY-521 breakout)
 
