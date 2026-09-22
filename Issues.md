@@ -2,7 +2,7 @@
 
 Code review of `main` @ `b6aa2b2`. API layer (`api_routing_task.py`) out of scope. Line numbers refer to that commit.
 
-**Status: all issues are fixed (1-13 in round 1, 14-26 in round 2 at the end of the file).** Each section ends with a *Resolution* note: what changed and which test covers it. Run `pytest` to check them (138 tests, including 11 firmware scenarios run against both the ESP32 and the Nano firmware, compiled for the PC). The firmware fixes are in both sketches (`firmware/emo_esp32`, `firmware/emo_nano`).
+**Status: issues 1-26 are fixed (1-13 in round 1, 14-26 in round 2, both on `Fixes`); round 3 (27-34, end of file) is open.** Each section ends with a *Resolution* note: what changed and which test covers it. Run `pytest` to check them (138 tests, including 11 firmware scenarios run against both the ESP32 and the Nano firmware, compiled for the PC). The firmware fixes are in both sketches (`firmware/emo_esp32`, `firmware/emo_nano`).
 
 Severity: 🔴 **Critical** (safety / robot stops responding) · 🟠 **High** (wrong behaviour) · 🟡 **Medium** · ⚪ **Low**
 
@@ -393,3 +393,133 @@ Both sketches, host tests extended, real ESP32 and Nano compiles pass.
   single-precision FPU; now float versions (~5 KB less flash).
 - **Flash writes:** ESP32 committed settings on every K/C even when unchanged; now compares first.
 - **IMU read:** 14 bytes per sample, 12 used; now 12.
+
+
+---
+
+# Round 3: review of the round-2 fixes (Raspberry Pi side, open)
+
+Review of `Fixes` @ `6a6a43e` (Pi fixes for 14-26). Line numbers refer to that commit. All 138 tests pass there;
+the findings below are what the tests don't cover. **Not fixed yet**: Pi-side code is reported here, not changed by
+the reviewer; each section has a proposed fix for the Pi code owner.
+
+| # | Severity | Area | Issue | Status |
+|---|---|---|---|---|
+| 27 | 🟠 High | Efficiency | Pi camera (Picamera2): vision thread busy-loops on `grab()`, one CPU core at ~100% | ⏳ Open |
+| 28 | 🟡 Medium | Safety | `stand` during an IMU fault stands the robot blind for a moment before relaxing it | ⏳ Open (firmware side ready) |
+| 29 | 🟡 Medium | Safety | Tuning commands sent during an E-stop (incl. `calibrate`) run after `clear` | ⏳ Open |
+| 30 | 🟡 Medium | Safety | Commands queued while the controller is unplugged are replayed on reconnect | ⏳ Open |
+| 31 | ⚪ Low | Behaviour | Flash rate limit is spent by commands that are then dropped; gains and calibrate share it | ⏳ Open |
+| 32 | ⚪ Low | Docs | Secure-MQTT setup breaks the robot's own local connection and every `mosquitto_pub` example | ⏳ Open |
+| 33 | ⚪ Low | Consistency | `require_https` blocks cached phrases; its "local" check differs from `mqtt_client._is_local` | ⏳ Open |
+| 34 | ⚪ Low | Diagnostics | Broker login failures are silent for the publisher and audio clients | ⏳ Open |
+
+
+## 🟠 27. Picamera2: vision thread busy-loops on `grab()`
+
+- **Where:** `vision_posture_module.py:78` (`_Picamera2Capture.grab` returns `True` at once), `:437` (`run_vision`).
+- **What:** between pose frames `run_vision` calls `camera.grab()` in a tight loop. `cv2.VideoCapture.grab()` blocks
+  until the next frame, so V4L2/USB cameras are paced. The Picamera2 wrapper's `grab()` returns immediately and
+  never waits for a frame, so the loop spins for the whole 0.2 s gap.
+- **Effect:** with `CAMERA_SOURCE=picamera2` (the Pi 5 CSI camera) and face detection off: one core at ~100%, and
+  the spinning thread competes for the GIL with the asyncio loop (behavior tree, serial link). Measured with a
+  Picamera2-like fake camera: **~3.7 million `grab()` calls and 1.7 s of CPU in 2 s**, 10 frames decoded.
+  The #24 resolution note ("free on picamera2") is wrong.
+- **Fix:** make `_Picamera2Capture.grab()` wait for and drop one frame (e.g. `self._cam.capture_request().release()`),
+  or have `run_vision` sleep until `last_pose + POSE_PERIOD_S` when the pipeline doesn't want a frame. Add a test
+  with a non-blocking fake camera that counts `grab()` calls.
+
+
+## 🟡 28. `stand` during an IMU fault stands the robot blind
+
+- **Where:** `behavior_tree_module.py:190-192` (`ImuFaultGuard` sends `S` as the IMU retry), `:428-433`.
+- **What:** with `ALLOW_NO_IMU=0` and a controller that **booted** without an IMU, `stand` → `S`. The firmware retries
+  the IMU; if it is still missing it stands anyway (booting without an IMU is allowed for bench tests) and answers
+  `ACK,S,NOIMU`. Only then does the guard send `O`.
+- **Effect:** each `stand` drives all four servos to the stand pose with no balance and no fall detection for one
+  serial round trip plus one tick (~100-200 ms), then drops them limp: the robot can jolt up and fall over.
+- **Fix:** use the new firmware `I` command (on `Fixes`, both sketches): it retries the IMU **without moving a servo**
+  and answers `ACK,I` (IMU working) or `NACK,I,NOIMU` (`NACK,I,MODE` while balancing). In `ImuFaultGuard` send `I`
+  instead of `S`; in `apply_serial_line` clear `imu_fault` on `ACK,I`, keep it on `NACK,I,NOIMU`, and let the
+  normal branches send `S` once the fault is gone. Add `"I": 1.0` to `SLOW_REPLY_TIMEOUT_S` (`serial_module.py:24`),
+  as the retry re-measures the gyro bias like `S` does.
+
+
+## 🟡 29. Tuning commands sent during an E-stop run after `clear`
+
+- **Where:** `behavior_tree_module.py:134-137` (`ServiceCommands`), `:149-159` (`EStopGuard`), `:410-415`.
+- **What:** latching the E-stop clears the outbox once. While it stays latched, `EStopGuard` returns SUCCESS first,
+  so `ServiceCommands` never runs, but `apply_locomotion_command` keeps filling the outbox. On `clear` it is flushed.
+- **Effect:** `error` → `calibrate` + `gesture` → `clear` sends `R, O, C, G,1, O`. A calibration asked for while the
+  robot was being handled runs later and stores that level offset in flash; this contradicts the #14 resolution
+  ("nothing stale runs after `clear`").
+- **Fix:** while `estop_active`, reject outbox commands (`gesture`, `telemetry`, `gains`, `calibrate`) with a
+  warning, or clear the outbox again when the E-stop is released. Test: `error`, `calibrate`, `clear` → no `C`.
+
+
+## 🟡 30. Commands queued while the controller is unplugged are replayed on reconnect
+
+- **Where:** `serial_module.py:141-202` (`serial_task`), `main.py:154-162`.
+- **What:** while the serial port is down, the behavior tree keeps queueing (`S` retries, `W` heartbeats, `K`, `C`,
+  `G,1`) into `serial_queue` (200, oldest dropped). After reconnecting, `serial_task` sends that backlog in order;
+  `on_connect` only resets the leg state.
+- **Effect:** stale commands reach a freshly booted controller: a `calibrate` or `gains` sent minutes earlier is
+  written to flash, and old walk commands or gestures run. They also delay the fresh `S`.
+- **Fix:** drop everything in `serial_queue` when the port (re)opens and when a `READY` reset is detected, before
+  `on_connect()` runs, so the tree rebuilds the state from scratch. Test: queue `C` while disconnected, then
+  reconnect → no `C` sent.
+
+
+## ⚪ 31. Flash rate limit spent by dropped commands; gains and calibrate share it
+
+- **Where:** `behavior_tree_module.py:362-370`, `:404-415`.
+- **What:** `_flash_write_allowed` records the time before `_queue_raw`, which can still drop the command when the
+  outbox is full. `gains` and `calibrate` share one timer.
+- **Effect:** a dropped `gains` still blocks the next valid one for 1 s; `calibrate` followed by `gains` within 1 s
+  (a normal tuning sequence) silently loses the gains (warning only).
+- **Fix:** record the time only once the command is queued; either document that the two share the limit or give
+  each its own timer (both write the same small settings block).
+
+
+## ⚪ 32. Secure-MQTT setup breaks the local connection and the examples
+
+- **Where:** `RUNNING.md:516-533` (section 13), `:152-161`, `:399-401`, `:438-440`.
+- **What:**
+  - The example config defines only `listener 8883`. In Mosquitto 2.x, defining any listener removes the default
+    localhost 1883 one, so the robot's own clients must use TLS too. With `MQTT_HOST=127.0.0.1`,
+    `ssl.create_default_context()` checks the hostname, so the certificate needs an IP SAN for `127.0.0.1` or the
+    connection fails (see #34 for why nobody notices).
+  - Every `mosquitto_pub` example has no `-u/-P`, `--cafile` or `-p 8883`, so none work after section 13.
+  - The ACL gives the robot and any remote controller the same `robot` login with `readwrite robot/#`.
+- **Fix:** add `listener 1883 127.0.0.1` for the robot's own clients (plain text on loopback) and keep 8883 + TLS
+  for remote use; show the `mosquitto_pub` flags for a secured broker; suggest a separate remote user with only the
+  topics it needs.
+
+
+## ⚪ 33. `require_https` blocks cached phrases; two different "local" checks
+
+- **Where:** `api_routing_task.py:43`, `:171-173`; `mqtt_client.py:23`.
+- **What:** `handle_job` checks `ELEVENLABS_TTS_URL` for every job, including `SAY_JOB` phrases already in the cache
+  that send nothing. `require_https` accepts only `localhost` / `127.0.0.1` / `::1`; `mqtt_client._is_local` accepts
+  any loopback address (`127.0.0.2`, ...).
+- **Effect:** with an `http://` URL, cues that need no request still play the error sound instead. The two modules
+  disagree on what counts as local.
+- **Fix:** check the URL only right before a request is sent (in `_transcribe` / `_request_response` / `_synthesize`);
+  share one `is_local_host()` helper.
+
+
+## ⚪ 34. Broker login failures are silent
+
+- **Where:** `mqtt_client.py:55`, `main.py:216`, `audio_trigger_task.py:31`.
+- **What:** only the behavior tree's client has an `on_connect` that logs a refused connection. The publisher
+  (`robot-main`) and the audio client get none, and paho retries in the background without logging.
+- **Effect:** a wrong `MQTT_PASSWORD` or certificate problem gives no telemetry, events, wake flag or camera state
+  and nothing in the log from those clients.
+- **Fix:** give `make_client` a default `on_connect` / `on_connect_fail` that logs the reason code once per failure
+  streak.
+
+
+## Firmware (round 3, on the `Fixes` branch)
+
+- **`I` command:** retries the IMU without moving a servo → `ACK,I` / `NACK,I,NOIMU` / `NACK,I,MODE` (while balancing).
+  Both sketches; host tests cover all three replies and recovery without moving. Needed for the #28 fix.
