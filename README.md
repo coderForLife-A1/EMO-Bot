@@ -65,7 +65,7 @@ keeps the robot safe even if the Pi stalls.
 
 | File | What it is |
 | --- | --- |
-| `firmware/emo_esp32/emo_esp32.ino` | **ESP32 firmware (default).** Port of the Nano sketch below: same protocol and control code. ESP32 specifics: I2C on GPIO21/22, settings in flash-emulated EEPROM (`EEPROM.commit()`), I2C timeout via `Wire.setTimeOut()`, and a `LINK` switch for USB (`Serial`) or the Pi's GPIO UART (`Serial2`, GPIO16/17, 3.3 V, no level shifter). |
+| `firmware/emo_esp32/emo_esp32.ino` | **ESP32 firmware (default).** Port of the Nano sketch below: same protocol and control code. ESP32 specifics: I2C on GPIO21/22, settings in flash-emulated EEPROM (`EEPROM.commit()`), I2C timeout via `Wire.setTimeOut()`, and a `LINK_UART2` switch for USB (`Serial`) or the Pi's GPIO UART (`Serial2`, GPIO16/17, 3.3 V, no level shifter). |
 | `firmware/emo_nano/emo_nano.ino` | **Arduino Nano firmware (alternative).** 100 Hz control loop: MPU6050 IMU with a complementary filter, PID on torso pitch through the hips (anti-windup, filtered D term), walking gait with knee lift and smooth start/stop, per-joint speed and angle limits, fall detection, walk watchdog, and calibration and PID gains saved in EEPROM. Speaks a line-based serial protocol (`S` stand, `W,<speed>,<turn>` walk, `G,1` gesture, `E`/`R` E-stop, `C` calibrate, `K` gains, `T` telemetry, `J` raw servo moves for setup). The configuration you adjust for your build (servo trims and directions, stance, gait sizes) is at the top. |
 
 ### Tools, assets and deployment
@@ -204,7 +204,7 @@ powering the system.
 The simplest option is a USB cable (`SERIAL_PORT=/dev/ttyUSB0`). To use the Pi's GPIO UART instead
 (`SERIAL_PORT=/dev/serial0`):
 
-**ESP32** (set `#define LINK Serial2` in `firmware/emo_esp32/emo_esp32.ino`; both sides 3.3 V, no level shifter):
+**ESP32** (set `#define LINK_UART2 1` in `firmware/emo_esp32/emo_esp32.ino`; both sides 3.3 V, no level shifter):
 
 - Pi physical pin 8, GPIO14/TXD -> ESP32 GPIO16 (RX2).
 - ESP32 GPIO17 (TX2) -> Pi physical pin 10, GPIO15/RXD.

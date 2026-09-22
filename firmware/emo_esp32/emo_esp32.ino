@@ -5,7 +5,7 @@
 //   (0x68) on the same I2C bus (SDA = GPIO21, SCL = GPIO22; change I2C_SDA_PIN / I2C_SCL_PIN below).
 //   Channel 0 = left hip, 1 = right hip, 2 = left knee, 3 = right knee.
 //   Mount the MPU6050 flat on the pelvis with its X arrow pointing forward.
-//   Pi link: the board's USB port (Serial) by default; see LINK below for the Pi's GPIO UART.
+//   Pi link: the board's USB port (Serial) by default; see LINK_UART2 below for the Pi's GPIO UART.
 // Flash it with arduino-cli (FQBN esp32:esp32:esp32); see RUNNING.md, section 4. Tune it with RUNNING.md, section 11.
 //
 // A 100 Hz control loop reads the IMU (complementary filter), runs a PID on torso pitch that
@@ -36,10 +36,20 @@
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
 // ---------------------------------------------------------------- board
-// Serial link to the Pi. Serial = USB (CP2102/CH340 on the DevKit, /dev/ttyUSB0 on the Pi).
-// For the Pi's GPIO UART (/dev/serial0) use Serial2 on GPIO16 (RX) / GPIO17 (TX): both sides are
-// 3.3 V, so no level shifter is needed, and the ESP32's boot messages stay off the Pi's line.
+// Serial link to the Pi. 0 = USB (Serial; CP2102/CH340 on the DevKit, /dev/ttyUSB0 on the Pi).
+// 1 = the Pi's GPIO UART (/dev/serial0) on Serial2, GPIO16 (RX) / GPIO17 (TX): both sides are 3.3 V,
+// so no level shifter, and the ESP32's boot messages stay off the Pi's line. The pins are set
+// explicitly: core 3.x defaults Serial2 to GPIO4/25. WROVER modules use GPIO16/17 for PSRAM: pick others.
+#define LINK_UART2 0
+#if LINK_UART2
+#define LINK Serial2
+static const int8_t LINK_RX_PIN = 16;
+static const int8_t LINK_TX_PIN = 17;
+#else
 #define LINK Serial
+static const int8_t LINK_RX_PIN = -1; // -1 = UART0 default pins (USB bridge)
+static const int8_t LINK_TX_PIN = -1;
+#endif
 static const uint32_t SERIAL_BAUD = 115200;
 static const int I2C_SDA_PIN = 21;
 static const int I2C_SCL_PIN = 22;
@@ -860,7 +870,7 @@ void handleSerialInput()
 // ---------------------------------------------------------------- Arduino entry points
 void setup()
 {
-    LINK.begin(SERIAL_BAUD);
+    LINK.begin(SERIAL_BAUD, SERIAL_8N1, LINK_RX_PIN, LINK_TX_PIN);
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
     Wire.setClock(400000);
     Wire.setTimeOut(I2C_TIMEOUT_MS);
