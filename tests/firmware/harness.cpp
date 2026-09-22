@@ -382,8 +382,12 @@ static void scenarioNoImu()
     g_imu.present = false;
     boot();
     expect(has(take(), "READY,NOIMU"), "boot reports missing IMU");
+    send("I");
+    expect(take() == "NACK,I,NOIMU\n" && mode == MODE_OFF, "I reports the missing IMU without standing");
     send("S");
     expect(take() == "ACK,S,NOIMU\n", "stands without balance when IMU is missing");
+    send("I");
+    expect(take() == "NACK,I,MODE\n", "no IMU retry while balancing");
     send("W,50,0");
     run(1.0f);
     expect(stride[0] > 0.3f && mode == MODE_BALANCE, "open-loop walking still works");
@@ -394,6 +398,8 @@ static void scenarioNoImu()
     g_imu.present = true; // IMU plugged in after boot
     send("S");
     expect(take() == "ACK,S\n" && imuOk && !imuLost, "S picks up an IMU connected after boot");
+    send("I");
+    expect(take() == "ACK,I\n", "I confirms a working IMU");
 }
 
 static void scenarioImuFail()
@@ -419,6 +425,12 @@ static void scenarioImuFail()
     send("S");
     expect(has(take(), "NACK,S,NOIMU"), "won't stand again while the IMU is still missing");
     g_imu.present = true; // cable reseated
+    send("I");
+    expect(take() == "ACK,I\n" && imuOk && !imuLost && mode == MODE_OFF, "I recovers the IMU without moving");
+    g_imu.present = false;
+    run(0.2f);
+    expect(has(take(), "EVT,IMU_FAIL") && !imuOk, "IMU lost again");
+    g_imu.present = true;
     send("S");
     run(0.3f);
     const std::string again = take();

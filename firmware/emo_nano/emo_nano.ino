@@ -22,6 +22,7 @@
 //   J,<joint>,<angle>   raw servo angle, for setup; leaves balance mode -> ACK,<joint>,<requested>,<applied>
 //   E / R               emergency stop (latched, all off) / release    -> ACK,E / ACK,R
 //   P                   ping                                      -> ACK,P
+//   I                   retry the IMU without moving (not while balancing) -> ACK,I / NACK,I,NOIMU
 // Errors: NACK,<cmd>,<reason>: <cmd> is the command letter it answers ('?' if unknown, e.g. for an
 //         overflowed line), <reason> is FORMAT|CMD|PARSE|JOINT|ESTOP|MODE|TILTED|NOIMU|OVERFLOW.
 //         The letter lets the Pi match every reply to its command even if one arrives late.
@@ -570,6 +571,41 @@ void controlTick(float dt)
 }
 
 // ---------------------------------------------------------------- commands
+// Try to bring the IMU back (reseated cable, or plugged in after boot). Fails fast if absent.
+// The gyro bias is re-measured, so the robot must be still: never while balancing.
+void imuRetry()
+{
+    imuOk = imuInit();
+    imuFailCount = 0;
+    if (imuOk)
+    {
+        imuLost = false;
+        imuUpdate(LOOP_US * 1e-6f); // fresh pitch (the filter re-seeds from the accelerometer)
+    }
+}
+
+// I: IMU check that never moves a servo, so the Pi can probe a faulted IMU without standing blind.
+void cmdImu()
+{
+    if (!imuOk)
+    {
+        if (mode == MODE_BALANCE)
+        {
+            sendNack(F("MODE"));
+            return;
+        }
+        imuRetry();
+    }
+    if (imuOk)
+    {
+        Serial.println(F("ACK,I"));
+    }
+    else
+    {
+        sendNack(F("NOIMU"));
+    }
+}
+
 void cmdStand()
 {
     if (estopLatched)
@@ -579,15 +615,8 @@ void cmdStand()
     }
     if (!imuOk && mode != MODE_BALANCE)
     {
-        // Try to bring the IMU back (reseated cable, or plugged in after boot). Fails fast if absent.
-        imuOk = imuInit();
-        imuFailCount = 0;
-        if (imuOk)
-        {
-            imuLost = false;
-            imuUpdate(LOOP_US * 1e-6f); // fresh pitch (the filter re-seeds from the accelerometer)
-        }
-        else if (imuLost) // lost at runtime: never stand blind (booting without one is allowed for bench tests)
+        imuRetry();
+        if (!imuOk && imuLost) // lost at runtime: never stand blind (booting without one is allowed for bench tests)
         {
             sendNack(F("NOIMU"));
             return;
@@ -788,6 +817,7 @@ void processCommand(char *line)
     case 'E':
     case 'R':
     case 'P':
+    case 'I':
         expected = 1;
         break;
     case 'G':
@@ -853,6 +883,9 @@ void processCommand(char *line)
         break;
     case 'P':
         Serial.println(F("ACK,P"));
+        break;
+    case 'I':
+        cmdImu();
         break;
     }
 }
