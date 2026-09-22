@@ -28,11 +28,14 @@ inline long map(long x, long inMin, long inMax, long outMin, long outMax)
     return (x - inMin) * (outMax - outMin) / (inMax - inMin) + outMin;
 }
 
+#define SERIAL_8N1 0x800001c // ESP32 value; unused on the host
+
 struct FakeSerial
 {
     std::queue<char> in;
     std::string out;
     void begin(long) {}
+    void begin(long, uint32_t, int8_t, int8_t) {} // ESP32: config, RX pin, TX pin
     int available() { return static_cast<int>(in.size()); }
     int read()
     {

@@ -1,6 +1,7 @@
-"""Simulated Nano: runs the real firmware code against a simulated biped + MPU6050, served as a TCP serial port.
+"""Simulated controller: runs the real firmware code against a simulated biped + MPU6050, served as a TCP serial port.
 
-    python tools/sim_nano.py                 # needs g++ (build-essential / MinGW / Xcode CLT)
+    python tools/sim_nano.py                     # ESP32 firmware; needs g++ (build-essential / MinGW / Xcode CLT)
+    python tools/sim_nano.py --firmware nano     # Arduino Nano firmware
     SERIAL_PORT=socket://127.0.0.1:7777 python main.py
 
 Type into this console while it runs:
@@ -8,9 +9,9 @@ Type into this console while it runs:
     state                print the simulated body state
     quit
 
-The firmware is compiled from firmware/emo_nano/emo_nano.ino with the stub Arduino headers in tests/firmware.
-Time runs in real time (10 ms steps). Each new connection is a power-on, like a USB Nano resetting when the
-port opens.
+The firmware is compiled from firmware/emo_<firmware>/emo_<firmware>.ino with the stub Arduino headers in
+tests/firmware. Time runs in real time (10 ms steps). Each new connection is a power-on, like the board
+resetting when its USB port opens.
 """
 import argparse
 import queue
@@ -29,12 +30,16 @@ HARNESS_DIR = ROOT / "tests" / "firmware"
 STEP_MS = 10
 
 
-def build() -> Path:
+FIRMWARES = ("esp32", "nano")
+
+
+def build(firmware: str) -> Path:
     if shutil.which("g++") is None:
         sys.exit("g++ not found: install build-essential (Linux), MinGW (Windows) or Xcode CLT (macOS)")
-    exe = Path(tempfile.gettempdir()) / ("emo_sim_nano" + (".exe" if sys.platform == "win32" else ""))
-    subprocess.run(["g++", "-std=c++11", "-O1", "-I", str(HARNESS_DIR), str(HARNESS_DIR / "harness.cpp"),
-                    "-o", str(exe)], check=True)
+    sketch = ROOT / "firmware" / f"emo_{firmware}" / f"emo_{firmware}.ino"
+    exe = Path(tempfile.gettempdir()) / (f"emo_sim_{firmware}" + (".exe" if sys.platform == "win32" else ""))
+    subprocess.run(["g++", "-std=c++11", "-O1", f'-DFIRMWARE_SKETCH="{sketch.as_posix()}"',
+                    "-I", str(HARNESS_DIR), str(HARNESS_DIR / "harness.cpp"), "-o", str(exe)], check=True)
     return exe
 
 
@@ -114,9 +119,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7777)
+    parser.add_argument("--firmware", choices=FIRMWARES, default="esp32")
     args = parser.parse_args()
 
-    exe = build()
+    exe = build(args.firmware)
     commands: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=console, args=(commands,), daemon=True).start()
 
@@ -124,7 +130,7 @@ def main() -> None:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((args.host, args.port))
         server.listen(1)
-        print(f"Simulated Nano on socket://{args.host}:{args.port} (Ctrl+C or 'quit' to stop)", flush=True)
+        print(f"Simulated {args.firmware} on socket://{args.host}:{args.port} (Ctrl+C or 'quit' to stop)", flush=True)
         keep_going = True
         while keep_going:
             conn, addr = server.accept()

@@ -4,7 +4,7 @@ EMO-Bot is a small two-legged desk companion. It stands and keeps its torso leve
 IMU-driven balance controller, walks on command, reminds you when you slouch, and holds a
 spoken conversation after a wake word.
 
-A **Raspberry Pi 5** does the thinking (vision, speech, decisions). An **Arduino Nano** does the
+A **Raspberry Pi 5** does the thinking (vision, speech, decisions). An **ESP32** does the
 fast, safety-critical control (balance PID, walking gait, fall detection) and drives four servos
 through a PCA9685.
 
@@ -17,7 +17,7 @@ through a PCA9685.
 
 | Feature | How |
 | --- | --- |
-| Stands and stays level | MPU6050 → complementary filter → PID on torso pitch → both hip servos (100 Hz on the Nano) |
+| Stands and stays level | MPU6050 → complementary filter → PID on torso pitch → both hip servos (100 Hz on the ESP32) |
 | Walks and turns | Sinusoidal gait on hips and knees; turning uses different stride lengths per leg |
 | Stays safe | Servos switch off if it falls past 45°, it stops walking if the Pi goes quiet, walks are time-limited, latched E-stop |
 | Posture reminders | Camera + MediaPipe pose; after 3 s of slouching it does a knee bob and says a reminder |
@@ -32,7 +32,7 @@ wide, flat feet and walks with a short shuffle.
 ## How it fits together
 
 ```
- Raspberry Pi 5 (Python, main.py)                                Arduino Nano (firmware, 100 Hz)
+ Raspberry Pi 5 (Python, main.py)                                ESP32 (firmware, 100 Hz)
  ┌─────────────────────────────────────────────┐                ┌─────────────────────────────────┐
  │ vision ──┐                                  │  S / W / G /   │ MPU6050 → pitch filter          │
  │ wake word├─► MQTT ─► behavior tree ─► serial├─ E / R ... ───►│ PID → hip correction            │
@@ -42,7 +42,7 @@ wide, flat feet and walks with a short shuffle.
                                                                   4 servos: L/R hip, L/R knee
 ```
 
-The Pi decides *what* to do (stand, walk for 3 s, gesture). The Nano decides *how* every 10 ms and
+The Pi decides *what* to do (stand, walk for 3 s, gesture). The ESP32 decides *how* every 10 ms and
 keeps the robot safe even if the Pi stalls.
 
 ---
@@ -56,7 +56,7 @@ keeps the robot safe even if the Pi stalls.
 | `main.py` | **Entry point.** Starts every task in one asyncio process and supervises them. If a critical task (serial, behavior tree) crashes, the robot shuts down. If an optional one (vision, wake word, speech) crashes, it is logged and the robot keeps running. Routes the Nano's events to MQTT and turns behavior-tree cues into speech. |
 | `config.py` | **All settings in one place.** Loads `.env` first, then exposes every setting (serial port, camera, audio devices, API keys, timeouts, feature switches) and every MQTT topic name. |
 | `behavior_tree_module.py` | **The robot's decision-making.** A 10 Hz py_trees priority tree: E-stop > fallen > rest > conversation > posture reminder > walk > stand. Turns MQTT commands (`walk,70,0,3`, `stand`, ...) into Nano commands, re-sending walk commands as a heartbeat. Runs standalone for testing: `python behavior_tree_module.py`. |
-| `serial_module.py` | **Link to the Nano.** Opens the serial port (or `socket://` for the simulator), waits for the `READY` banner, sends one command at a time, checks each ACK/NACK, forwards events (`EVT,FALLEN`) and telemetry, detects Nano resets and reconnects forever. `SERIAL_PORT=sim` only logs commands. |
+| `serial_module.py` | **Link to the ESP32 (or Nano).** Opens the serial port (or `socket://` for the simulator), waits for the `READY` banner, sends one command at a time, checks each ACK/NACK, forwards events (`EVT,FALLEN`) and telemetry, detects controller resets and reconnects forever. `SERIAL_PORT=sim` only logs commands. |
 | `vision_posture_module.py` | **Camera vision.** MediaPipe face detection and pose estimation; decides good or poor posture relative to your own upright baseline, and publishes `POSTURE_POOR` / `POSTURE_OK`. Supports the Pi CSI camera (Picamera2), USB cameras and laptop webcams. Runs standalone. |
 | `audio_trigger_task.py` | **Wake word.** Porcupine listens for the wake word, then records 5 s of speech and hands it to the speech pipeline. Ignores its own voice while replying. Runs standalone to test the microphone. |
 | `api_routing_task.py` | **Speech pipeline.** Whisper (speech → text) → GPT (reply) → ElevenLabs (text → speech) → speaker. Also speaks the robot's cues ("I fell over"). Plays a fallback beep on any failure. `python api_routing_task.py "Hello"` checks keys and speaker. |
@@ -65,13 +65,14 @@ keeps the robot safe even if the Pi stalls.
 
 | File | What it is |
 | --- | --- |
-| `firmware/emo_nano/emo_nano.ino` | **Arduino Nano firmware.** 100 Hz control loop: MPU6050 IMU with a complementary filter, PID on torso pitch through the hips (anti-windup, filtered D term), walking gait with knee lift and smooth start/stop, per-joint speed and angle limits, fall detection, walk watchdog, and calibration and PID gains saved in EEPROM. Speaks a line-based serial protocol (`S` stand, `W,<speed>,<turn>` walk, `G,1` gesture, `E`/`R` E-stop, `C` calibrate, `K` gains, `T` telemetry, `J` raw servo moves for setup). The configuration you adjust for your build (servo trims and directions, stance, gait sizes) is at the top. |
+| `firmware/emo_esp32/emo_esp32.ino` | **ESP32 firmware (default).** Port of the Nano sketch below: same protocol and control code. ESP32 specifics: I2C on GPIO21/22, settings in flash-emulated EEPROM (`EEPROM.commit()`), I2C timeout via `Wire.setTimeOut()`, and a `LINK_UART2` switch for USB (`Serial`) or the Pi's GPIO UART (`Serial2`, GPIO16/17, 3.3 V, no level shifter). |
+| `firmware/emo_nano/emo_nano.ino` | **Arduino Nano firmware (alternative).** 100 Hz control loop: MPU6050 IMU with a complementary filter, PID on torso pitch through the hips (anti-windup, filtered D term), walking gait with knee lift and smooth start/stop, per-joint speed and angle limits, fall detection, walk watchdog, and calibration and PID gains saved in EEPROM. Speaks a line-based serial protocol (`S` stand, `W,<speed>,<turn>` walk, `G,1` gesture, `E`/`R` E-stop, `C` calibrate, `K` gains, `T` telemetry, `J` raw servo moves for setup). The configuration you adjust for your build (servo trims and directions, stance, gait sizes) is at the top. |
 
 ### Tools, assets and deployment
 
 | File | What it is |
 | --- | --- |
-| `tools/sim_nano.py` | **Simulated Nano.** Compiles the real firmware for your PC, runs it against a simulated robot (laggy servos, noisy IMU) and serves it as a serial port on `socket://127.0.0.1:7777`. Type `tilt 8` or `tilt 70 200` to put it on a slope or knock it over. Needs `g++`. |
+| `tools/sim_nano.py` | **Simulated controller.** Compiles the real firmware (ESP32 by default, `--firmware nano` for the Nano) for your PC, runs it against a simulated robot (laggy servos, noisy IMU) and serves it as a serial port on `socket://127.0.0.1:7777`. Type `tilt 8` or `tilt 70 200` to put it on a slope or knock it over. Needs `g++`. |
 | `assets/network_error.wav` | Three descending beeps, played when the cloud speech pipeline fails. |
 | `deploy/emo-bot.service` | systemd unit that starts the robot on boot and restarts it if it crashes (install steps in RUNNING.md section 10). |
 
@@ -90,13 +91,13 @@ keeps the robot safe even if the Pi stalls.
 | File | What it is |
 | --- | --- |
 | `README.md` | This overview. |
-| `RUNNING.md` | The full guide: laptop dry run, tests, flashing the Nano, first power-up of the legs, Pi setup, `.env` reference, checking each subsystem, running, starting on boot, PID/gait tuning, troubleshooting. |
+| `RUNNING.md` | The full guide: laptop dry run, tests, flashing the controller (ESP32 or Nano), first power-up of the legs, Pi setup, `.env` reference, checking each subsystem, running, starting on boot, PID/gait tuning, troubleshooting. |
 
 ### Tests (no hardware needed)
 
 | File | What it tests |
 | --- | --- |
-| `tests/test_firmware.py` | Compiles the Nano firmware for your PC and runs 10 scenarios against a simulated robot: serial protocol, IMU direction, recovery from a slope, walking, watchdog, fall detection, wrong-sensor-direction safety, calibration + EEPROM, missing IMU, telemetry. Skipped if `g++` isn't installed. |
+| `tests/test_firmware.py` | Compiles both firmwares (ESP32, Nano) for your PC and runs 10 scenarios on each against a simulated robot: serial protocol, IMU direction, recovery from a slope, walking, watchdog, fall detection, wrong-sensor-direction safety, calibration + EEPROM, missing IMU, telemetry. Skipped if `g++` isn't installed. |
 | `tests/firmware/harness.cpp` | The simulator behind those scenarios (and behind `tools/sim_nano.py`): a planar model of the robot, simulated MPU6050, and a `serve` mode. |
 | `tests/firmware/Arduino.h`, `Wire.h`, `EEPROM.h`, `Adafruit_PWMServoDriver.h` | Small stand-ins for the Arduino libraries so the firmware compiles on a PC. |
 | `tests/test_behavior_tree.py` | Standing, walking and its heartbeat, stop, E-stop, falls, rest, calibration, tuning commands, priorities. |
@@ -130,8 +131,8 @@ git clone https://github.com/coderForLife-A1/EMO-Bot.git ~/EMO-Bot && cd ~/EMO-B
 python3 -m venv --system-site-packages .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env            # add API keys; set SERIAL_PORT / CAMERA_SOURCE / audio devices
-arduino-cli compile --fqbn arduino:avr:nano firmware/emo_nano
-arduino-cli upload  --fqbn arduino:avr:nano -p /dev/ttyUSB0 firmware/emo_nano
+arduino-cli compile --fqbn esp32:esp32:esp32 firmware/emo_esp32
+arduino-cli upload  --fqbn esp32:esp32:esp32 -p /dev/ttyUSB0 firmware/emo_esp32   # board setup: RUNNING.md section 4
 python main.py
 ```
 
@@ -147,13 +148,13 @@ mosquitto_pub -t robot/locomotion/cmd -m stand             # stand and balance
 mosquitto_pub -t robot/locomotion/cmd -m walk,70,0,3       # walk forward 3 s (speed, turn: -100..100)
 mosquitto_pub -t robot/locomotion/cmd -m walk,0,80,2       # turn right in place
 mosquitto_pub -t robot/locomotion/cmd -m rest              # servos off until "stand"
-mosquitto_pub -t robot/locomotion/cmd -m gains,0.8,3,0.03  # tune the balance PID live (saved on the Nano)
+mosquitto_pub -t robot/locomotion/cmd -m gains,0.8,3,0.03  # tune the balance PID live (saved on the ESP32)
 mosquitto_pub -t robot/locomotion/cmd -m telemetry,1       # stream pitch / correction on robot/locomotion/telemetry
 mosquitto_pub -t robot/error -m error                      # E-stop; "clear" releases it
 mosquitto_sub -t 'robot/#' -v                              # watch everything
 ```
 
-All topics and the Nano's serial protocol are listed in [RUNNING.md section 1](RUNNING.md#1-how-the-pieces-fit-together).
+All topics and the controller's serial protocol are listed in [RUNNING.md section 1](RUNNING.md#1-how-the-pieces-fit-together).
 
 ---
 
@@ -162,10 +163,11 @@ All topics and the Nano's serial protocol are listed in [RUNNING.md section 1](R
 | Component | Function | Interface / electrical requirement |
 | --- | --- | --- |
 | Raspberry Pi 5 | Runs vision, speech, MQTT and the behavior tree | 5 V USB-C power; 3.3 V GPIO; Linux ALSA/V4L2 |
-| Arduino Nano | Balance and gait controller | USB/UART at 115200 baud; 5 V logic on typical Nano boards |
-| PCA9685 | 16-channel, 12-bit PWM servo driver | I2C address `0x40` on the Nano's A4/A5; separate servo supply |
-| MPU6050 | 6-axis IMU for torso pitch (balance, fall detection) | I2C address `0x68` on the Nano's A4/A5 bus, shared with the PCA9685; flat on the pelvis, X arrow forward |
-| 4 leg servos (2 hip, 2 knee) | Legs | PCA9685 channels 0-3; powered from a regulated servo supply, never the Pi or Nano 5 V rail |
+| ESP32 DevKit (ESP32-WROOM-32) | Balance and gait controller | USB/UART at 115200 baud; 3.3 V logic |
+| Arduino Nano *(alternative)* | Balance and gait controller | USB/UART at 115200 baud; 5 V logic on typical Nano boards |
+| PCA9685 | 16-channel, 12-bit PWM servo driver | I2C address `0x40` on the controller's I2C bus (ESP32 GPIO21/22, Nano A4/A5); separate servo supply |
+| MPU6050 | 6-axis IMU for torso pitch (balance, fall detection) | I2C address `0x68` on the same I2C bus, shared with the PCA9685; flat on the pelvis, X arrow forward |
+| 4 leg servos (2 hip, 2 knee) | Legs | PCA9685 channels 0-3; powered from a regulated servo supply, never the Pi or controller rail |
 | ReSpeaker HAT | Microphone input | ALSA card 0; check with `arecord -l` and `python -m sounddevice` |
 | CSI/USB camera | Posture sensing | `CAMERA_SOURCE=picamera2` (Pi 5 CSI) or a V4L2 device such as `/dev/video0` |
 | Speaker + amplifier | Speech output | ALSA playback, e.g. `plughw:0` |
@@ -174,10 +176,19 @@ All topics and the Nano's serial protocol are listed in [RUNNING.md section 1](R
 
 ## Wiring & Pinouts
 
-All grounds must be common. Confirm the exact ReSpeaker, TFT breakout and Nano revision before
+All grounds must be common. Confirm the exact ReSpeaker, TFT breakout and controller board revision before
 powering the system.
 
-### Arduino Nano / PCA9685 / MPU6050
+### ESP32 / PCA9685 / MPU6050
+
+- ESP32 GPIO21 (SDA) -> PCA9685 `SDA` and MPU6050 `SDA` (shared bus).
+- ESP32 GPIO22 (SCL) -> PCA9685 `SCL` and MPU6050 `SCL`.
+- ESP32 `3V3` -> PCA9685 `VCC` and MPU6050 `VCC` (bus runs at 3.3 V); MPU6050 `AD0` to `GND` for `0x68`.
+- ESP32 `GND` -> PCA9685 `GND` and MPU6050 `GND`.
+- Power the ESP32 from the Pi's USB port (or a separate 5 V into `VIN`), never the servo rail: servo current dips trip the ESP32 brown-out reset.
+- Servo supply, channels and IMU mounting: same as the Nano list below.
+
+### Arduino Nano / PCA9685 / MPU6050 (alternative)
 
 - Nano A4/SDA -> PCA9685 `SDA` and MPU6050 `SDA` (shared bus).
 - Nano A5/SCL -> PCA9685 `SCL` and MPU6050 `SCL`.
@@ -188,15 +199,23 @@ powering the system.
 - Leg servos: left hip -> channel 0, right hip -> 1, left knee -> 2, right knee -> 3. PWM is 50 Hz.
 - Mount the MPU6050 flat on the pelvis with its X arrow pointing forward, away from servo vibration where possible.
 
-### Pi-to-Nano link
+### Pi-to-controller link
 
 The simplest option is a USB cable (`SERIAL_PORT=/dev/ttyUSB0`). To use the Pi's GPIO UART instead
 (`SERIAL_PORT=/dev/serial0`):
 
+**ESP32** (set `#define LINK_UART2 1` in `firmware/emo_esp32/emo_esp32.ino`; both sides 3.3 V, no level shifter):
+
+- Pi physical pin 8, GPIO14/TXD -> ESP32 GPIO16 (RX2).
+- ESP32 GPIO17 (TX2) -> Pi physical pin 10, GPIO15/RXD.
+- Pi physical pin 6 (`GND`) -> ESP32 `GND`.
+
+**Nano:**
+
 - Pi physical pin 8, GPIO14/TXD -> Nano `RX` through a bidirectional level shifter or a verified 3.3 V-safe input.
 - Nano `TX` -> Pi physical pin 10, GPIO15/RXD through a 5 V-to-3.3 V level shifter. Never connect a typical 5 V Nano TX directly to Pi GPIO15.
 - Pi physical pin 6 (`GND`) -> Nano `GND`.
-- 115200 baud, one ASCII command per line (protocol in [RUNNING.md](RUNNING.md#nano-serial-protocol-115200-baud-one-command-per-line)).
+- 115200 baud, one ASCII command per line (protocol in [RUNNING.md](RUNNING.md#controller-serial-protocol-115200-baud-one-command-per-line)).
 
 ### Raspberry Pi 5 I2C (VL53L0X, planned)
 
@@ -204,7 +223,7 @@ The simplest option is a USB cable (`SERIAL_PORT=/dev/ttyUSB0`). To use the Pi's
 - Pi physical pin 3, GPIO2/SDA -> VL53L0X `SDA`.
 - Pi physical pin 5, GPIO3/SCL -> VL53L0X `SCL`.
 - Pi physical pin 6 (`GND`) -> VL53L0X `GND`.
-- The PCA9685 and MPU6050 are on the Nano's bus, not these Pi pins.
+- The PCA9685 and MPU6050 are on the controller's bus, not these Pi pins.
 
 ### Raspberry Pi 5 SPI / GC9A01 (planned)
 
@@ -219,11 +238,11 @@ The simplest option is a USB cable (`SERIAL_PORT=/dev/ttyUSB0`). To use the Pi's
 
 ## Safety
 
-- `mosquitto_pub -t robot/error -m error` latches an E-stop: the Nano turns every servo output off
+- `mosquitto_pub -t robot/error -m error` latches an E-stop: the controller turns every servo output off
   and refuses commands until `mosquitto_pub -t robot/error -m clear`.
-- If the robot tips past 45° for a quarter of a second, the Nano switches every servo off
+- If the robot tips past 45° for a quarter of a second, the controller switches every servo off
   (`EVT,FALLEN`), the robot asks to be stood back up, and it won't stand again until it is upright and told `stand`.
-- The Nano stops walking if the Pi hasn't re-sent the walk command for 1 s. A single walk command
+- The controller stops walking if the Pi hasn't re-sent the walk command for 1 s. A single walk command
   never lasts longer than 10 s, so the robot doesn't wander off the desk.
 - Joint limits are enforced in the firmware. Set them for your mechanics before running the full
   robot, with the robot held in the air (RUNNING.md section 5).
