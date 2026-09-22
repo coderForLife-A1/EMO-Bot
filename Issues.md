@@ -2,7 +2,7 @@
 
 Code review of `main` @ `b6aa2b2`. API layer (`api_routing_task.py`) out of scope. Line numbers refer to that commit.
 
-**Status: all 13 issues are fixed.** Each section ends with a *Resolution* note: what changed and which test covers it. Run `pytest` to check them (109 tests, including 11 firmware scenarios run against both the ESP32 and the Nano firmware, compiled for the PC). The firmware fixes are in both sketches (`firmware/emo_esp32`, `firmware/emo_nano`).
+**Status: issues 1-13 are fixed; round 2 (14-26, end of file) is open.** Each section ends with a *Resolution* note: what changed and which test covers it. Run `pytest` to check them (109 tests, including 11 firmware scenarios run against both the ESP32 and the Nano firmware, compiled for the PC). The firmware fixes are in both sketches (`firmware/emo_esp32`, `firmware/emo_nano`).
 
 Severity: 🔴 **Critical** (safety / robot stops responding) · 🟠 **High** (wrong behaviour) · 🟡 **Medium** · ⚪ **Low**
 
@@ -171,3 +171,179 @@ Severity: 🔴 **Critical** (safety / robot stops responding) · 🟠 **High** (
 - **Fix:** change to section 11.
 - **Resolution:** Both sketch headers (ESP32 and Nano) now point to RUNNING.md section 4 (flashing), 5 (first power-up)
   and 11 (tuning).
+
+
+---
+
+# Round 2: bug, security and efficiency review (Raspberry Pi side, open)
+
+Review of `main` @ `6f69e19`, API layer included. Line numbers refer to that commit. Red-team pass on the MQTT,
+serial, audio and API paths. **Not fixed yet**: Pi-side code is reported here, not changed by the reviewer; each section has a proposed fix for the Pi code owner.
+
+| # | Severity | Area | Issue | Status |
+|---|---|---|---|---|
+| 14 | 🔴 Critical | Safety | E-stop silently dropped under an MQTT command flood | ⏳ Open |
+| 15 | 🟠 High | Safety | Controller stands without IMU while the Pi reports an IMU fault | ⏳ Open |
+| 16 | 🟠 High | Security | MQTT has no login or TLS; the Docker example exposes the broker to the LAN | ⏳ Open |
+| 17 | 🟠 High | Conversation | Speech cues can evict a queued recording → wake word dead until restart | ⏳ Open |
+| 18 | 🟡 Medium | Safety | E-stop doesn't cancel the active walk; walking resumes after `clear` | ⏳ Open |
+| 19 | 🟡 Medium | Security | Unthrottled `gains` / `calibrate` wear out the controller's flash | ⏳ Open |
+| 20 | 🟡 Medium | Security | No MQTT payload size limit | ⏳ Open |
+| 21 | ⚪ Low | Security | API keys can be sent over plain HTTP | ⏳ Open |
+| 22 | ⚪ Low | Privacy | What the user said is logged at INFO | ⏳ Open |
+| 23 | ⚪ Low | Dev tool | `sim_nano.py` builds to a predictable path in the shared temp dir | ⏳ Open |
+| 24 | ⚪ Low | Efficiency | Vision wastes CPU per frame | ⏳ Open |
+| 25 | ⚪ Low | Efficiency | Audio round-trips every WAV through temp files | ⏳ Open |
+| 26 | ⚪ Low | Cleanup | Dead and duplicated code | ⏳ Open |
+
+Firmware findings from the same review are already fixed on the `Fixes` branch (see the end of this file).
+
+
+## 🔴 14. E-stop silently dropped under an MQTT command flood
+
+- **Where:** `behavior_tree_module.py:67` (unbounded `outbox`), `:121` (`ServiceCommands`), `:138-141` (`EStopGuard`).
+- **What:** `ServiceCommands` is the first child of the tree and moves the whole outbox into `motor_queue`
+  (max 200) every tick. `EStopGuard` runs after it; `put_motor("E")` returns `False` when the queue is full, but
+  the result is ignored and `latched = True` is set anyway.
+- **Effect:** E is never sent and never retried: **servos stay powered while the Pi believes it is E-stopped**.
+- **Repro:** within one 100 ms tick publish > 200 `gesture` / `telemetry,1` messages to `robot/locomotion/cmd`, and
+  `error` to `robot/error`.
+- **Fix:** bound the outbox (e.g. 16, reject extra with a warning); add `CommandBus.put_urgent()` that empties
+  `motor_queue` before queueing E; latch only once E is queued.
+
+
+## 🟠 15. Controller stands without IMU while the Pi reports an IMU fault
+
+- **Where:** `behavior_tree_module.py:166` (`ImuFaultGuard` sends O only once), `:384-388`, `:397`;
+  firmware `emo_esp32.ino:614` (`ACK,S,NOIMU`).
+- **What:** with `ALLOW_NO_IMU=0` and no IMU at boot: `READY,NOIMU` → `imu_fault` → guard sends O once. A `stand`
+  command sets `imu_retry` → S. The firmware stands in balance mode without the IMU and answers `ACK,S,NOIMU`.
+  `apply_serial_line` sets `legs_standing = True` but leaves `imu_fault` set; the guard has already sent its O.
+- **Effect:** servos powered with no balance and no fall detection, which `ALLOW_NO_IMU=0` is meant to prevent.
+  Second case, with `ALLOW_NO_IMU=1`: `NACK,C,NOIMU` (calibrate on the bench) sets `imu_fault`, and
+  `ACK,S,NOIMU` never clears it → stuck in the fault branch.
+- **Fix:** guard re-sends O whenever `imu_fault and legs_standing`; `ACK,S,NOIMU` sets
+  `imu_fault = not ALLOW_NO_IMU`; don't count `NACK,C,NOIMU` as a fault (calibration only).
+  The `Fixes` firmware now retries IMU init on every S, so `ACK,S` means the IMU really came back.
+
+
+## 🟠 16. MQTT has no login or TLS; Docker example exposes the broker
+
+- **Where:** `config.py:29-30` (host/port only); four client builders (`main.py:90`, `behavior_tree_module.py:507`,
+  `audio_trigger_task.py:31`, `vision_posture_module.py:65`); `RUNNING.md:125`.
+- **What:** every client connects anonymously in plain text. The Docker command publishes `-p 1883:1883` on all
+  interfaces with `mosquitto-no-auth.conf`.
+- **Effect:** anyone on the network can E-stop, walk, change gains, calibrate, or spoof the wake flag/posture
+  events. (apt Mosquitto 2.x listens on localhost only by default, so only the Docker path is exposed out of the box.)
+- **Fix:** `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_TLS`, `MQTT_CA_CERTS` in config, applied by one shared client
+  factory; Docker example `-p 127.0.0.1:1883:1883`; document `password_file` + ACLs for remote access.
+
+
+## 🟠 17. Speech cues can evict a queued recording
+
+- **Where:** `main.py:189` (`offer(speech_queue, ...)`), `main.py:234` (`maxsize=20`).
+- **What:** `offer` drops the **oldest** job when the queue is full. That can be a `LISTEN_JOB`; `busy_event` is
+  cleared only after a `LISTEN_JOB` is processed.
+- **Effect:** `busy_event` stays set → the wake-word worker skips every frame → **no wake word until restart**.
+  The wake flag stays `1` until the 30 s timeout and the recording leaks in `/dev/shm`.
+- **Repro:** while one API job is running (up to 15 s + playback), toggle `robot/error` `error`/`clear` 20 times
+  (each latch queues `AUDIO,EMERGENCY_STOP`).
+- **Fix:** queue cues with `put_nowait` and drop the **cue** when full; never evict listen jobs.
+
+
+## 🟡 18. E-stop doesn't cancel the active walk
+
+- **Where:** `behavior_tree_module.py:136-141`.
+- **What:** `EStopGuard` doesn't reset `walk_until`.
+- **Effect:** `walk,50,0,10` → `error` → `clear` within 10 s: R, S, then W — the robot walks off again after an
+  emergency stop. `test_estop_latches_once_and_restands_after_release` sends `stop` before `clear`, masking it.
+- **Fix:** `state.walk_until = 0.0` when the E-stop latches; test without the `stop`.
+
+
+## 🟡 19. Unthrottled `gains` / `calibrate` wear out the flash
+
+- **Where:** `behavior_tree_module.py:366`, `:371`; firmware `saveSettings()` (`emo_esp32.ino:278`).
+- **What:** every K and C saves settings; on the ESP32 that is a flash sector erase + write
+  (`EEPROM.commit()`), with no rate limit on the Pi.
+- **Effect:** a flood of `gains` at serial speed (~50/s) reaches the ~100k erase-cycle rating in well under an
+  hour → settings corrupt / lost. (The `Fixes` firmware skips unchanged writes; alternating values still write.)
+- **Fix:** rate-limit K and C on the Pi (e.g. 1 per second, warn and drop the rest).
+
+
+## 🟡 20. No MQTT payload size limit
+
+- **Where:** `behavior_tree_module.py:524`.
+- **What:** any payload is decoded and stripped on paho's thread; Mosquitto accepts up to 256 MB by default.
+- **Effect:** memory/CPU spike on the Pi from one large message.
+- **Fix:** drop payloads over 256 bytes before decoding; set `message_size_limit` in the broker config.
+
+
+## ⚪ 21. API keys can be sent over plain HTTP
+
+- **Where:** `api_routing_task.py:48`, `:62`, `:93`.
+- **What:** `OPENAI_BASE_URL` / `ELEVENLABS_TTS_URL` are used as given; an `http://` value sends the Bearer token
+  and `xi-api-key` in clear text.
+- **Fix:** refuse non-HTTPS URLs unless the host is `localhost` / `127.0.0.1` / `::1` (fall back to the error sound).
+
+
+## ⚪ 22. What the user said is logged at INFO
+
+- **Where:** `api_routing_task.py:156` (`Heard`), `:158` (`Replying`).
+- **Effect:** journald on the Pi keeps a transcript of every conversation.
+- **Fix:** log both at DEBUG.
+
+
+## ⚪ 23. Predictable simulator build path
+
+- **Where:** `tools/sim_nano.py:40`.
+- **What:** the executable is always `<tmp>/emo_sim_<firmware>` in the shared temp directory.
+- **Effect:** on a multi-user Linux box another user can pre-create or swap that file (symlink / TOCTOU) and have
+  their binary run.
+- **Fix:** build into `tempfile.mkdtemp()` and remove it on exit.
+
+
+## ⚪ 24. Vision wastes CPU per frame
+
+- **Where:** `vision_posture_module.py:378`, `:389-394`, `:176`.
+- **What:**
+  - BGR→RGB conversion runs on every frame, pose only on every 2nd (face detection is off by default) → half the
+    conversions are unused.
+  - Skipped frames are still fully decoded (`read()` instead of `grab()`).
+  - `posture_metrics()` runs twice per pose frame (directly and inside `is_poor_posture`).
+  - Pose at ~15 Hz; posture timing (3 s confirm, 1 s clear) needs ~5 Hz.
+- **Fix:** time-based pose throttle (~0.2 s), `grab()` for skipped frames, convert only when a detector runs, compute
+  metrics once. Expected: roughly 3x less MediaPipe CPU on the Pi.
+
+
+## ⚪ 25. Audio round-trips every WAV through temp files
+
+- **Where:** `audio_trigger_task.py:71` (recording → `/dev/shm` file), `api_routing_task.py:108` (TTS → file → aplay),
+  `audio_trigger_task.py:102`.
+- **What:** WAVs are written to disk and read back / deleted; the `struct` format string (`"h" * 512`) is rebuilt
+  for every audio frame (~31/s).
+- **Fix:** pass WAV bytes in memory, pipe playback into `aplay -` stdin; precompile one `struct.Struct`.
+
+
+## ⚪ 26. Dead and duplicated code
+
+- `behavior_tree_module.py:468` `on_mqtt_message`: unused since MQTT messages go through `build_mqtt_client`.
+- `vision_posture_module.py:24-25` `TOPIC_STATE` / `TOPIC_FACE_ERROR` aliases: unused.
+- Four copies of the MQTT client setup (see #16) and two copies of the camera loop (`main._vision_worker`,
+  `vision_posture_module.run`).
+- **Fix:** delete the unused code; one MQTT factory, one shared camera loop.
+
+
+---
+
+## Firmware (fixed on the `Fixes` branch)
+
+Both sketches, host tests extended, real ESP32 and Nano compiles pass.
+
+- **E-stop latency:** `allOutputsOff()` made 16 I2C writes; now one `ALL_LED` write (full-off bit), with the
+  per-channel writes as fallback if the bus NACKs.
+- **Gain cap:** K accepted gains above 1000 when sent straight over serial (only the Pi checked); now `NACK,K,PARSE`.
+- **IMU plugged in after boot:** S retried the IMU only after a runtime loss; now whenever the IMU is missing.
+- **ESP32 double math:** `PI`, `TWO_PI`, `RAD_TO_DEG`, `sin`/`cos`/`atan2`/`lround` ran as software doubles on a
+  single-precision FPU; now float versions (~5 KB less flash).
+- **Flash writes:** ESP32 committed settings on every K/C even when unchanged; now compares first.
+- **IMU read:** 14 bytes per sample, 12 used; now 12.
