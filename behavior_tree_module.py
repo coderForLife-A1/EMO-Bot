@@ -59,7 +59,7 @@ class SharedState:
     # Legs
     fallen: bool = False  # EVT,FALLEN / NACK,S,TILTED; cleared by a "stand" command
     imu_fault: bool = False  # EVT,IMU_FAIL / NACK,*,NOIMU / READY,NOIMU; cleared by ACK,S or READY,IMU
-    imu_retry: bool = False  # "stand" while imu_fault: send one S so the controller tries to re-init the IMU
+    imu_retry: bool = False  # "stand" while imu_fault: send one I (re-init the IMU without moving a servo)
     resting: bool = False  # "rest" command: servos off until "stand"
     legs_standing: bool = False  # confirmed by ACK,S; cleared by NACKs, O, E, falls, resets
     stand_sent_at: Optional[float] = None  # when the last unanswered S was sent
@@ -68,7 +68,8 @@ class SharedState:
     walk_until: float = 0.0  # monotonic deadline of the current walk command
     walking: bool = False  # we sent a non-zero W that hasn't been stopped yet
     outbox: collections.deque = field(default_factory=collections.deque)  # raw tuning commands (max OUTBOX_MAX)
-    last_flash_write: float = float("-inf")  # last gains/calibrate sent (each one writes the controller's flash)
+    last_flash_write: dict = field(default_factory=dict)  # "gains"/"calibrate" -> time last queued (flash writes)
+    estop_resend: bool = False  # controller rebooted during an E-stop: latch it again
     last_outbox_warning: float = float("-inf")
 
 
@@ -155,11 +156,15 @@ class EStopGuard(py_trees.behaviour.Behaviour):
                 _legs_off(self.state)
                 self.state.walk_until = 0.0  # an E-stop cancels the walk; "clear" must not resume it
                 self.state.outbox.clear()  # ...and any queued tuning commands: nothing stale after "clear"
+                self.state.estop_resend = False
                 self.latched = True
+            elif self.latched and self.state.estop_resend and self.bus.put_urgent("E"):
+                self.state.estop_resend = False  # the controller rebooted mid-E-stop: latch it again
             return py_trees.common.Status.SUCCESS
 
         if self.latched:
             self.bus.put_motor("R")  # servos stay off; a lower branch sends S to stand again
+            self.state.outbox.clear()  # (commands are refused during an E-stop; belt and braces)
             self.latched = False
         return py_trees.common.Status.FAILURE
 
@@ -167,7 +172,8 @@ class EStopGuard(py_trees.behaviour.Behaviour):
 class ImuFaultGuard(py_trees.behaviour.Behaviour):
     """No balance or fall detection without the IMU: relax the servos and don't stand or walk.
 
-    A "stand" command sends one S, which makes the controller try to re-initialise the IMU.
+    A "stand" command sends one I: the controller re-initialises the IMU without moving a servo and answers
+    ACK,I (working: the fault clears and the normal branches stand the robot up) or NACK,I,NOIMU.
     """
 
     def __init__(self, state: SharedState, bus: CommandBus):
@@ -189,7 +195,7 @@ class ImuFaultGuard(py_trees.behaviour.Behaviour):
             self.handled = True
         if self.state.imu_retry:
             self.state.imu_retry = False
-            self.bus.put_motor("S")
+            self.bus.put_motor("I")  # never S: that would stand the robot blind if the IMU is still missing
         return py_trees.common.Status.SUCCESS
 
 
@@ -347,27 +353,42 @@ def _clamp_int(text: str, low: int, high: int) -> int:
     return max(low, min(high, int(_finite(text))))
 
 
-def _queue_raw(state: SharedState, *commands: str) -> None:
-    """Queue tuning commands for the controller; a flood beyond OUTBOX_MAX is dropped, not buffered."""
+def _queue_raw(state: SharedState, *commands: str) -> bool:
+    """Queue tuning commands for the controller; a flood beyond OUTBOX_MAX is dropped, not buffered.
+
+    Returns False if they were dropped.
+    """
     if len(state.outbox) + len(commands) > OUTBOX_MAX:
         now = time.monotonic()
         if now - state.last_outbox_warning > 1.0:  # a flood logs once a second, not once per message
             state.last_outbox_warning = now
             logger.warning("Too many queued tuning commands; dropping %s (and any more this second)",
                            ", ".join(commands))
-        return
+        return False
     state.outbox.extend(commands)
+    return True
 
 
 def _flash_write_allowed(state: SharedState, cmd: str) -> bool:
-    """gains/calibrate each rewrite the controller's settings in flash: allow one per FLASH_WRITE_MIN_S."""
-    now = time.monotonic()
-    if now - state.last_flash_write < FLASH_WRITE_MIN_S:
-        logger.warning("Ignoring %r: only one gains/calibrate per %.0f s (each one writes flash)",
-                       cmd, FLASH_WRITE_MIN_S)
+    """gains and calibrate each rewrite the controller's settings in flash: one of each per FLASH_WRITE_MIN_S.
+
+    Only checks; the time is recorded by _queue_flash_write once the command is really queued.
+    """
+    if time.monotonic() - state.last_flash_write.get(cmd, float("-inf")) < FLASH_WRITE_MIN_S:
+        logger.warning("Ignoring %r: at most one %s per %.0f s (each one writes flash)", cmd, cmd, FLASH_WRITE_MIN_S)
         return False
-    state.last_flash_write = now
     return True
+
+
+def _queue_flash_write(state: SharedState, cmd: str, *commands: str) -> bool:
+    if _queue_raw(state, *commands):
+        state.last_flash_write[cmd] = time.monotonic()
+        return True
+    return False
+
+
+# Commands refused while the E-stop is latched: nothing asked for during an emergency runs after "clear".
+_REFUSED_DURING_ESTOP = {"walk", "gesture", "telemetry", "gains", "calibrate"}
 
 
 def apply_locomotion_command(state: SharedState, payload: str) -> None:
@@ -378,6 +399,9 @@ def apply_locomotion_command(state: SharedState, payload: str) -> None:
     """
     parts = [p.strip() for p in payload.strip().lower().split(",")]
     cmd, args = parts[0], parts[1:]
+    if state.estop_active and cmd in _REFUSED_DURING_ESTOP:
+        logger.warning("Ignoring %r during the E-stop (send it again after 'clear')", payload)
+        return
     try:
         if cmd == "stand":
             state.fallen = state.resting = False
@@ -406,13 +430,12 @@ def apply_locomotion_command(state: SharedState, payload: str) -> None:
             if min(kp, ki, kd) < 0 or max(kp, ki, kd) > 100_000:
                 raise ValueError("gains must be between 0 and 1000")
             if _flash_write_allowed(state, cmd):
-                _queue_raw(state, f"K,{kp},{ki},{kd}")
+                _queue_flash_write(state, cmd, f"K,{kp},{ki},{kd}")
         elif cmd == "calibrate":
-            if _flash_write_allowed(state, cmd):
-                # Calibration needs the balance loop off: relax, measure, then stay relaxed until "stand".
+            # Calibration needs the balance loop off: relax, measure, then stay relaxed until "stand".
+            if _flash_write_allowed(state, cmd) and _queue_flash_write(state, cmd, "O", "C"):
                 state.resting = True
                 state.walk_until = 0.0
-                _queue_raw(state, "O", "C")
         else:
             logger.warning("Unknown locomotion command %r", payload)
     except (IndexError, ValueError, OverflowError):
@@ -432,6 +455,10 @@ def apply_serial_line(state: SharedState, line: str) -> None:
         # balance, which is only acceptable on the bench (ImuFaultGuard relaxes it again otherwise).
         state.imu_fault = line == "ACK,S,NOIMU" and not config.ALLOW_NO_IMU
         return
+    if line == "ACK,I":
+        state.imu_fault = False  # IMU answered; the normal branches now stand the robot up
+        state.stand_sent_at = None
+        return
     if line in ("ACK,O", "ACK,E"):
         _legs_off(state)
         return
@@ -439,7 +466,7 @@ def apply_serial_line(state: SharedState, line: str) -> None:
         state.fallen = True
         _legs_off(state)
         return
-    if line == "EVT,IMU_FAIL" or line in ("NACK,S,NOIMU", "NACK,W,NOIMU"):
+    if line == "EVT,IMU_FAIL" or line in ("NACK,S,NOIMU", "NACK,W,NOIMU", "NACK,I,NOIMU"):
         # (NACK,C,NOIMU only means calibration needs the IMU: not a fault on a bench without one.)
         state.imu_fault = True
         _legs_off(state)
@@ -454,8 +481,12 @@ def apply_serial_line(state: SharedState, line: str) -> None:
 
 
 def on_nano_reset(state: SharedState) -> None:
-    """The controller (re)booted with its servos off: stand again on the next tick."""
+    """The controller (re)booted with its servos off: stand again on the next tick.
+
+    If it rebooted during an E-stop, its latch is gone: EStopGuard sends E again.
+    """
     _legs_off(state)
+    state.estop_resend = state.estop_active
 
 
 def clear_conversation(state: SharedState) -> None:
@@ -554,11 +585,9 @@ def build_mqtt_client(deliver: Deliver) -> mqtt.Client:
     last_oversize_warning = [0.0]
 
     def on_connect(client: mqtt.Client, _userdata, _flags, reason_code, _properties) -> None:
-        if reason_code == 0:
+        if reason_code == 0:  # failures are logged by mqtt_client.make_client
             for topic in SUBSCRIBED_TOPICS:
                 client.subscribe(topic)
-        else:
-            logger.error("MQTT connect failed: %s", reason_code)
 
     def on_message(_client: mqtt.Client, _userdata, msg: mqtt.MQTTMessage) -> None:
         try:

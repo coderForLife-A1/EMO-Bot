@@ -2,7 +2,7 @@
 
 Code review of `main` @ `b6aa2b2`. API layer (`api_routing_task.py`) out of scope. Line numbers refer to that commit.
 
-**Status: issues 1-26 are fixed (1-13 in round 1, 14-26 in round 2, both on `Fixes`); round 3 (27-34, end of file) is open.** Each section ends with a *Resolution* note: what changed and which test covers it. Run `pytest` to check them (138 tests, including 11 firmware scenarios run against both the ESP32 and the Nano firmware, compiled for the PC). The firmware fixes are in both sketches (`firmware/emo_esp32`, `firmware/emo_nano`).
+**Status: all issues are fixed (1-13 in round 1, 14-26 in round 2, 27-34 in round 3), on `Fixes`.** Each section ends with a *Resolution* note: what changed and which test covers it. Run `pytest` to check them (158 tests, including 11 firmware scenarios run against both the ESP32 and the Nano firmware, compiled for the PC). The firmware fixes are in both sketches (`firmware/emo_esp32`, `firmware/emo_nano`).
 
 Severity: 🔴 **Critical** (safety / robot stops responding) · 🟠 **High** (wrong behaviour) · 🟡 **Medium** · ⚪ **Low**
 
@@ -348,7 +348,7 @@ Firmware findings from the same review are already fixed on the `Fixes` branch (
 - **Fix:** time-based pose throttle (~0.2 s), `grab()` for skipped frames, convert only when a detector runs, compute
   metrics once. Expected: roughly 3x less MediaPipe CPU on the Pi.
 - **Resolution:** Pose runs on a timer (`POSE_PERIOD_S = 0.2`, ~5 Hz). Frames the pipeline won't use are taken with
-  `grab()` (no decode; free on picamera2), BGR->RGB conversion only runs when a detector runs, and posture
+  `grab()` (no decode; on Picamera2 this was wrong until #27: its `grab()` didn't wait for a frame), BGR->RGB conversion only runs when a detector runs, and posture
   metrics are computed once per pose frame (`judge_posture`). Tests: `test_pose_runs_at_about_5_hz`,
   `test_grab_skips_decoding`, `test_shared_camera_loop_grabs_unwanted_frames`, `test_posture_metrics_computed_once`.
 
@@ -397,22 +397,22 @@ Both sketches, host tests extended, real ESP32 and Nano compiles pass.
 
 ---
 
-# Round 3: review of the round-2 fixes (Raspberry Pi side, open)
+# Round 3: review of the round-2 fixes (Raspberry Pi side, fixed)
 
 Review of `Fixes` @ `6a6a43e` (Pi fixes for 14-26). Line numbers refer to that commit. All 138 tests pass there;
-the findings below are what the tests don't cover. **Not fixed yet**: Pi-side code is reported here, not changed by
-the reviewer; each section has a proposed fix for the Pi code owner.
+the findings below are what the tests don't cover. The reviewer reported the Pi-side issues without changing that
+code; they are now fixed on `Fixes`, each section ending with a *Resolution* note.
 
 | # | Severity | Area | Issue | Status |
 |---|---|---|---|---|
-| 27 | 🟠 High | Efficiency | Pi camera (Picamera2): vision thread busy-loops on `grab()`, one CPU core at ~100% | ⏳ Open |
-| 28 | 🟡 Medium | Safety | `stand` during an IMU fault stands the robot blind for a moment before relaxing it | ⏳ Open (firmware side ready) |
-| 29 | 🟡 Medium | Safety | Tuning commands sent during an E-stop (incl. `calibrate`) run after `clear` | ⏳ Open |
-| 30 | 🟡 Medium | Safety | Commands queued while the controller is unplugged are replayed on reconnect | ⏳ Open |
-| 31 | ⚪ Low | Behaviour | Flash rate limit is spent by commands that are then dropped; gains and calibrate share it | ⏳ Open |
-| 32 | ⚪ Low | Docs | Secure-MQTT setup breaks the robot's own local connection and every `mosquitto_pub` example | ⏳ Open |
-| 33 | ⚪ Low | Consistency | `require_https` blocks cached phrases; its "local" check differs from `mqtt_client._is_local` | ⏳ Open |
-| 34 | ⚪ Low | Diagnostics | Broker login failures are silent for the publisher and audio clients | ⏳ Open |
+| 27 | 🟠 High | Efficiency | Pi camera (Picamera2): vision thread busy-loops on `grab()`, one CPU core at ~100% | ✅ Fixed |
+| 28 | 🟡 Medium | Safety | `stand` during an IMU fault stands the robot blind for a moment before relaxing it | ✅ Fixed |
+| 29 | 🟡 Medium | Safety | Tuning commands sent during an E-stop (incl. `calibrate`) run after `clear` | ✅ Fixed |
+| 30 | 🟡 Medium | Safety | Commands queued while the controller is unplugged are replayed on reconnect | ✅ Fixed |
+| 31 | ⚪ Low | Behaviour | Flash rate limit is spent by commands that are then dropped; gains and calibrate share it | ✅ Fixed |
+| 32 | ⚪ Low | Docs | Secure-MQTT setup breaks the robot's own local connection and every `mosquitto_pub` example | ✅ Fixed |
+| 33 | ⚪ Low | Consistency | `require_https` blocks cached phrases; its "local" check differs from `mqtt_client._is_local` | ✅ Fixed |
+| 34 | ⚪ Low | Diagnostics | Broker login failures are silent for the publisher and audio clients | ✅ Fixed |
 
 
 ## 🟠 27. Picamera2: vision thread busy-loops on `grab()`
@@ -428,6 +428,11 @@ the reviewer; each section has a proposed fix for the Pi code owner.
 - **Fix:** make `_Picamera2Capture.grab()` wait for and drop one frame (e.g. `self._cam.capture_request().release()`),
   or have `run_vision` sleep until `last_pose + POSE_PERIOD_S` when the pipeline doesn't want a frame. Add a test
   with a non-blocking fake camera that counts `grab()` calls.
+- **Resolution:** `_Picamera2Capture.grab()` now waits for the next frame and drops it (`capture_request().release()`),
+  like cv2's `grab()`. As a second layer, `run_vision` sleeps one frame time whenever a `grab()` returns in under
+  2 ms, so any camera whose `grab()` doesn't block is paced instead of spun. Tests:
+  `test_nonblocking_grab_does_not_spin` (fake clock: 2 s of video = 10 decoded frames and at most ~65 grabs,
+  instead of millions), `test_picamera2_grab_waits_for_a_frame`.
 
 
 ## 🟡 28. `stand` during an IMU fault stands the robot blind
@@ -443,6 +448,10 @@ the reviewer; each section has a proposed fix for the Pi code owner.
   instead of `S`; in `apply_serial_line` clear `imu_fault` on `ACK,I`, keep it on `NACK,I,NOIMU`, and let the
   normal branches send `S` once the fault is gone. Add `"I": 1.0` to `SLOW_REPLY_TIMEOUT_S` (`serial_module.py:24`),
   as the retry re-measures the gyro bias like `S` does.
+- **Resolution:** `ImuFaultGuard` retries with `I` instead of `S`, so a retry never moves a servo. `ACK,I` clears the
+  fault and the normal branches then send `S`; `NACK,I,NOIMU` keeps it. `I` gets the 1 s reply timeout like `S`
+  (`SLOW_REPLY_TIMEOUT_S`). Tests: `test_imu_retry_never_stands_the_robot_blind`,
+  `test_stand_retries_imu_once_and_recovers`, `test_i_command_gets_the_slow_timeout`.
 
 
 ## 🟡 29. Tuning commands sent during an E-stop run after `clear`
@@ -455,6 +464,10 @@ the reviewer; each section has a proposed fix for the Pi code owner.
   ("nothing stale runs after `clear`").
 - **Fix:** while `estop_active`, reject outbox commands (`gesture`, `telemetry`, `gains`, `calibrate`) with a
   warning, or clear the outbox again when the E-stop is released. Test: `error`, `calibrate`, `clear` → no `C`.
+- **Resolution:** While the E-stop is latched, `walk`, `gesture`, `telemetry`, `gains` and `calibrate` are refused with a
+  warning (walk too: a walk sent during the E-stop would otherwise start after `clear`), and the outbox is cleared
+  again on release. Test: `test_commands_during_estop_never_run_later` (`error`, then all five, then `clear` sends
+  only `R`, `S`).
 
 
 ## 🟡 30. Commands queued while the controller is unplugged are replayed on reconnect
@@ -468,6 +481,10 @@ the reviewer; each section has a proposed fix for the Pi code owner.
 - **Fix:** drop everything in `serial_queue` when the port (re)opens and when a `READY` reset is detected, before
   `on_connect()` runs, so the tree rebuilds the state from scratch. Test: queue `C` while disconnected, then
   reconnect → no `C` sent.
+- **Resolution:** `serial_task` drops everything still queued when the port (re)opens and when a `READY` reset is
+  detected, before `on_connect()`, so the behavior tree rebuilds the state from scratch. Related: a controller
+  that reboots during an E-stop comes back unlatched, so `on_nano_reset` makes `EStopGuard` send `E` again.
+  Tests: `test_backlog_is_dropped_on_reconnect`, `test_controller_reboot_during_estop_is_latched_again`.
 
 
 ## ⚪ 31. Flash rate limit spent by dropped commands; gains and calibrate share it
@@ -479,6 +496,9 @@ the reviewer; each section has a proposed fix for the Pi code owner.
   (a normal tuning sequence) silently loses the gains (warning only).
 - **Fix:** record the time only once the command is queued; either document that the two share the limit or give
   each its own timer (both write the same small settings block).
+- **Resolution:** The time is recorded only once the command is really queued (`_queue_flash_write`), and `gains` and
+  `calibrate` have separate timers (at most one of each per second). Tests: `test_calibrate_then_gains_both_go_through`,
+  `test_dropped_command_does_not_spend_the_rate_limit`, `test_flash_writes_are_rate_limited`.
 
 
 ## ⚪ 32. Secure-MQTT setup breaks the local connection and the examples
@@ -494,6 +514,12 @@ the reviewer; each section has a proposed fix for the Pi code owner.
 - **Fix:** add `listener 1883 127.0.0.1` for the robot's own clients (plain text on loopback) and keep 8883 + TLS
   for remote use; show the `mosquitto_pub` flags for a secured broker; suggest a separate remote user with only the
   topics it needs.
+- **Resolution:** RUNNING.md section 13 rewritten: `listener 1883 127.0.0.1` for the robot's own programs (plain text on
+  loopback) plus `listener 8883` with TLS for remote use, a login on both, separate `robot` and `remote` users
+  (remote can only send commands and the E-stop), the certificate SAN requirement, the robot's `.env`, and the
+  `mosquitto_pub` / `mosquitto_sub` flags for a secured broker (local and remote); sections 2, 9 and 11 point to
+  them. Also fixed: the old example put a comment after `message_size_limit` on the same line, which Mosquitto
+  doesn't accept. The protocol table now lists `I`.
 
 
 ## ⚪ 33. `require_https` blocks cached phrases; two different "local" checks
@@ -506,6 +532,10 @@ the reviewer; each section has a proposed fix for the Pi code owner.
   disagree on what counts as local.
 - **Fix:** check the URL only right before a request is sent (in `_transcribe` / `_request_response` / `_synthesize`);
   share one `is_local_host()` helper.
+- **Resolution:** `require_https` runs right before each request (`_transcribe`, `_request_response`, `_synthesize`), so a
+  cached phrase, which sends nothing, plays even with an `http://` URL. New `netutil.is_local_host()` (localhost or
+  any loopback address) is the single "local" check, used by both the API pipeline and `mqtt_client`. Tests:
+  `test_cached_phrase_plays_even_with_an_http_url`, `test_one_shared_local_check`.
 
 
 ## ⚪ 34. Broker login failures are silent
@@ -517,6 +547,10 @@ the reviewer; each section has a proposed fix for the Pi code owner.
   and nothing in the log from those clients.
 - **Fix:** give `make_client` a default `on_connect` / `on_connect_fail` that logs the reason code once per failure
   streak.
+- **Resolution:** `mqtt_client.make_client` wraps every client's `on_connect` and adds `on_connect_fail`: a refused
+  connection (e.g. bad login) or an unreachable broker is logged once per failure streak, and recovery is logged
+  once. The behavior tree's own failure log was removed (now shared). Tests:
+  `test_connection_failures_are_logged_once_per_streak`, `test_user_on_connect_still_runs`.
 
 
 ## Firmware (round 3, on the `Fixes` branch)

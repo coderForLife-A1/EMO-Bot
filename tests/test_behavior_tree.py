@@ -218,16 +218,28 @@ def test_estop_latches_only_once_queued(robot):
 
 
 def test_stood_up_without_imu_is_relaxed_again(robot, monkeypatch):
-    """#15: after a retry the controller answered ACK,S,NOIMU and stood with no balance."""
+    """#15: if the controller stands without its IMU anyway (ACK,S,NOIMU), it is relaxed at once."""
     monkeypatch.setattr(config, "ALLOW_NO_IMU", False)
     state, bus, tree = robot
     nano(state, "READY,NOIMU")
     assert tick(tree, bus)[0] == ["O"]
-    loco(state, "stand")
-    assert tick(tree, bus)[0] == ["S"]  # one retry
-    nano(state, "ACK,S,NOIMU")  # IMU still absent: stood anyway
+    nano(state, "ACK,S,NOIMU")  # e.g. an S sent by hand over the serial console
     assert state.imu_fault is True
     assert tick(tree, bus)[0] == ["O"]  # relaxed again
+
+
+def test_imu_retry_never_stands_the_robot_blind(robot, monkeypatch):
+    """#28: the retry used to be an S, which stands the robot with no balance if the IMU is still missing."""
+    monkeypatch.setattr(config, "ALLOW_NO_IMU", False)
+    state, bus, tree = robot
+    nano(state, "READY,NOIMU")
+    tick(tree, bus)
+    loco(state, "stand")
+    motor, _ = tick(tree, bus, 5)
+    assert motor == ["I"]  # I re-initialises the IMU without moving a servo
+    nano(state, "NACK,I,NOIMU")
+    assert tick(tree, bus, 5)[0] == []  # still missing: nothing moves
+    assert state.imu_fault is True
 
 
 def test_bench_mode_calibrate_without_imu_is_not_a_fault(robot, monkeypatch):
@@ -243,16 +255,58 @@ def test_bench_mode_calibrate_without_imu_is_not_a_fault(robot, monkeypatch):
 
 
 def test_flash_writes_are_rate_limited(robot):
-    """#19: every gains/calibrate rewrites the controller's flash; one per second at most."""
+    """#19: every gains/calibrate rewrites the controller's flash; one of each per second at most."""
     state, bus, tree = standing(robot)
     for i in range(50):
         loco(state, f"gains,0.{i + 10},3,0.03")
-    loco(state, "calibrate")
     motor, _ = tick(tree, bus)
-    assert [m for m in motor if m.startswith(("K,", "C"))] == ["K,10,300,3"]
-    state.last_flash_write -= bt.FLASH_WRITE_MIN_S  # a second later
+    assert [m for m in motor if m.startswith("K,")] == ["K,10,300,3"]
+    state.last_flash_write["gains"] -= bt.FLASH_WRITE_MIN_S  # a second later
+    loco(state, "gains,0.9,3,0.03")
+    assert tick(tree, bus)[0] == ["K,90,300,3"]
+
+
+def test_calibrate_then_gains_both_go_through(robot):
+    """#31: calibrate and gains used to share one timer, so gains right after calibrate was lost."""
+    state, bus, tree = standing(robot)
     loco(state, "calibrate")
-    assert tick(tree, bus)[0][:2] == ["O", "C"]
+    loco(state, "gains,0.9,3,0.03")
+    motor, _ = tick(tree, bus)
+    assert motor[:3] == ["O", "C", "K,90,300,3"]
+
+
+def test_dropped_command_does_not_spend_the_rate_limit(robot):
+    """#31: a gains dropped because the outbox was full used to block the next valid one for 1 s."""
+    state, bus, tree = standing(robot)
+    for _ in range(bt.OUTBOX_MAX):
+        loco(state, "gesture")
+    loco(state, "gains,0.5,3,0.03")  # dropped: outbox full
+    tick(tree, bus)
+    loco(state, "gains,0.6,3,0.03")  # must not be refused by the rate limit
+    assert tick(tree, bus)[0] == ["K,60,300,3"]
+
+
+def test_commands_during_estop_never_run_later(robot):
+    """#29: calibrate/gesture sent while E-stopped used to run after "clear" (a stale calibration in flash)."""
+    state, bus, tree = standing(robot)
+    bt.apply_topic_payload(state, config.TOPIC_ERROR, "error")
+    tick(tree, bus)
+    for payload in ("calibrate", "gesture", "gains,0.9,3,0.03", "telemetry,1", "walk,50,0,5"):
+        loco(state, payload)
+    bt.apply_topic_payload(state, config.TOPIC_ERROR, "clear")
+    motor, _ = tick(tree, bus, 3)
+    assert motor == ["R", "S"]
+    assert state.walk_until == 0.0
+
+
+def test_controller_reboot_during_estop_is_latched_again(robot):
+    """#30: a controller that resets mid-E-stop boots unlatched; E is sent again."""
+    state, bus, tree = standing(robot)
+    bt.apply_topic_payload(state, config.TOPIC_ERROR, "error")
+    assert tick(tree, bus)[0] == ["E"]
+    nano(state, "READY,IMU")  # controller rebooted (e.g. power glitch)
+    assert tick(tree, bus)[0] == ["E"]
+    assert tick(tree, bus, 3)[0] == []  # once only
 
 
 def test_oversized_mqtt_payloads_are_dropped_unread():
@@ -321,14 +375,16 @@ def test_stand_retries_imu_once_and_recovers(robot):
     tick(tree, bus)
     loco(state, "stand")
     motor, _ = tick(tree, bus, 5)
-    assert motor == ["S"]  # a single attempt: the Nano re-initialises the IMU
-    nano(state, "NACK,S,NOIMU")
+    assert motor == ["I"]  # a single attempt, without moving: the controller re-initialises the IMU
+    nano(state, "NACK,I,NOIMU")
     assert tick(tree, bus, 5)[0] == []  # still broken: stays relaxed
 
     loco(state, "stand")
-    tick(tree, bus)
-    nano(state, "ACK,S")  # IMU back
-    assert state.imu_fault is False and state.legs_standing
+    assert tick(tree, bus)[0] == ["I"]
+    nano(state, "ACK,I")  # IMU back: now the normal branches stand the robot up
+    assert state.imu_fault is False
+    assert tick(tree, bus)[0] == ["S"]
+    nano(state, "ACK,S")
     loco(state, "walk,30,0,2")
     assert tick(tree, bus)[0] == ["W,30,0"]
 

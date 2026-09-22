@@ -80,3 +80,26 @@ def test_simulator_builds_into_a_private_directory(tmp_path, monkeypatch):
     assert "-o" in commands[0] and commands[0][commands[0].index("-o") + 1] == str(exe)
     source = (ROOT / "tools" / "sim_nano.py").read_text(encoding="utf-8")
     assert "mkdtemp" in source and "gettempdir" not in source
+
+
+def test_connection_failures_are_logged_once_per_streak(caplog):
+    """#34: only the behavior tree logged a refused connection; the publisher and audio clients were silent."""
+    import logging
+
+    client = mqtt_client.make_client("robot-main", connect=False)
+    with caplog.at_level(logging.INFO, logger="mqtt_client"):
+        for _ in range(3):
+            client.on_connect(client, None, None, 134, None)  # 134 = bad user name or password
+        client.on_connect_fail(client, None)
+        client.on_connect(client, None, None, 0, None)  # recovered
+        client.on_connect_fail(client, None)  # new streak
+    assert caplog.text.count("refused the connection") == 1
+    assert caplog.text.count("connected to") == 1
+    assert caplog.text.count("can't reach broker") == 1
+
+
+def test_user_on_connect_still_runs():
+    seen = []
+    client = mqtt_client.make_client("t", on_connect=lambda *a: seen.append(a[3]), connect=False)
+    client.on_connect(client, None, None, 0, None)
+    assert seen == [0]

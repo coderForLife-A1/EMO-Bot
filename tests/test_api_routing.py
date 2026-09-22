@@ -183,3 +183,33 @@ def test_recording_stays_in_memory():
     data = audio_trigger_task._record_after_wake(Stream(), 512)
     with wave.open(io.BytesIO(data)) as w:
         assert w.getnframes() == audio_trigger_task.SAMPLE_RATE * audio_trigger_task.RECORD_SECONDS
+
+
+def test_cached_phrase_plays_even_with_an_http_url(env, monkeypatch):
+    """#33: the HTTPS check ran for every job, so cached phrases (no request at all) played the error sound."""
+    requests = []
+
+    async def run():
+        async with mock_client(requests) as client:
+            await api.handle_job(client, api.SAY_JOB, "Emergency stop.")  # cached over HTTPS
+            monkeypatch.setattr(config, "ELEVENLABS_TTS_URL", "http://tts.example.com/v1/text-to-speech")
+            again = await api.handle_job(client, api.SAY_JOB, "Emergency stop.")  # cached: no request
+            fresh = await api.handle_job(client, api.SAY_JOB, "Something new")  # needs a request: refused
+            return again, fresh
+
+    again, fresh = asyncio.run(run())
+    assert again is True and fresh is False
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("host, local", [
+    ("localhost", True), ("127.0.0.1", True), ("127.0.0.2", True), ("::1", True), ("[::1]", True),
+    ("192.168.1.5", False), ("api.openai.com", False), (None, False),
+])
+def test_one_shared_local_check(host, local):
+    """#33: API and MQTT used different ideas of "local"; both now use netutil.is_local_host."""
+    import mqtt_client
+    import netutil
+
+    assert netutil.is_local_host(host) is local
+    assert mqtt_client.is_local_host is netutil.is_local_host is api.is_local_host

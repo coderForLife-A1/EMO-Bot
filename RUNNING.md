@@ -93,6 +93,7 @@ never wanders off the desk on its own), then it stands.
 | `J,<joint>,<angle>` | `ACK,<joint>,<requested>,<applied>` | Raw servo angle (setup only; leaves balance mode) |
 | `E` / `R` | `ACK,E` / `ACK,R` | Emergency stop (all off, latched) / release |
 | `P` | `ACK,P` | Ping |
+| `I` | `ACK,I` / `NACK,I,NOIMU` | Retry the IMU without moving a servo (re-initialises it if it was missing). `NACK,I,MODE` while balancing: the gyro bias needs the robot still. The Pi uses it to recover from an IMU fault |
 | *(unsolicited)* | `EVT,FALLEN`, `EVT,WATCHDOG`, `EVT,IMU_FAIL`, `T,...` | Events and telemetry. On `EVT,IMU_FAIL` the controller stops walking; the Pi relaxes the servos |
 | rejected | `NACK,<cmd>,<reason>` | `<cmd>` is the command letter being answered (`?` for an overflowed line). `<reason>`: `FORMAT`, `CMD`, `PARSE`, `JOINT`, `ESTOP`, `MODE`, `TILTED`, `NOIMU`, `OVERFLOW`. Nothing moves |
 
@@ -160,6 +161,8 @@ mosquitto_pub -t robot/locomotion/cmd -m gesture               # knee bob
 mosquitto_pub -t robot/error -m error                          # E-stop: all servos off
 mosquitto_pub -t robot/error -m clear                          # release: stands again
 ```
+
+> If you secured the broker with a login (section 13), add `-u <user> -P <password>` to every `mosquitto_pub` / `mosquitto_sub` command.
 
 In the `sim_nano.py` terminal, type `tilt 8` to put the robot on an 8° slope (watch the correction
 in telemetry), `tilt 70 200` to knock it over (`EVT,FALLEN`, servos off), then `tilt 0` and
@@ -387,6 +390,8 @@ INFO [serial_module] Serial connected: /dev/ttyUSB0 @ 115200
 INFO [__main__] EMO-Bot running: serial_task, behavior_tree_task, api_routing_task, vision_task, audio_trigger_task
 ```
 
+> If you secured the broker with a login (section 13), add `-u <user> -P <password>` to every `mosquitto_pub` / `mosquitto_sub` command.
+
 What the robot does:
 
 - **Idle**: stands in the crouched stance and keeps its torso level.
@@ -434,6 +439,8 @@ The balance loop is `hip offset = -(Kp·pitch + Ki·∫pitch + Kd·pitch_rate)`,
 hips, clamped to ±20°, with anti-windup and a 10 Hz filter on the D term. Defaults:
 **Kp 0.8, Ki 3.0, Kd 0.03**. In simulation they're stable for servo lags from 30 to 200 ms. Real
 servos add backlash and flex, so tune on the robot:
+
+> If you secured the broker with a login (section 13), add `-u <user> -P <password>` to every `mosquitto_pub` / `mosquitto_sub` command.
 
 1. Stream telemetry: `mosquitto_pub -t robot/locomotion/cmd -m telemetry,1` and
    `mosquitto_sub -t robot/locomotion/telemetry` (fields: pitch x10, rate x10, correction x10, mode).
@@ -500,38 +507,87 @@ Also worth tuning:
 ## 13. Secure MQTT
 
 Anyone who can publish to the broker can drive the robot: E-stop it, make it walk, change its gains or
-recalibrate it. Keep the broker private:
+recalibrate it. Keep the broker private.
 
-- **Default (recommended): localhost only.** apt's Mosquitto 2.x only listens on `127.0.0.1` unless you add
-  a listener, and the Docker example above binds to `127.0.0.1` too. Don't publish port 1883 on all interfaces.
-- **Remote control from another machine:** give the broker a login and ACLs, and preferably TLS.
+**Default (recommended): localhost only.** apt's Mosquitto 2.x listens only on `127.0.0.1` until you add a
+listener, and the Docker example in section 2 binds to `127.0.0.1` too. Never publish port 1883 on all
+interfaces without a login.
 
-  ```bash
-  sudo mosquitto_passwd -c /etc/mosquitto/passwd robot      # prompts for a password
-  ```
+**Remote control from another machine.** Keep plain MQTT on localhost for the robot's own programs, add a TLS
+listener for everything else, and require a login on both. The robot and the remote controller get separate
+users, and the remote one can only do what it needs.
 
-  `/etc/mosquitto/conf.d/emo-bot.conf`:
+1. Create the two users (each prompts for a password):
 
-  ```
-  listener 8883
-  certfile /etc/mosquitto/certs/server.crt
-  keyfile  /etc/mosquitto/certs/server.key
-  allow_anonymous false
-  password_file /etc/mosquitto/passwd
-  acl_file /etc/mosquitto/acl
-  message_size_limit 1024        # every EMO-Bot message is tiny; the robot also drops anything over 256 bytes
-  ```
+   ```bash
+   sudo mosquitto_passwd -c /etc/mosquitto/passwd robot
+   sudo mosquitto_passwd /etc/mosquitto/passwd remote
+   ```
 
-  `/etc/mosquitto/acl`:
+2. `/etc/mosquitto/conf.d/emo-bot.conf` (Mosquitto only allows comments on their own lines):
 
-  ```
-  user robot
-  topic readwrite robot/#
-  ```
+   ```
+   # Robot's own programs: plain text, loopback only. Defining any listener removes Mosquitto's
+   # default one, so this line is what keeps the robot's local connection working.
+   listener 1883 127.0.0.1
 
-  Then set `MQTT_USERNAME`, `MQTT_PASSWORD` and `MQTT_TLS=1` in `.env` (port defaults to 8883 with TLS; set
-  `MQTT_CA_CERTS` to your CA file for a self-signed certificate) and `sudo systemctl restart mosquitto emo-bot`.
-  Every EMO-Bot module connects through `mqtt_client.py`, so they all use these settings.
+   # Remote control: TLS. The certificate must name the Pi's hostname or IP address (subjectAltName),
+   # because clients check it.
+   listener 8883
+   certfile /etc/mosquitto/certs/server.crt
+   keyfile /etc/mosquitto/certs/server.key
+
+   # Both listeners need a login (these settings apply to every listener).
+   allow_anonymous false
+   password_file /etc/mosquitto/passwd
+   acl_file /etc/mosquitto/acl
+
+   # Every EMO-Bot message is tiny; the robot also drops anything over 256 bytes itself.
+   message_size_limit 1024
+   ```
+
+3. `/etc/mosquitto/acl`:
+
+   ```
+   # The robot's programs publish and subscribe everything under robot/
+   user robot
+   topic readwrite robot/#
+
+   # A remote controller can send commands and the E-stop, and watch everything
+   user remote
+   topic write robot/locomotion/cmd
+   topic write robot/error
+   topic read robot/#
+   ```
+
+4. Robot's `.env` (plain text is fine on loopback; TLS to `127.0.0.1` would fail the certificate's hostname
+   check unless the certificate also names `127.0.0.1`):
+
+   ```dotenv
+   MQTT_HOST=127.0.0.1
+   MQTT_TLS=0
+   MQTT_USERNAME=robot
+   MQTT_PASSWORD=<robot's password>
+   ```
+
+5. `sudo systemctl restart mosquitto emo-bot` and check the log: every client logs
+   `broker ... refused the connection` if the login is wrong (`journalctl -u emo-bot -f`).
+
+**`mosquitto_pub` / `mosquitto_sub` once the broker needs a login.** Every command in this guide then needs
+the login too:
+
+```bash
+# on the Pi (plain, loopback)
+mosquitto_pub -u robot -P '<password>' -t robot/locomotion/cmd -m stand
+mosquitto_sub -u robot -P '<password>' -t 'robot/#' -v
+
+# from another machine (TLS; ca.crt is the CA that signed the broker's certificate)
+mosquitto_pub -h <pi-address> -p 8883 --cafile ca.crt -u remote -P '<password>' -t robot/error -m error
+```
+
+A remote *Python* client using this repo's code sets `MQTT_HOST=<pi-address>`, `MQTT_TLS=1` (port 8883),
+`MQTT_CA_CERTS=ca.crt`, `MQTT_USERNAME=remote` and `MQTT_PASSWORD`.
 
 The API keys in `.env` are only ever sent over HTTPS: an `http://` `OPENAI_BASE_URL` or `ELEVENLABS_TTS_URL`
-is refused unless it points at this machine (`localhost`, `127.0.0.1`, `::1`).
+is refused unless it points at this machine (`localhost` or any loopback address). Cached phrases need no
+request, so they still play.

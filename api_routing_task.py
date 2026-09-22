@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 import httpx
 
 import config
+from netutil import is_local_host
 
 logger = logging.getLogger(__name__)
 
@@ -41,16 +42,20 @@ def _missing_keys() -> list[str]:
 
 
 def require_https(url: str) -> None:
-    """API keys go in request headers: refuse plain HTTP unless the server is on this machine."""
+    """API keys go in request headers: refuse plain HTTP unless the server is on this machine.
+
+    Called right before each request, so cached phrases (which send nothing) are never blocked.
+    """
     parts = urlsplit(url)
     if parts.scheme == "https":
         return
-    if parts.scheme == "http" and parts.hostname in ("localhost", "127.0.0.1", "::1"):
+    if parts.scheme == "http" and is_local_host(parts.hostname):
         return
     raise RuntimeError(f"refusing to send API keys to {parts.scheme}://{parts.hostname}: use https")
 
 
 async def _transcribe(client: httpx.AsyncClient, wav_bytes: bytes) -> str:
+    require_https(config.OPENAI_BASE_URL)
     response = await client.post(
         f"{config.OPENAI_BASE_URL}/audio/transcriptions",
         headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
@@ -65,6 +70,7 @@ async def _transcribe(client: httpx.AsyncClient, wav_bytes: bytes) -> str:
 
 
 async def _request_response(client: httpx.AsyncClient, transcript: str) -> str:
+    require_https(config.OPENAI_BASE_URL)
     response = await client.post(
         f"{config.OPENAI_BASE_URL}/chat/completions",
         headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
@@ -96,6 +102,7 @@ def pcm_to_wav(pcm: bytes, sample_rate: int = TTS_SAMPLE_RATE) -> bytes:
 
 
 async def _synthesize(client: httpx.AsyncClient, response_text: str) -> bytes:
+    require_https(config.ELEVENLABS_TTS_URL)
     response = await client.post(
         f"{config.ELEVENLABS_TTS_URL}/{config.ELEVENLABS_VOICE_ID}",
         params={"output_format": TTS_OUTPUT_FORMAT},
@@ -168,9 +175,6 @@ async def handle_job(client: httpx.AsyncClient, kind: str, value) -> bool:
         missing = _missing_keys()
         if missing:
             raise RuntimeError(f"missing {', '.join(missing)} in .env")
-        require_https(config.ELEVENLABS_TTS_URL)
-        if kind == LISTEN_JOB:
-            require_https(config.OPENAI_BASE_URL)
         wav_bytes = await asyncio.wait_for(_speech_for(client, kind, value), timeout=config.API_TIMEOUT_SECONDS)
     except Exception as exc:  # noqa: BLE001 - any failure falls back to the local sound
         logger.warning("API %s job failed: %r", kind, exc)

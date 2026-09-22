@@ -20,8 +20,9 @@ logger = logging.getLogger(__name__)
 
 READY_TIMEOUT_S = 3.0  # opening the port resets a USB-attached board; its bootloader takes ~1-2 s
 REPLY_TIMEOUT_S = 0.3
-# Commands that take longer on the controller: C samples the IMU for ~0.35 s; S may re-initialise a lost IMU.
-SLOW_REPLY_TIMEOUT_S = {"C": 1.5, "S": 1.0}
+# Commands that take longer on the controller: C samples the IMU for ~0.35 s; S and I may re-initialise
+# the IMU (re-measuring the gyro bias) before answering.
+SLOW_REPLY_TIMEOUT_S = {"C": 1.5, "S": 1.0, "I": 1.0}
 IDLE_POLL_S = 0.5  # ping when idle so events (EVT,FALLEN) are read promptly
 PARK_COMMANDS = ("W,0,0", "O")  # sent on shutdown: stop walking, then switch the servos off
 
@@ -52,6 +53,20 @@ def offer_urgent(queue: asyncio.Queue, item) -> None:
 		except asyncio.QueueEmpty:
 			break
 	queue.put_nowait(item)
+
+
+def discard_pending(queue: asyncio.Queue) -> int:
+	"""Drop every queued command. Used when the controller (re)connects or resets: the backlog was meant
+	for a controller state that no longer exists (e.g. an old calibrate or walk), and the behavior tree
+	rebuilds the state from scratch after on_connect."""
+	dropped = 0
+	while True:
+		try:
+			queue.get_nowait()
+		except asyncio.QueueEmpty:
+			return dropped
+		queue.task_done()
+		dropped += 1
 
 
 def reply_timeout(command: str) -> float:
@@ -177,6 +192,9 @@ async def serial_task(
 				if on_line is not None:
 					on_line(banner)
 			logger.info("Serial connected: %s @ %s", port, baudrate)
+			stale = discard_pending(command_queue)
+			if stale:
+				logger.info("Dropped %d command(s) queued while the controller was away", stale)
 			if on_connect:
 				on_connect()
 
@@ -191,6 +209,9 @@ async def serial_task(
 					reply = await asyncio.to_thread(send_and_wait, ser, payload, None, forward)
 					if reply.startswith("READY"):
 						logger.warning("Controller reset detected (%s); standing up again", reply)
+						stale = discard_pending(command_queue)
+						if stale:
+							logger.info("Dropped %d command(s) meant for the controller before its reset", stale)
 						if on_connect:
 							on_connect()
 					elif reply.startswith("NACK") and ",ESTOP" not in reply:

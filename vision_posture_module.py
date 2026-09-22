@@ -32,6 +32,7 @@ POSTURE_REMIND_S = 60.0  # re-alert while posture stays poor
 POSTURE_ABSENT_RESET_S = 10.0  # user out of view this long -> POSTURE_OK
 POSTURE_ABSENT_GRACE_S = 1.0  # out of view this long -> slouch/good timers restart (ignores dropouts)
 
+MIN_FRAME_WAIT_S = 0.002  # a grab() faster than this didn't wait for a frame (run_vision then sleeps)
 CAMERA_FAIL_LIMIT = 30  # consecutive failed reads (~0.3 s) before the camera is reopened
 CAMERA_BACKOFF_MAX_S = 30.0
 
@@ -76,6 +77,9 @@ class _Picamera2Capture:
         return True, self._cam.capture_array()
 
     def grab(self):
+        # Wait for the next frame and drop it without converting it, like cv2's grab(). Returning at once
+        # would make run_vision spin a CPU core between pose frames.
+        self._cam.capture_request().release()
         return True
 
     def release(self) -> None:
@@ -434,7 +438,11 @@ def run_vision(stop, publish, camera=None, pipeline=None) -> None:
     try:
         while not stop.is_set():
             if not pipeline.wants_frame(time.monotonic()):
+                started = time.monotonic()
                 camera.grab()
+                if time.monotonic() - started < MIN_FRAME_WAIT_S:
+                    # This camera's grab() didn't wait for a frame: don't spin, wait a frame time instead.
+                    time.sleep(1.0 / FRAME_FPS)
                 continue
             frame = camera.read()
             if frame is None:

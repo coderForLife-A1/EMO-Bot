@@ -309,3 +309,56 @@ def test_posture_metrics_computed_once(monkeypatch):
     monkeypatch.setattr(vp, "posture_metrics", counting)
     assert vp.judge_posture(real(person(0.2, 0.5))) is False
     assert calls == []  # judge_posture works on metrics, it doesn't recompute them
+
+
+def test_nonblocking_grab_does_not_spin(monkeypatch):
+    """#27: Picamera2's grab() returned at once, so run_vision spun a core between pose frames."""
+    import threading
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(vp.time, "monotonic", lambda: clock["t"])
+
+    def sleep(seconds):
+        clock["t"] += seconds
+
+    monkeypatch.setattr(vp.time, "sleep", sleep)
+
+    class InstantGrabCamera(CountingCapture):  # like the old Picamera2 wrapper: grab() never waits
+        pass
+
+    class TimedPipeline:
+        def __init__(self, stop):
+            self.stop, self.last = stop, float("-inf")
+
+        def wants_frame(self, now):
+            if now >= 2.0:
+                self.stop.set()
+            return now - self.last >= vp.POSE_PERIOD_S
+
+        def process(self, frame, now):
+            self.last = now
+            return []
+
+        def close(self):
+            pass
+
+    stop = threading.Event()
+    cap = InstantGrabCamera()
+    vp.run_vision(stop, lambda t, p: None, camera=vp.ResilientCamera(opener=lambda _s: cap),
+                  pipeline=TimedPipeline(stop))
+    assert cap.reads == 10  # 5 Hz for 2 s
+    assert cap.grabs <= 2.0 * vp.FRAME_FPS + 5  # paced at the frame rate, not millions
+
+
+def test_picamera2_grab_waits_for_a_frame():
+    """#27: the Picamera2 wrapper's grab() now takes (and drops) one frame, like cv2's grab()."""
+    calls = []
+
+    class Request:
+        def release(self):
+            calls.append("release")
+
+    cap = vp._Picamera2Capture.__new__(vp._Picamera2Capture)
+    cap._cam = SimpleNamespace(capture_request=lambda: calls.append("capture") or Request())
+    assert cap.grab() is True
+    assert calls == ["capture", "release"]

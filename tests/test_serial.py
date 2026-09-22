@@ -136,3 +136,43 @@ def test_sim_mode_acks_commands(caplog):
     assert seen == ["ACK,S", "ACK,0,90,90", "ACK,W,20,0"]
     assert "SIM serial -> S" in caplog.text
     assert "parking servos" in caplog.text
+
+
+def test_backlog_is_dropped_on_reconnect(monkeypatch):
+    """#30: commands queued while the controller was unplugged used to be replayed on reconnect."""
+    sent = []
+
+    class Port(FakeSerial):
+        def __init__(self):
+            super().__init__([b"READY,IMU\n"])
+
+        def write(self, data):
+            sent.append(data.decode().strip())
+            self.replies.append(f"ACK,{data.decode().strip()}\n".encode())
+            return len(data)
+
+    monkeypatch.setattr(serial_module.serial, "serial_for_url", lambda *a, **k: Port())
+
+    async def run():
+        q = asyncio.Queue()
+        for stale in ("C", "K,90,300,3", "W,50,0", "G,1"):  # queued while unplugged
+            q.put_nowait(stale)
+        connected = asyncio.Event()
+
+        def on_connect():
+            q.put_nowait("S")  # what the behavior tree sends after on_nano_reset
+            connected.set()
+
+        task = asyncio.create_task(serial_module.serial_task(q, port="/dev/fake", on_connect=on_connect))
+        await asyncio.wait_for(connected.wait(), 2)
+        await asyncio.wait_for(q.join(), 2)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    assert sent[0] == "S" and not {"C", "K,90,300,3", "W,50,0", "G,1"} & set(sent)
+
+
+def test_i_command_gets_the_slow_timeout():
+    """#28: I re-initialises the IMU like S, so it gets the same longer timeout."""
+    assert serial_module.reply_timeout("I") == serial_module.reply_timeout("S") >= 1.0
