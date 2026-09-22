@@ -176,26 +176,26 @@ static void scenarioProtocol()
     {
         const char *name, *in, *out;
     } cases[] = {
-        {"walk refused before standing", "W,50,0", "NACK,MODE\n"},
-        {"gesture refused before standing", "G,1", "NACK,MODE\n"},
+        {"walk refused before standing", "W,50,0", "NACK,W,MODE\n"},
+        {"gesture refused before standing", "G,1", "NACK,G,MODE\n"},
         {"raw joint move (setup mode)", "J,2,90", "ACK,2,90,90\n"},
         {"clamp high", "J,1,200", "ACK,1,200,170\n"},
         {"huge angle clamps, no 16-bit wrap", "J,0,40000", "ACK,0,40000,170\n"},
-        {"joint out of range", "J,16,90", "NACK,JOINT\n"},
-        {"unknown command", "X,1,90", "NACK,CMD\n"},
-        {"non-numeric", "J,a,90", "NACK,PARSE\n"},
-        {"too many fields", "K,1,2,3,4", "NACK,FORMAT\n"},
-        {"wrong field count", "W,50", "NACK,FORMAT\n"},
-        {"empty field rejected", "J,,1,90", "NACK,FORMAT\n"},
-        {"negative gain rejected", "K,-1,0,0", "NACK,PARSE\n"},
-        {"unknown gesture", "G,7", "NACK,PARSE\n"},
+        {"joint out of range", "J,16,90", "NACK,J,JOINT\n"},
+        {"unknown command", "X,1,90", "NACK,X,CMD\n"},
+        {"non-numeric", "J,a,90", "NACK,J,PARSE\n"},
+        {"too many fields", "K,1,2,3,4", "NACK,K,FORMAT\n"},
+        {"wrong field count", "W,50", "NACK,W,FORMAT\n"},
+        {"empty field rejected", "J,,1,90", "NACK,J,FORMAT\n"},
+        {"negative gain rejected", "K,-1,0,0", "NACK,K,PARSE\n"},
+        {"unknown gesture", "G,7", "NACK,G,PARSE\n"},
         {"ping", "P", "ACK,P\n"},
         {"stand", "S", "ACK,S\n"},
         {"walk clamps to +/-100", "W,250,-300", "ACK,W,100,-100\n"},
-        {"calibration refused while balancing", "C", "NACK,MODE\n"},
+        {"calibration refused while balancing", "C", "NACK,C,MODE\n"},
         {"relax", "O", "ACK,O\n"},
         {"estop", "E", "ACK,E\n"},
-        {"stand refused while latched", "S", "NACK,ESTOP\n"},
+        {"stand refused while latched", "S", "NACK,S,ESTOP\n"},
         {"release", "R", "ACK,R\n"},
         {"stand after release", "S", "ACK,S\n"},
         {"gesture", "G,1", "ACK,G,1\n"},
@@ -210,7 +210,7 @@ static void scenarioProtocol()
 
     take();
     send(std::string(32, 'x') + "J,0,170");
-    expect(take() == "NACK,OVERFLOW\n", "overflowed line is dropped whole (tail not executed)");
+    expect(take() == "NACK,?,OVERFLOW\n", "overflowed line is dropped whole (tail not executed)");
 
     send("E");
     int offWrites = 0;
@@ -313,7 +313,7 @@ static void scenarioFall()
         off += g_chanOff[ch];
     expect(off == 4, "leg servos switched off after a fall");
     send("S");
-    expect(has(take(), "NACK,TILTED"), "refuses to stand while lying down");
+    expect(has(take(), "NACK,S,TILTED"), "refuses to stand while lying down");
     setTilt(0, 100); // picked up
     run(0.5f);
     send("S");
@@ -367,7 +367,38 @@ static void scenarioNoImu()
     send("O");
     take();
     send("C");
-    expect(take() == "NACK,NOIMU\n", "calibration needs the IMU");
+    expect(take() == "NACK,C,NOIMU\n", "calibration needs the IMU");
+}
+
+static void scenarioImuFail()
+{
+    boot();
+    send("S");
+    send("W,60,0");
+    run(0.5f);
+    take();
+    g_imu.present = false; // I2C cable falls out
+    for (int i = 0; i < 20; i++)
+    {
+        send("W,60,0");
+        run(0.05f);
+    }
+    const std::string out = take();
+    expect(has(out, "EVT,IMU_FAIL"), "IMU loss is reported");
+    expect(has(out, "NACK,W,NOIMU"), "walk heartbeats are refused after IMU loss");
+    expect(!imuOk && speedTarget == 0 && fabs(stride[0]) < 0.05f, "walking stops when the IMU is lost",
+           fmt("stride=%.2f", stride[0]));
+
+    send("O");
+    send("S");
+    expect(has(take(), "NACK,S,NOIMU"), "won't stand again while the IMU is still missing");
+    g_imu.present = true; // cable reseated
+    send("S");
+    run(0.3f);
+    const std::string again = take();
+    expect(has(again, "ACK,S\n") && imuOk && mode == MODE_BALANCE, "S re-initialises the IMU and stands", again);
+    send("W,40,0");
+    expect(has(take(), "ACK,W,40,0"), "walking allowed again after recovery");
 }
 
 static void scenarioTelemetry()
@@ -395,7 +426,7 @@ static const Scenario SCENARIOS[] = {
     {"protocol", scenarioProtocol},     {"imu_sign", scenarioImuSign},   {"slope", scenarioSlopeRejection},
     {"walking", scenarioWalking},       {"watchdog", scenarioWatchdog},  {"fall", scenarioFall},
     {"wrong_sign", scenarioWrongSignIsSafe}, {"calibration", scenarioCalibration}, {"no_imu", scenarioNoImu},
-    {"telemetry", scenarioTelemetry},
+    {"imu_fail", scenarioImuFail}, {"telemetry", scenarioTelemetry},
 };
 
 // "serve" mode for tools/sim_nano.py: line-oriented control over stdin/stdout.

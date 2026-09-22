@@ -50,8 +50,8 @@ shuffle, and turning uses different stride lengths per leg.
 | Task | Module | Critical? | What it does |
 | --- | --- | --- | --- |
 | `serial_task` | `serial_module.py` | yes | Sends commands to the Nano, checks each reply, forwards events/telemetry, reconnects forever. |
-| `behavior_tree_task` | `behavior_tree_module.py` | yes | 10 Hz priority tree: E-stop > fallen > rest > conversation > posture reminder > walk > stand. |
-| `vision_task` | `vision_posture_module.py` | no | Camera → MediaPipe pose → posture events (and face position). |
+| `behavior_tree_task` | `behavior_tree_module.py` | yes | 10 Hz priority tree: E-stop > IMU fault > fallen > rest > conversation > posture reminder > walk > stand. |
+| `vision_task` | `vision_posture_module.py` | no | Camera → MediaPipe pose → posture events; reopens the camera if it drops out (face detection optional). |
 | `audio_trigger_task` | `audio_trigger_task.py` | no | Porcupine wake word → records 5 s → hands the WAV to the API task. |
 | `api_routing_task` | `api_routing_task.py` | no | Whisper → GPT → ElevenLabs → `aplay`, plus spoken cues ("I fell over"). |
 
@@ -63,13 +63,14 @@ no mic, bad API key), the error is logged and everything else keeps running.
 | Topic | Direction | Payload |
 | --- | --- | --- |
 | `robot/locomotion/cmd` | → robot | `stand`, `rest`, `stop`, `walk,<speed>,<turn>[,<seconds>]`, `gesture`, `telemetry,<0\|1>`, `gains,<kp>,<ki>,<kd>`, `calibrate` |
-| `robot/locomotion/event` | robot → | `EVT,FALLEN`, `EVT,WATCHDOG`, `EVT,IMU_FAIL`, `NACK,...` from the Nano |
+| `robot/locomotion/event` | robot → | `EVT,FALLEN`, `EVT,WATCHDOG`, `EVT,IMU_FAIL`, `NACK,<cmd>,<reason>` and `READY,...` from the Nano |
 | `robot/locomotion/telemetry` | robot → | `T,<pitch x10>,<pitch rate x10>,<hip correction x10>,<mode>` at 20 Hz when enabled. Mode: `B` balancing, `O` off, `M` manual, `F` fallen |
 | `robot/error` | → robot | `error` = E-stop (all servos off), `clear` = release |
 | `robot/state` | vision → | `POSTURE_POOR` / `POSTURE_OK`: knee-bob gesture and a spoken reminder |
 | `robot/audio/wake_flag` | audio → | `1` during a conversation (robot stands still), then `0` |
 | `robot/audio/state`, `robot/audio/intent` | robot → | Informational |
-| `robot/vision/face_error` | vision → | Face offset in pixels (not used by the legs) |
+| `robot/vision/state` | vision → | `UP` / `DOWN` when the camera starts or stops delivering frames (retained) |
+| `robot/vision/face_error` | vision → | Face offset in pixels, only with `FACE_DETECTION=1` (not used by the legs yet) |
 
 `walk` speed and turn are -100..100. Positive speed walks forward, positive turn turns right
 (the left leg takes longer strides; with speed 0 the legs stride in opposite directions). A walk lasts the given number of seconds (default 2, max 10, so the robot
@@ -80,8 +81,8 @@ never wanders off the desk on its own), then it stands.
 | Send | Reply | Meaning |
 | --- | --- | --- |
 | *(on boot)* | `READY,IMU` / `READY,NOIMU` | Firmware started; says whether the MPU6050 answered |
-| `S` | `ACK,S` (`ACK,S,NOIMU`) | Stand in the crouched stance and balance. Refused with `NACK,TILTED` when lying down |
-| `W,<speed>,<turn>` | `ACK,W,<speed>,<turn>` | Walk (-100..100). Must be re-sent at least every second or the Nano stops (`EVT,WATCHDOG`) |
+| `S` | `ACK,S` (`ACK,S,NOIMU`) | Stand in the crouched stance and balance. Refused with `NACK,S,TILTED` when lying down. If the IMU failed earlier, it is re-initialised first (`NACK,S,NOIMU` if it still doesn't answer) |
+| `W,<speed>,<turn>` | `ACK,W,<speed>,<turn>` | Walk (-100..100). Must be re-sent at least every second or the Nano stops (`EVT,WATCHDOG`). Refused with `NACK,W,NOIMU` after an IMU failure |
 | `G,1` | `ACK,G,1` | Knee-bob gesture |
 | `O` | `ACK,O` | Relax: servos off (not latched) |
 | `C` | `ACK,C,<offset x100>` | Calibrate level (robot held upright and still, not balancing); saved to EEPROM |
@@ -90,14 +91,19 @@ never wanders off the desk on its own), then it stands.
 | `J,<joint>,<angle>` | `ACK,<joint>,<requested>,<applied>` | Raw servo angle (setup only; leaves balance mode) |
 | `E` / `R` | `ACK,E` / `ACK,R` | Emergency stop (all off, latched) / release |
 | `P` | `ACK,P` | Ping |
-| *(unsolicited)* | `EVT,FALLEN`, `EVT,WATCHDOG`, `EVT,IMU_FAIL`, `T,...` | Events and telemetry |
-| malformed | `NACK,FORMAT` / `CMD` / `PARSE` / `JOINT` / `ESTOP` / `MODE` / `NOIMU` / `OVERFLOW` | Rejected; nothing moves |
+| *(unsolicited)* | `EVT,FALLEN`, `EVT,WATCHDOG`, `EVT,IMU_FAIL`, `T,...` | Events and telemetry. On `EVT,IMU_FAIL` the Nano stops walking; the Pi relaxes the servos |
+| rejected | `NACK,<cmd>,<reason>` | `<cmd>` is the command letter being answered (`?` for an overflowed line). `<reason>`: `FORMAT`, `CMD`, `PARSE`, `JOINT`, `ESTOP`, `MODE`, `TILTED`, `NOIMU`, `OVERFLOW`. Nothing moves |
+
+The Pi matches every reply to its command by that letter, so a late reply (e.g. calibration, which takes
+~0.35 s) is never mistaken for the reply to the next command. Slow commands get longer timeouts
+(`C` 1.5 s, `S` 1 s, others 0.3 s), and the E-stop skips ahead of anything already queued.
 
 ---
 
 ## 2. Quick start on a laptop (no hardware)
 
-You need **Python 3.11** (3.9-3.12 work; mediapipe 0.10.18 has no wheels for 3.13). For the
+You need **Python 3.11** to run the robot (3.9-3.12 work; mediapipe 0.10.18 has no wheels for 3.13+).
+The tests alone (`requirements-dev.txt`) work on any Python 3.9 or newer. For the
 simulated Nano you also need **g++** (Linux: `build-essential`, macOS: Xcode command line tools,
 Windows: MinGW-w64 or MSYS2).
 
@@ -171,7 +177,7 @@ pytest
 
 | File | Covers |
 | --- | --- |
-| `tests/test_firmware.py` | Compiles the Nano firmware for your PC and runs 10 scenarios against a simulated biped + IMU: protocol, IMU sign, slope rejection, walking, watchdog, fall detection, wrong-sign safety, calibration + EEPROM, no-IMU fallback, telemetry. Skipped without `g++`. |
+| `tests/test_firmware.py` | Compiles the Nano firmware for your PC and runs 11 scenarios against a simulated biped + IMU: protocol, IMU sign, slope rejection, walking, watchdog, fall detection, wrong-sign safety, calibration + EEPROM, no-IMU fallback, IMU failure while walking + recovery, telemetry. Skipped without `g++`. |
 | `tests/test_behavior_tree.py` | Stand/walk/stop, walk heartbeat and time limit, E-stop latch/release, fall handling, rest, calibration, tuning pass-through, conversation and posture priorities |
 | `tests/test_serial.py` | ACK/NACK parsing, READY banner, event/telemetry forwarding, drop-oldest queueing, sim mode |
 | `tests/test_vision.py` | Posture rules, personal baseline, alert hysteresis |
@@ -322,6 +328,8 @@ access once.
 | `AUDIO_INPUT_DEVICE` | system default | Mic name substring or index from `python -m sounddevice`, e.g. `seeed` |
 | `AUDIO_OUTPUT_DEVICE` | ALSA default | `aplay -D` device, e.g. `plughw:0` |
 | `ENABLE_VISION` / `ENABLE_AUDIO` | `1` | Set to `0` to skip a subsystem |
+| `FACE_DETECTION` | `0` | Run MediaPipe face detection and publish `robot/vision/face_error`. Off by default: nothing uses it yet and it costs Pi CPU |
+| `ALLOW_NO_IMU` | `0` | Let the robot stand and walk when the Nano booted without an IMU (no balance, no fall detection). Bench tests only |
 | `MQTT_HOST` / `MQTT_PORT` | `127.0.0.1` / `1883` | |
 
 Never commit `.env` (it is in `.gitignore`).
@@ -371,8 +379,17 @@ What the robot does:
   `mosquitto_pub -t robot/locomotion/cmd -m stand`.
 - **E-stop**: `mosquitto_pub -t robot/error -m error` turns everything off; `clear` stands it up again.
 - **Rest**: `mosquitto_pub -t robot/locomotion/cmd -m rest` relaxes the servos until `stand`.
+- **IMU stops answering** (`EVT,IMU_FAIL`): without it there is no balance and no fall detection, so the
+  robot stops walking, relaxes its servos and says so. Fix the wiring, then send `stand`: the Nano
+  re-initialises the IMU and stands only if it answers. A Nano that *booted* without an IMU
+  (`READY,NOIMU`) is treated the same way unless `ALLOW_NO_IMU=1`.
+- **Camera unplugged or crashed**: vision logs it, publishes `robot/vision/state DOWN`, and keeps trying
+  to reopen it (1 s, 2 s, 4 s ... up to 30 s apart). `UP` is published when frames arrive again.
+- **Speech task crashes mid-conversation**: the conversation flag is cleared so the robot doesn't
+  stay frozen. It also expires on its own after 30 s.
 
-Stop with **Ctrl+C** (or `SIGTERM`). Shutdown is clean.
+Stop with **Ctrl+C** (or `SIGTERM`). The Pi stops any walk and switches the servos off (`W,0,0`,
+then `O`) before closing the serial port, so the servos don't stay powered after the program exits.
 
 ---
 
@@ -437,12 +454,14 @@ Also worth tuning:
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
-| Banner says `READY,NOIMU` | MPU6050 not answering on I2C | Check VCC/GND/SDA(A4)/SCL(A5) and AD0 low (address 0x68). The robot still stands and walks, without balance |
+| Banner says `READY,NOIMU` | MPU6050 not answering on I2C | Check VCC/GND/SDA(A4)/SCL(A5) and AD0 low (address 0x68). The Pi keeps the servos relaxed until it answers (or set `ALLOW_NO_IMU=1` for bench tests) |
 | `EVT,IMU_FAIL` while running | I2C glitch from servo noise | Shorter I2C wires, twisted with ground, servo power on a separate supply, 1000 µF at the PCA9685 |
 | Torso tilts further instead of correcting | Hip direction or IMU sign wrong | Section 5, steps 3 and 5 (`PITCH_SIGN`, `LEG_DIR`) |
 | Buzzing / oscillation while standing | Kp or Kd too high, or loose servo horns | Lower gains (section 11), tighten horn screws |
 | Stands leaning forward or back | Calibration or stance | Recalibrate (`calibrate`) on a flat surface; adjust `STAND_HIP_DEG`/`STAND_KNEE_DEG` together |
-| `NACK,TILTED` when standing | IMU reads more than 30° | Robot is lying down; or run `calibrate` if it is upright |
+| `NACK,S,TILTED` when standing | IMU reads more than 30° | Robot is lying down; or run `calibrate` if it is upright |
+| `NACK,S,NOIMU` / `NACK,W,NOIMU` | IMU failed and still isn't answering | Check the MPU6050 wiring, then send `stand` again |
+| `robot/vision/state DOWN` | Camera unplugged or not delivering frames | Check the cable/`CAMERA_SOURCE`; vision reopens it automatically |
 | Walking stops after a second with `EVT,WATCHDOG` | `W` not being repeated | Normal when sending `W` by hand; via `main.py` it means the Pi stalled |
 | Robot falls sideways when walking | Single-foot phase too long or feet too narrow | Lower `KNEE_LIFT_DEG`, widen the feet, slower `GAIT_HZ` |
 | `No READY from /dev/ttyUSB0` | Wrong port/baud, firmware not flashed | `arduino-cli board list`, reflash, check with `miniterm` |

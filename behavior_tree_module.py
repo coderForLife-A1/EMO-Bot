@@ -3,13 +3,18 @@
 The Nano runs the fast loop (IMU balance PID + gait at 100 Hz). This tree only decides *what* the
 legs should do and sends high-level commands: S (stand), W,<speed>,<turn> (walk), G,1 (gesture),
 O (relax), E/R (E-stop). See firmware/emo_nano/emo_nano.ino for the protocol.
+
+Threading: SharedState is only touched on one thread (the tick thread). MQTT callbacks don't
+modify it directly; they hand each message to a ``deliver`` function that queues it for that
+thread (main.py uses loop.call_soon_threadsafe, standalone mode uses an inbox queue).
 """
 import collections
 import logging
+import math
 import queue
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 import paho.mqtt.client as mqtt
 import py_trees
@@ -22,10 +27,13 @@ WALK_HEARTBEAT_S = 0.2  # firmware stops walking if W isn't repeated within 1 s
 WALK_DEFAULT_S = 2.0
 WALK_MAX_S = 10.0  # a walk command never runs longer than this (desk robot: don't wander off)
 POSTURE_GESTURE_S = 2.0  # how long the posture branch owns the robot after an alert
+STAND_RETRY_S = 1.0  # resend S if no ACK,S arrived within this time
+CONVERSATION_TIMEOUT_S = 30.0  # wake flag older than this is ignored (recording + API + playback)
 
 AUDIO_EMERGENCY_STOP = "AUDIO,EMERGENCY_STOP"
 AUDIO_POSTURE_WARNING = "AUDIO,POSTURE_WARNING"
 AUDIO_FALLEN = "AUDIO,FALLEN"
+AUDIO_IMU_FAULT = "AUDIO,IMU_FAULT"
 
 GESTURE_BOB = "G,1"
 
@@ -37,6 +45,7 @@ _ESTOP_OFF = {"clear", "ok", "reset", "0", "false", "off"}
 class SharedState:
     estop_active: bool = False
     conversation_active: bool = False
+    conversation_since: float = 0.0  # monotonic time the wake flag was raised
     posture_poor: bool = False
     posture_alert_ts: float = 0.0  # monotonic time of the latest POSTURE_POOR alert
     posture_alert_seq: int = 0  # increments per alert (timestamps can collide on coarse clocks)
@@ -44,9 +53,12 @@ class SharedState:
     face_error_seq: int = 0
     last_face_error_ts: float = 0.0
     # Legs
-    fallen: bool = False  # set by the Nano's EVT,FALLEN / NACK,TILTED; cleared by a "stand" command
+    fallen: bool = False  # EVT,FALLEN / NACK,S,TILTED; cleared by a "stand" command
+    imu_fault: bool = False  # EVT,IMU_FAIL / NACK,*,NOIMU / READY,NOIMU; cleared by ACK,S or READY,IMU
+    imu_retry: bool = False  # "stand" while imu_fault: send one S so the Nano tries to re-init the IMU
     resting: bool = False  # "rest" command: servos off until "stand"
-    legs_standing: bool = False  # we believe the Nano is in balance mode
+    legs_standing: bool = False  # confirmed by ACK,S; cleared by NACKs, O, E, falls, resets
+    stand_sent_at: Optional[float] = None  # when the last unanswered S was sent
     walk_speed: int = 0  # -100..100
     walk_turn: int = 0  # -100..100
     walk_until: float = 0.0  # monotonic deadline of the current walk command
@@ -73,14 +85,27 @@ class CommandBus:
             pass
 
 
+def request_stand(state: SharedState, bus: CommandBus) -> None:
+    """Send S unless one is already waiting for its ACK (retried after STAND_RETRY_S)."""
+    now = time.monotonic()
+    if state.stand_sent_at is not None and now - state.stand_sent_at < STAND_RETRY_S:
+        return
+    if bus.put_motor("S"):
+        state.stand_sent_at = now
+
+
 def ensure_standing(state: SharedState, bus: CommandBus) -> None:
-    """Stop any walk and make sure the Nano is balancing (S is only sent when needed)."""
+    """Stop any walk and make sure the Nano is balancing."""
     if state.walking:
         bus.put_motor("W,0,0")
         state.walking = False
     if not state.legs_standing:
-        if bus.put_motor("S"):
-            state.legs_standing = True
+        request_stand(state, bus)
+
+
+def _legs_off(state: SharedState) -> None:
+    state.legs_standing = state.walking = False
+    state.stand_sent_at = None
 
 
 class ServiceCommands(py_trees.behaviour.Behaviour):
@@ -109,9 +134,9 @@ class EStopGuard(py_trees.behaviour.Behaviour):
     def update(self) -> py_trees.common.Status:
         if self.state.estop_active:
             if not self.latched:
-                self.bus.put_motor("E")
+                self.bus.put_motor("E")  # main.py sends E ahead of anything already queued
                 self.bus.put_audio(AUDIO_EMERGENCY_STOP)
-                self.state.legs_standing = self.state.walking = False
+                _legs_off(self.state)
                 self.latched = True
             return py_trees.common.Status.SUCCESS
 
@@ -119,6 +144,33 @@ class EStopGuard(py_trees.behaviour.Behaviour):
             self.bus.put_motor("R")  # servos stay off; a lower branch sends S to stand again
             self.latched = False
         return py_trees.common.Status.FAILURE
+
+
+class ImuFaultGuard(py_trees.behaviour.Behaviour):
+    """No balance or fall detection without the IMU: relax the servos and don't stand or walk.
+
+    A "stand" command sends one S, which makes the Nano try to re-initialise the IMU.
+    """
+
+    def __init__(self, state: SharedState, bus: CommandBus):
+        super().__init__(name="IMU Fault")
+        self.state = state
+        self.bus = bus
+        self.handled = False
+
+    def update(self) -> py_trees.common.Status:
+        if not self.state.imu_fault:
+            self.handled = False
+            return py_trees.common.Status.FAILURE
+        if not self.handled:
+            self.bus.put_motor("O")
+            self.bus.put_audio(AUDIO_IMU_FAULT)
+            _legs_off(self.state)
+            self.handled = True
+        if self.state.imu_retry:
+            self.state.imu_retry = False
+            self.bus.put_motor("S")
+        return py_trees.common.Status.SUCCESS
 
 
 class FallenGuard(py_trees.behaviour.Behaviour):
@@ -137,7 +189,7 @@ class FallenGuard(py_trees.behaviour.Behaviour):
         if not self.announced:
             self.bus.put_audio(AUDIO_FALLEN)
             self.announced = True
-        self.state.legs_standing = self.state.walking = False
+        _legs_off(self.state)
         return py_trees.common.Status.SUCCESS
 
 
@@ -154,18 +206,26 @@ class RestGuard(py_trees.behaviour.Behaviour):
             return py_trees.common.Status.FAILURE
         if not self.sent:
             self.bus.put_motor("O")
-            self.state.legs_standing = self.state.walking = False
+            _legs_off(self.state)
             self.sent = True
         return py_trees.common.Status.SUCCESS
 
 
 class CheckConversationActive(py_trees.behaviour.Behaviour):
+    """Active while the wake flag is up, but never longer than CONVERSATION_TIMEOUT_S."""
+
     def __init__(self, state: SharedState):
         super().__init__(name="Check Conversation Active")
         self.state = state
 
     def update(self) -> py_trees.common.Status:
-        return py_trees.common.Status.SUCCESS if self.state.conversation_active else py_trees.common.Status.FAILURE
+        if not self.state.conversation_active:
+            return py_trees.common.Status.FAILURE
+        if time.monotonic() - self.state.conversation_since > CONVERSATION_TIMEOUT_S:
+            logger.warning("Conversation flag stuck for %.0fs; clearing it", CONVERSATION_TIMEOUT_S)
+            self.state.conversation_active = False
+            return py_trees.common.Status.FAILURE
+        return py_trees.common.Status.SUCCESS
 
 
 class ConversationAction(py_trees.behaviour.Behaviour):
@@ -208,8 +268,9 @@ class PostureCorrectionAction(py_trees.behaviour.Behaviour):
         ensure_standing(self.state, self.bus)
         if self.state.posture_alert_seq != self.handled_alert_seq:
             self.handled_alert_seq = self.state.posture_alert_seq
-            self.bus.put_motor(GESTURE_BOB)
             self.bus.put_audio(AUDIO_POSTURE_WARNING)
+            if self.state.legs_standing:
+                self.bus.put_motor(GESTURE_BOB)
         return py_trees.common.Status.SUCCESS
 
 
@@ -228,8 +289,9 @@ class WalkAction(py_trees.behaviour.Behaviour):
         if not active:
             return py_trees.common.Status.FAILURE
 
-        if not self.state.legs_standing and self.bus.put_motor("S"):
-            self.state.legs_standing = True
+        if not self.state.legs_standing:
+            request_stand(self.state, self.bus)  # walk once ACK,S confirms the robot is balancing
+            return py_trees.common.Status.SUCCESS
         if not self.state.walking or now - self.last_sent >= WALK_HEARTBEAT_S:
             self.bus.put_motor(f"W,{self.state.walk_speed},{self.state.walk_turn}")
             self.state.walking = True
@@ -254,8 +316,15 @@ def parse_bool(payload: str) -> bool:
     return payload.strip().lower() in {"1", "true", "on", "yes"}
 
 
+def _finite(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"not a finite number: {text!r}")
+    return value
+
+
 def _clamp_int(text: str, low: int, high: int) -> int:
-    return max(low, min(high, int(float(text))))
+    return max(low, min(high, int(_finite(text))))
 
 
 def apply_locomotion_command(state: SharedState, payload: str) -> None:
@@ -270,15 +339,19 @@ def apply_locomotion_command(state: SharedState, payload: str) -> None:
         if cmd == "stand":
             state.fallen = state.resting = False
             state.walk_until = 0.0
+            state.stand_sent_at = None
+            if state.imu_fault:
+                state.imu_retry = True
         elif cmd == "rest":
             state.resting = True
             state.walk_until = 0.0
         elif cmd == "stop":
             state.walk_until = 0.0
         elif cmd == "walk":
-            state.walk_speed = _clamp_int(args[0], -100, 100)
-            state.walk_turn = _clamp_int(args[1], -100, 100) if len(args) > 1 else 0
-            seconds = float(args[2]) if len(args) > 2 else WALK_DEFAULT_S
+            speed = _clamp_int(args[0], -100, 100)
+            turn = _clamp_int(args[1], -100, 100) if len(args) > 1 else 0
+            seconds = _finite(args[2]) if len(args) > 2 else WALK_DEFAULT_S
+            state.walk_speed, state.walk_turn = speed, turn
             state.walk_until = time.monotonic() + max(0.0, min(WALK_MAX_S, seconds))
             state.resting = False
         elif cmd == "gesture":
@@ -286,7 +359,9 @@ def apply_locomotion_command(state: SharedState, payload: str) -> None:
         elif cmd == "telemetry":
             state.outbox.append(f"T,{1 if parse_bool(args[0]) else 0}")
         elif cmd == "gains":
-            kp, ki, kd = (round(float(a) * 100) for a in args[:3])
+            kp, ki, kd = (round(_finite(a) * 100) for a in args[:3])
+            if min(kp, ki, kd) < 0 or max(kp, ki, kd) > 100_000:
+                raise ValueError("gains must be between 0 and 1000")
             state.outbox.append(f"K,{kp},{ki},{kd}")
         elif cmd == "calibrate":
             # Calibration needs the balance loop off: relax, measure, then stay relaxed until "stand".
@@ -295,24 +370,50 @@ def apply_locomotion_command(state: SharedState, payload: str) -> None:
             state.outbox.extend(["O", "C"])
         else:
             logger.warning("Unknown locomotion command %r", payload)
-    except (IndexError, ValueError):
+    except (IndexError, ValueError, OverflowError):
         logger.warning("Malformed locomotion command %r", payload)
 
 
 def apply_serial_line(state: SharedState, line: str) -> None:
-    """React to unsolicited lines from the Nano (events, refusals)."""
-    if line in ("EVT,FALLEN", "NACK,TILTED"):
-        state.fallen = True
-        state.legs_standing = state.walking = False
-    elif line == "EVT,WATCHDOG":
-        state.walking = False
-    elif line.startswith("READY"):
+    """Update the leg state from any line the Nano sends (replies, events, banners)."""
+    if line.startswith("READY"):
         on_nano_reset(state)
+        state.imu_fault = line == "READY,NOIMU" and not config.ALLOW_NO_IMU
+        return
+    if line in ("ACK,S", "ACK,S,NOIMU"):
+        state.legs_standing = True
+        state.stand_sent_at = None
+        if line == "ACK,S":
+            state.imu_fault = False
+        return
+    if line in ("ACK,O", "ACK,E"):
+        _legs_off(state)
+        return
+    if line == "EVT,FALLEN" or line == "NACK,S,TILTED":
+        state.fallen = True
+        _legs_off(state)
+        return
+    if line == "EVT,IMU_FAIL" or (line.startswith("NACK,") and line.endswith(",NOIMU")):
+        state.imu_fault = True
+        _legs_off(state)
+        return
+    if line == "EVT,WATCHDOG":
+        state.walking = False
+        return
+    if line.startswith("NACK,S,") or line.startswith("NACK,W,"):
+        # Not balancing after all (e.g. NACK,W,MODE): stand again after the retry delay.
+        state.legs_standing = state.walking = False
+        state.stand_sent_at = time.monotonic()
 
 
 def on_nano_reset(state: SharedState) -> None:
     """The Nano (re)booted with its servos off: stand again on the next tick."""
-    state.legs_standing = state.walking = False
+    _legs_off(state)
+
+
+def clear_conversation(state: SharedState) -> None:
+    """Called when the audio/API task dies so the conversation branch can't stay stuck."""
+    state.conversation_active = False
 
 
 def apply_topic_payload(state: SharedState, topic: str, payload: str) -> None:
@@ -332,6 +433,8 @@ def apply_topic_payload(state: SharedState, topic: str, payload: str) -> None:
 
     if topic == config.TOPIC_WAKE_FLAG:
         state.conversation_active = parse_bool(payload)
+        if state.conversation_active:
+            state.conversation_since = time.monotonic()
         return
 
     if topic == config.TOPIC_STATE:
@@ -346,16 +449,24 @@ def apply_topic_payload(state: SharedState, topic: str, payload: str) -> None:
     if topic == config.TOPIC_FACE_ERROR:
         try:
             x_str, y_str = payload.split(",", 1)
-            state.face_error = (float(x_str), float(y_str))
+            state.face_error = (_finite(x_str), _finite(y_str))
         except ValueError:
             return
         state.face_error_seq += 1
         state.last_face_error_ts = time.monotonic()
 
 
+def safe_apply(state: SharedState, topic: str, payload: str) -> None:
+    """apply_topic_payload that never raises (a bad message must not stop E-stop handling)."""
+    try:
+        apply_topic_payload(state, topic, payload)
+    except Exception:  # noqa: BLE001
+        logger.exception("Error handling %s payload %r", topic, payload)
+
+
 def on_mqtt_message(state: SharedState, _client: mqtt.Client, _userdata, msg: mqtt.MQTTMessage) -> None:
     payload = msg.payload.decode("utf-8", errors="ignore").strip()
-    apply_topic_payload(state, msg.topic, payload)
+    safe_apply(state, msg.topic, payload)
 
 
 def build_tree(state: SharedState, bus: CommandBus) -> py_trees.trees.BehaviourTree:
@@ -370,6 +481,7 @@ def build_tree(state: SharedState, bus: CommandBus) -> py_trees.trees.BehaviourT
     root.add_children([
         ServiceCommands(state, bus),
         EStopGuard(state, bus),
+        ImuFaultGuard(state, bus),
         FallenGuard(state, bus),
         RestGuard(state, bus),
         conversation_seq,
@@ -388,8 +500,15 @@ SUBSCRIBED_TOPICS = (
     config.TOPIC_LOCOMOTION_CMD,
 )
 
+Deliver = Callable[[str, str], None]
 
-def build_mqtt_client(state: SharedState) -> mqtt.Client:
+
+def build_mqtt_client(deliver: Deliver) -> mqtt.Client:
+    """MQTT client that passes (topic, payload) of every subscribed message to ``deliver``.
+
+    ``deliver`` runs on paho's network thread; it must hand the message to the tick thread
+    rather than touching SharedState itself.
+    """
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="robot-behavior-tree")
 
     def on_connect(client: mqtt.Client, _userdata, _flags, reason_code, _properties) -> None:
@@ -399,8 +518,14 @@ def build_mqtt_client(state: SharedState) -> mqtt.Client:
         else:
             logger.error("MQTT connect failed: %s", reason_code)
 
+    def on_message(_client: mqtt.Client, _userdata, msg: mqtt.MQTTMessage) -> None:
+        try:
+            deliver(msg.topic, msg.payload.decode("utf-8", errors="ignore").strip())
+        except Exception:  # noqa: BLE001 - an exception here would kill paho's network thread
+            logger.exception("Dropping MQTT message on %s", msg.topic)
+
     client.on_connect = on_connect
-    client.on_message = lambda c, u, m: on_mqtt_message(state, c, u, m)
+    client.on_message = on_message
     client.connect_async(config.MQTT_HOST, config.MQTT_PORT, keepalive=30)
     client.loop_start()
     return client
@@ -415,17 +540,28 @@ def drain_queues(bus: CommandBus) -> None:
 
 
 def main() -> None:
+    """Standalone mode: run the tree without a Nano, printing the commands it would send.
+
+    Every command is treated as acknowledged, as if a healthy Nano were attached.
+    """
     state = SharedState()
     bus = CommandBus()
     tree = build_tree(state, bus)
-    mqtt_client = build_mqtt_client(state)
+    inbox: "queue.SimpleQueue[tuple[str, str]]" = queue.SimpleQueue()
+    mqtt_client = build_mqtt_client(lambda topic, payload: inbox.put((topic, payload)))
 
     print("Behavior tree running at 10Hz (Ctrl+C to stop)")
     try:
         period = 0.1
         next_tick = time.monotonic()
         while True:
+            while not inbox.empty():
+                safe_apply(state, *inbox.get_nowait())
             tree.tick()
+            while not bus.motor_queue.empty():
+                command = bus.motor_queue.get_nowait()
+                print(f"MOTOR_CMD: {command}")
+                apply_serial_line(state, "ACK," + command)
             drain_queues(bus)
             next_tick += period
             sleep_time = next_tick - time.monotonic()

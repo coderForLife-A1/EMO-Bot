@@ -87,6 +87,112 @@ def test_user_leaving_resets_alert():
     assert mon.update(None, 11) == "POSTURE_OK"
 
 
+def test_returning_user_needs_full_confirm_time():
+    """Issue #8: after leaving mid-slouch, one poor frame on return used to trigger an alert."""
+    mon = vp.PostureMonitor(confirm_s=3, clear_s=1, absent_reset_s=10)
+    assert mon.update(True, 0.0) is None  # slouch starts
+    assert mon.update(None, 1.0) is None  # user leaves before an alert
+    assert mon.update(None, 30.0) is None
+    assert mon.update(True, 60.0) is None  # back, one poor frame: not yet
+    assert mon.update(True, 62.9) is None
+    assert mon.update(True, 63.0) == "POSTURE_POOR"
+
+
+def test_brief_dropout_does_not_restart_the_timer():
+    mon = vp.PostureMonitor(confirm_s=3, clear_s=1)
+    mon.update(True, 0.0)
+    mon.update(None, 1.0)  # a single missed frame (< grace period)
+    mon.update(True, 1.2)
+    assert mon.update(True, 3.0) == "POSTURE_POOR"
+
+
+class FlakyCapture:
+    """Delivers ``frames`` good frames, then fails forever."""
+
+    def __init__(self, frames):
+        self.frames = frames
+        self.released = False
+
+    def read(self):
+        if self.frames > 0:
+            self.frames -= 1
+            return True, "frame"
+        return False, None
+
+    def release(self):
+        self.released = True
+
+
+def test_camera_reopens_after_failures(monkeypatch):
+    """Issue #9: a camera that stopped delivering frames was retried silently forever."""
+    monkeypatch.setattr(vp.time, "sleep", lambda s: None)
+    opened, states = [], []
+
+    def opener(_source):
+        cap = FlakyCapture(frames=2)
+        opened.append(cap)
+        return cap
+
+    cam = vp.ResilientCamera(on_state=states.append, opener=opener)
+    assert cam.read() == "frame"
+    assert states == ["UP"]
+    frames = [cam.read() for _ in range(vp.CAMERA_FAIL_LIMIT + 1)]
+    assert frames[0] == "frame" and all(f is None for f in frames[1:])
+    assert states == ["UP", "DOWN"]
+    assert opened[0].released
+
+    cam.next_open = 0  # skip the backoff wait
+    assert cam.read() == "frame"  # reopened
+    assert len(opened) == 2 and states == ["UP", "DOWN", "UP"]
+
+
+def test_camera_missing_at_start_keeps_retrying(monkeypatch):
+    monkeypatch.setattr(vp.time, "sleep", lambda s: None)
+    states, attempts = [], []
+
+    def opener(_source):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise RuntimeError("no camera")
+        return FlakyCapture(frames=5)
+
+    cam = vp.ResilientCamera(on_state=states.append, opener=opener)
+    for _ in range(3):
+        cam.next_open = 0
+        frame = cam.read()
+    assert frame == "frame"
+    assert states == ["DOWN", "UP"]
+    assert cam.backoff == 1.0  # reset after success
+
+
+def test_face_detection_is_optional(monkeypatch):
+    """Issue #11: face detection costs Pi CPU and nothing uses it, so it's off by default."""
+    import sys
+
+    created = []
+
+    class Detector:
+        def __init__(self, **kw):
+            created.append(type(self).__name__)
+
+        def close(self):
+            pass
+
+    class FaceDetection(Detector):
+        pass
+
+    class Pose(Detector):
+        pass
+
+    fake = SimpleNamespace(__version__="0.10.18", solutions=SimpleNamespace(
+        face_detection=SimpleNamespace(FaceDetection=FaceDetection), pose=SimpleNamespace(Pose=Pose)))
+    monkeypatch.setitem(sys.modules, "mediapipe", fake)
+    vp.VisionPipeline(face_detection=False).close()
+    assert created == ["Pose"]
+    vp.VisionPipeline(face_detection=True).close()
+    assert created == ["Pose", "FaceDetection", "Pose"]
+
+
 def test_mediapipe_version_message(monkeypatch):
     import sys
 

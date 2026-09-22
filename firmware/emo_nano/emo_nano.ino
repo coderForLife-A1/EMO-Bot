@@ -3,7 +3,8 @@
 // Hardware: PCA9685 (0x40) drives the servos; MPU6050 (0x68) on the same I2C bus (A4/A5).
 //   Channel 0 = left hip, 1 = right hip, 2 = left knee, 3 = right knee.
 //   Mount the MPU6050 flat on the pelvis with its X arrow pointing forward.
-// Flash it with arduino-cli; see RUNNING.md, section 4. Tune it with RUNNING.md, section 10.
+// Flash it with arduino-cli (RUNNING.md, section 4), set it up with the robot held in the air
+// (section 5) and tune it (section 11).
 //
 // A 100 Hz control loop reads the IMU (complementary filter), runs a PID on torso pitch that
 // offsets both hips (hip strategy), adds a sinusoidal gait, slew-limits every joint and writes the
@@ -21,8 +22,11 @@
 //   J,<joint>,<angle>   raw servo angle, for setup; leaves balance mode -> ACK,<joint>,<requested>,<applied>
 //   E / R               emergency stop (latched, all off) / release    -> ACK,E / ACK,R
 //   P                   ping                                      -> ACK,P
-// Errors: NACK,FORMAT|CMD|PARSE|JOINT|ESTOP|MODE|TILTED|NOIMU|OVERFLOW
-// Events: EVT,FALLEN  EVT,WATCHDOG (walk stopped: no W for 1 s)  EVT,IMU_FAIL
+// Errors: NACK,<cmd>,<reason>: <cmd> is the command letter it answers ('?' if unknown, e.g. for an
+//         overflowed line), <reason> is FORMAT|CMD|PARSE|JOINT|ESTOP|MODE|TILTED|NOIMU|OVERFLOW.
+//         The letter lets the Pi match every reply to its command even if one arrives late.
+// Events: EVT,FALLEN  EVT,WATCHDOG (walk stopped: no W for 1 s)
+//         EVT,IMU_FAIL (IMU stopped answering: walking stops, balance and fall detection are off)
 // Boot:   READY,IMU or READY,NOIMU
 
 #include <Wire.h>
@@ -122,6 +126,7 @@ Mode mode = MODE_OFF;
 bool estopLatched = false;
 
 bool imuOk = false;
+bool imuLost = false; // IMU answered at boot, then failed: walking refused until it is re-initialised
 bool filterReady = false;
 uint8_t imuFailCount = 0;
 float gyroBiasRaw = 0;
@@ -180,9 +185,13 @@ uint8_t clampServoDeg(uint8_t joint, long deg)
     return static_cast<uint8_t>(deg);
 }
 
+char currentCmd = '?'; // command letter being processed, echoed in NACKs
+
 void sendNack(const __FlashStringHelper *reason)
 {
     Serial.print(F("NACK,"));
+    Serial.print(currentCmd);
+    Serial.print(',');
     Serial.println(reason);
 }
 
@@ -371,6 +380,8 @@ void imuUpdate(float dt)
         if (++imuFailCount >= 10)
         {
             imuOk = false;
+            imuLost = true;
+            stopGait(); // never keep walking blind; the Pi relaxes the servos on this event
             Serial.println(F("EVT,IMU_FAIL"));
         }
         return;
@@ -542,6 +553,19 @@ void cmdStand()
         sendNack(F("ESTOP"));
         return;
     }
+    if (imuLost && mode != MODE_BALANCE)
+    {
+        // The IMU worked at boot and then stopped answering: try to bring it back (e.g. reseated cable).
+        imuOk = imuInit();
+        imuLost = !imuOk;
+        imuFailCount = 0;
+        if (imuLost)
+        {
+            sendNack(F("NOIMU"));
+            return;
+        }
+        imuUpdate(LOOP_US * 1e-6); // fresh pitch (the filter re-seeds from the accelerometer)
+    }
     if (imuOk && fabs(pitchDeg) > STAND_MAX_TILT_DEG)
     {
         sendNack(F("TILTED"));
@@ -582,6 +606,11 @@ void cmdWalk(char **fields)
     if (mode != MODE_BALANCE)
     {
         sendNack(F("MODE"));
+        return;
+    }
+    if (imuLost) // never walk blind after the IMU failed (booting without one is allowed for bench tests)
+    {
+        sendNack(F("NOIMU"));
         return;
     }
     speed = speed < -100 ? -100 : (speed > 100 ? 100 : speed);
@@ -715,6 +744,7 @@ void processCommand(char *line)
 {
     char *fields[4];
     const uint8_t count = splitFields(line, fields, 4);
+    currentCmd = (fields[0][0] != '\0' && fields[0][1] == '\0') ? fields[0][0] : '?';
     if (count > 4 || fields[0][0] == '\0' || fields[0][1] != '\0')
     {
         sendNack(count > 4 ? F("FORMAT") : F("CMD"));
@@ -837,6 +867,7 @@ void handleSerialInput()
             // Overflow protection: drop the rest of this line so its tail is never executed.
             rxLen = 0;
             rxDiscarding = true;
+            currentCmd = '?';
             sendNack(F("OVERFLOW"));
         }
     }

@@ -55,9 +55,9 @@ keeps the robot safe even if the Pi stalls.
 | --- | --- |
 | `main.py` | **Entry point.** Starts every task in one asyncio process and supervises them. If a critical task (serial, behavior tree) crashes, the robot shuts down. If an optional one (vision, wake word, speech) crashes, it is logged and the robot keeps running. Routes the Nano's events to MQTT and turns behavior-tree cues into speech. |
 | `config.py` | **All settings in one place.** Loads `.env` first, then exposes every setting (serial port, camera, audio devices, API keys, timeouts, feature switches) and every MQTT topic name. |
-| `behavior_tree_module.py` | **The robot's decision-making.** A 10 Hz py_trees priority tree: E-stop > fallen > rest > conversation > posture reminder > walk > stand. Turns MQTT commands (`walk,70,0,3`, `stand`, ...) into Nano commands, re-sending walk commands as a heartbeat. Runs standalone for testing: `python behavior_tree_module.py`. |
+| `behavior_tree_module.py` | **The robot's decision-making.** A 10 Hz py_trees priority tree: E-stop > IMU fault > fallen > rest > conversation > posture reminder > walk > stand. Turns MQTT commands (`walk,70,0,3`, `stand`, ...) into Nano commands, only counts the robot as standing once the Nano confirms it (`ACK,S`), and re-sends walk commands as a heartbeat. Runs standalone for testing: `python behavior_tree_module.py`. |
 | `serial_module.py` | **Link to the Nano.** Opens the serial port (or `socket://` for the simulator), waits for the `READY` banner, sends one command at a time, checks each ACK/NACK, forwards events (`EVT,FALLEN`) and telemetry, detects Nano resets and reconnects forever. `SERIAL_PORT=sim` only logs commands. |
-| `vision_posture_module.py` | **Camera vision.** MediaPipe face detection and pose estimation; decides good or poor posture relative to your own upright baseline, and publishes `POSTURE_POOR` / `POSTURE_OK`. Supports the Pi CSI camera (Picamera2), USB cameras and laptop webcams. Runs standalone. |
+| `vision_posture_module.py` | **Camera vision.** MediaPipe pose estimation decides good or poor posture relative to your own upright baseline and publishes `POSTURE_POOR` / `POSTURE_OK`. Reopens the camera if it drops out and publishes `robot/vision/state` `UP`/`DOWN`. Face detection is optional (`FACE_DETECTION=1`). Supports the Pi CSI camera (Picamera2), USB cameras and laptop webcams. Runs standalone. |
 | `audio_trigger_task.py` | **Wake word.** Porcupine listens for the wake word, then records 5 s of speech and hands it to the speech pipeline. Ignores its own voice while replying. Runs standalone to test the microphone. |
 | `api_routing_task.py` | **Speech pipeline.** Whisper (speech → text) → GPT (reply) → ElevenLabs (text → speech) → speaker. Also speaks the robot's cues ("I fell over"). Plays a fallback beep on any failure. `python api_routing_task.py "Hello"` checks keys and speaker. |
 
@@ -79,24 +79,25 @@ keeps the robot safe even if the Pi stalls.
 
 | File | What it is |
 | --- | --- |
-| `.env.example` | Template for your `.env` (API keys, serial port, camera, audio devices, feature switches). Copy it to `.env`; `.env` is never committed. |
+| `.env.example` | Template for your `.env` (API keys, serial port, camera, audio devices, feature switches such as `FACE_DETECTION` and `ALLOW_NO_IMU`). Copy it to `.env`; `.env` is never committed. |
 | `requirements.txt` | Python packages for the robot (pins `mediapipe==0.10.18`, the newest release that has both the API used here and Raspberry Pi wheels). |
-| `requirements-dev.txt` | Packages to run the tests and linter on any computer, without robot hardware. |
+| `requirements-dev.txt` | Packages to run the tests and linter on any computer (any Python 3.9+), without robot hardware. |
 | `pyproject.toml` | Settings for the `ruff` linter and `pytest`. |
-| `.gitignore` | Keeps `.env`, virtual environments, caches and build output out of git. |
+| `.gitignore` | Keeps `.env`, virtual environments, caches, build output and local Claude workspace files (`.claude/`, `CLAUDE.md`, `docs/`) out of git. |
 
 ### Documentation
 
 | File | What it is |
 | --- | --- |
 | `README.md` | This overview. |
+| `Issues.md` | Code review of the Raspberry Pi side (by Pratik): 13 issues ranked by severity, each with how it was fixed. |
 | `RUNNING.md` | The full guide: laptop dry run, tests, flashing the Nano, first power-up of the legs, Pi setup, `.env` reference, checking each subsystem, running, starting on boot, PID/gait tuning, troubleshooting. |
 
 ### Tests (no hardware needed)
 
 | File | What it tests |
 | --- | --- |
-| `tests/test_firmware.py` | Compiles the Nano firmware for your PC and runs 10 scenarios against a simulated robot: serial protocol, IMU direction, recovery from a slope, walking, watchdog, fall detection, wrong-sensor-direction safety, calibration + EEPROM, missing IMU, telemetry. Skipped if `g++` isn't installed. |
+| `tests/test_firmware.py` | Compiles the Nano firmware for your PC and runs 11 scenarios against a simulated robot: serial protocol, IMU direction, recovery from a slope, walking, watchdog, fall detection, wrong-sensor-direction safety, calibration + EEPROM, missing IMU, IMU failing while walking (and recovering), telemetry. Skipped if `g++` isn't installed. |
 | `tests/firmware/harness.cpp` | The simulator behind those scenarios (and behind `tools/sim_nano.py`): a planar model of the robot, simulated MPU6050, and a `serve` mode. |
 | `tests/firmware/Arduino.h`, `Wire.h`, `EEPROM.h`, `Adafruit_PWMServoDriver.h` | Small stand-ins for the Arduino libraries so the firmware compiles on a PC. |
 | `tests/test_behavior_tree.py` | Standing, walking and its heartbeat, stop, E-stop, falls, rest, calibration, tuning commands, priorities. |
@@ -220,7 +221,11 @@ The simplest option is a USB cable (`SERIAL_PORT=/dev/ttyUSB0`). To use the Pi's
 ## Safety
 
 - `mosquitto_pub -t robot/error -m error` latches an E-stop: the Nano turns every servo output off
-  and refuses commands until `mosquitto_pub -t robot/error -m clear`.
+  and refuses commands until `mosquitto_pub -t robot/error -m clear`. The E-stop skips ahead of any
+  commands already queued, and a malformed MQTT message can't disable it.
+- If the IMU stops answering, there is no balance and no fall detection, so the Nano stops walking
+  and the Pi relaxes the servos until the IMU answers again (`EVT,IMU_FAIL`).
+- When the Pi software exits, it stops any walk and switches the servos off first.
 - If the robot tips past 45° for a quarter of a second, the Nano switches every servo off
   (`EVT,FALLEN`), the robot asks to be stood back up, and it won't stand again until it is upright and told `stand`.
 - The Nano stops walking if the Pi hasn't re-sent the walk command for 1 s. A single walk command

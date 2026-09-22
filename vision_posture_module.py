@@ -1,8 +1,10 @@
-"""Camera vision: MediaPipe face detection and pose estimation.
+"""Camera vision: MediaPipe pose estimation for posture reminders.
 
-Publishes the face position (robot/vision/face_error) and posture events (robot/state:
-POSTURE_POOR after 3 s of slouching, POSTURE_OK when it recovers). Supports the Pi CSI camera
-(picamera2), USB/V4L2 cameras and laptop webcams. Run standalone with `python vision_posture_module.py`.
+Publishes posture events (robot/state: POSTURE_POOR after 3 s of slouching, POSTURE_OK when it
+recovers) and camera health (robot/vision/state: UP/DOWN; the camera is reopened with backoff if it
+drops out). Face detection (robot/vision/face_error) is optional: FACE_DETECTION=1. Supports the Pi
+CSI camera (picamera2), USB/V4L2 cameras and laptop webcams. Run standalone with
+`python vision_posture_module.py`.
 """
 import bisect
 import collections
@@ -33,6 +35,10 @@ POSTURE_CONFIRM_S = 3.0  # continuous poor posture before an alert
 POSTURE_CLEAR_S = 1.0  # continuous good posture before POSTURE_OK
 POSTURE_REMIND_S = 60.0  # re-alert while posture stays poor
 POSTURE_ABSENT_RESET_S = 10.0  # user out of view this long -> POSTURE_OK
+POSTURE_ABSENT_GRACE_S = 1.0  # out of view this long -> slouch/good timers restart (ignores dropouts)
+
+CAMERA_FAIL_LIMIT = 30  # consecutive failed reads (~0.3 s) before the camera is reopened
+CAMERA_BACKOFF_MAX_S = 30.0
 
 # MediaPipe Pose landmark indices (stable across releases)
 NOSE = 0
@@ -230,6 +236,9 @@ class PostureMonitor:
         if poor is None:
             if self.absent_since is None:
                 self.absent_since = now
+            if now - self.absent_since >= POSTURE_ABSENT_GRACE_S:
+                # User really gone (not a one-frame dropout): timing starts afresh when they return.
+                self.poor_since = self.good_since = None
             if self.alerted and now - self.absent_since >= self.absent_reset_s:
                 self.alerted = False
                 self.poor_since = None
@@ -258,19 +267,98 @@ class PostureMonitor:
         return None
 
 
-class VisionPipeline:
-    """Face tracking + posture monitoring on BGR frames. Returns (topic, payload) messages to publish."""
+class ResilientCamera:
+    """Camera that survives unplugging: reopens after repeated read failures, with backoff.
 
-    def __init__(self) -> None:
+    ``read()`` returns a frame or None (no frame right now; the caller just tries again).
+    ``on_state("UP" | "DOWN")`` is called whenever frames start or stop arriving.
+    """
+
+    def __init__(self, source: Optional[str] = None, on_state=None, opener=None) -> None:
+        self.source = source
+        self.on_state = on_state
+        self.opener = opener or open_camera
+        self.cap = None
+        self.up: Optional[bool] = None
+        self.failures = 0
+        self.backoff = 1.0
+        self.next_open = 0.0
+
+    def _set_up(self, up: bool) -> None:
+        if up != self.up:
+            self.up = up
+            if self.on_state is not None:
+                self.on_state("UP" if up else "DOWN")
+
+    def _close(self, now: float) -> None:
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:  # noqa: BLE001
+                pass
+        self.cap = None
+        self.next_open = now + self.backoff
+        self.backoff = min(self.backoff * 2, CAMERA_BACKOFF_MAX_S)
+        self._set_up(False)
+
+    def read(self):
+        now = time.monotonic()
+        if self.cap is None:
+            if now < self.next_open:
+                time.sleep(0.05)
+                return None
+            try:
+                self.cap = self.opener(self.source)
+            except Exception as exc:  # noqa: BLE001 - keep retrying, e.g. camera plugged in later
+                logger.warning("Camera %r unavailable: %s (retrying in %.0fs)",
+                               self.source or config.CAMERA_SOURCE, exc, self.backoff)
+                self._close(now)
+                return None
+            self.failures = 0
+
+        try:
+            ok, frame = self.cap.read()
+        except Exception:  # noqa: BLE001 - e.g. picamera2 raising when the ribbon comes loose
+            ok, frame = False, None
+        if ok:
+            self.failures = 0
+            self.backoff = 1.0
+            self._set_up(True)
+            return frame
+
+        self.failures += 1
+        time.sleep(0.01)
+        if self.failures >= CAMERA_FAIL_LIMIT:
+            logger.warning("Camera stopped delivering frames; reopening in %.0fs", self.backoff)
+            self._close(now)
+        return None
+
+    def release(self) -> None:
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+
+
+class VisionPipeline:
+    """Posture monitoring (and optional face detection) on BGR frames.
+
+    ``process()`` returns (topic, payload) messages to publish.
+    """
+
+    def __init__(self, face_detection: Optional[bool] = None) -> None:
         import mediapipe as mp
 
         if not hasattr(mp, "solutions"):
             raise RuntimeError(f"mediapipe {mp.__version__} has no 'solutions' module. {MEDIAPIPE_HINT}")
 
-        self.face_detector = mp.solutions.face_detection.FaceDetection(
-            model_selection=0,
-            min_detection_confidence=0.5,
-        )
+        if face_detection is None:
+            face_detection = config.FACE_DETECTION
+        self.face_detector = None
+        if face_detection:
+            self.face_detector = mp.solutions.face_detection.FaceDetection(
+                model_selection=0,
+                min_detection_confidence=0.5,
+            )
         self.pose_detector = mp.solutions.pose.Pose(
             static_image_mode=False,
             model_complexity=0,
@@ -289,13 +377,14 @@ class VisionPipeline:
         frame_h, frame_w = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        face_result = self.face_detector.process(rgb)
-        center = select_primary_face(face_result.detections, frame_w, frame_h)
-        if center is not None and (now - self.last_face_pub) >= FACE_PUBLISH_MIN_INTERVAL_S:
-            x_err = center[0] - (frame_w // 2)
-            y_err = center[1] - (frame_h // 2)
-            messages.append((config.TOPIC_FACE_ERROR, f"{x_err},{y_err}"))
-            self.last_face_pub = now
+        if self.face_detector is not None:
+            face_result = self.face_detector.process(rgb)
+            center = select_primary_face(face_result.detections, frame_w, frame_h)
+            if center is not None and (now - self.last_face_pub) >= FACE_PUBLISH_MIN_INTERVAL_S:
+                x_err = center[0] - (frame_w // 2)
+                y_err = center[1] - (frame_h // 2)
+                messages.append((config.TOPIC_FACE_ERROR, f"{x_err},{y_err}"))
+                self.last_face_pub = now
 
         if self.frame_idx % POSE_EVERY_N_FRAMES == 0:
             pose_result = self.pose_detector.process(rgb)
@@ -312,23 +401,23 @@ class VisionPipeline:
         return messages
 
     def close(self) -> None:
-        self.face_detector.close()
+        if self.face_detector is not None:
+            self.face_detector.close()
         self.pose_detector.close()
 
 
 def run() -> None:
-    """Standalone mode: publish face errors and posture events straight to MQTT."""
+    """Standalone mode: publish posture events (and face errors if enabled) straight to MQTT."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
     mqtt_client = build_mqtt_client()
-    cap = open_camera()
+    cap = ResilientCamera(on_state=lambda s: mqtt_client.publish(config.TOPIC_VISION_STATE, s, qos=1, retain=True))
     pipeline = VisionPipeline()
     print(f"Vision running on camera {config.CAMERA_SOURCE!r} (Ctrl+C to stop)")
 
     try:
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                time.sleep(0.01)
+            frame = cap.read()
+            if frame is None:
                 continue
             for topic, payload in pipeline.process(frame, time.monotonic()):
                 mqtt_client.publish(topic, payload, qos=0, retain=False)

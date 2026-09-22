@@ -11,7 +11,7 @@ import pytest
 
 HERE = Path(__file__).parent / "firmware"
 SCENARIOS = ["protocol", "imu_sign", "slope", "walking", "watchdog", "fall", "wrong_sign", "calibration",
-             "no_imu", "telemetry"]
+             "no_imu", "imu_fail", "telemetry"]
 
 pytestmark = pytest.mark.skipif(shutil.which("g++") is None, reason="g++ not installed")
 

@@ -38,6 +38,7 @@ TOPIC_AUDIO_INTENT = "robot/audio/intent"  # audio cues requested by the behavio
 TOPIC_LOCOMOTION_CMD = "robot/locomotion/cmd"  # stand | rest | stop | walk,<speed>,<turn>[,<s>] | ...
 TOPIC_LOCOMOTION_EVENT = "robot/locomotion/event"  # EVT,FALLEN / EVT,WATCHDOG / NACK,... from the Nano
 TOPIC_LOCOMOTION_TELEMETRY = "robot/locomotion/telemetry"  # T,<pitch x10>,<rate x10>,<corr x10>,<mode>
+TOPIC_VISION_STATE = "robot/vision/state"  # UP / DOWN when the camera starts or stops delivering frames
 
 # Pi <-> Nano serial link. "sim" logs commands instead of opening a port.
 SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/ttyUSB0")
@@ -46,6 +47,11 @@ SERIAL_BAUD = int(os.getenv("SERIAL_BAUD", "115200"))
 # Subsystem switches (the robot keeps running in degraded mode if an optional one fails)
 ENABLE_VISION = _env_bool("ENABLE_VISION", True)
 ENABLE_AUDIO = _env_bool("ENABLE_AUDIO", True)
+# Face detection costs CPU on the Pi and nothing uses its output yet (no head servos); off by default.
+FACE_DETECTION = _env_bool("FACE_DETECTION", False)
+# Let the robot stand/walk when the Nano booted without an IMU (no balance, no fall detection).
+# Only for bench tests: keep it off on a real robot.
+ALLOW_NO_IMU = _env_bool("ALLOW_NO_IMU", False)
 
 # "picamera2" (Pi CSI camera), a V4L2 path such as "/dev/video0", or a webcam index such as "0"
 CAMERA_SOURCE = os.getenv("CAMERA_SOURCE", "/dev/video0")
