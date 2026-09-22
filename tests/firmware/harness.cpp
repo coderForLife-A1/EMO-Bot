@@ -23,6 +23,8 @@ uint32_t g_micros = 0;
 std::vector<PwmCall> g_pwm;
 uint16_t g_chan[16];
 bool g_chanOff[16];
+bool g_pcaAllFails = false;
+int g_pcaAllWrites = 0;
 
 #ifndef FIRMWARE_SKETCH
 #define FIRMWARE_SKETCH "../../firmware/emo_esp32/emo_esp32.ino"
@@ -193,6 +195,8 @@ static void scenarioProtocol()
         {"wrong field count", "W,50", "NACK,W,FORMAT\n"},
         {"empty field rejected", "J,,1,90", "NACK,J,FORMAT\n"},
         {"negative gain rejected", "K,-1,0,0", "NACK,K,PARSE\n"},
+        {"gain above 1000 rejected", "K,100001,0,0", "NACK,K,PARSE\n"},
+        {"overflowing gain rejected", "K,99999999999999999999,0,0", "NACK,K,PARSE\n"},
         {"unknown gesture", "G,7", "NACK,G,PARSE\n"},
         {"ping", "P", "ACK,P\n"},
         {"stand", "S", "ACK,S\n"},
@@ -222,6 +226,17 @@ static void scenarioProtocol()
     for (int ch = 0; ch < 16; ch++)
         offWrites += g_chanOff[ch];
     expect(offWrites == 16, "estop switches all 16 outputs off");
+    expect(g_pcaAllWrites > 0, "estop uses one ALL_LED write");
+
+    send("R");
+    send("S");
+    g_pcaAllFails = true; // ALL_LED write NACKed: per-channel fallback
+    send("E");
+    offWrites = 0;
+    for (int ch = 0; ch < 16; ch++)
+        offWrites += g_chanOff[ch];
+    expect(offWrites == 16, "estop falls back to per-channel writes if the ALL_LED write fails");
+    g_pcaAllFails = false;
     expect(angleToTick(10) == 124 && angleToTick(90) == 307 && angleToTick(170) == 489, "servo tick mapping");
 }
 
@@ -353,6 +368,9 @@ static void scenarioCalibration()
            reply + fmt(" pitch=%.2f", pitchDeg));
     send("K,120,250,5");
     expect(take() == "ACK,K,120,250,5\n", "gains accepted");
+    const int commits = EEPROM.commits;
+    send("K,120,250,5");
+    expect(take() == "ACK,K,120,250,5\n" && EEPROM.commits == commits, "unchanged gains don't rewrite flash");
     settings.kp = settings.pitchOffset = 0;
     loadSettings();
     expect(fabs(settings.pitchOffset - 5) < 0.5f && fabs(settings.kp - 1.2f) < 1e-4f,
@@ -373,6 +391,9 @@ static void scenarioNoImu()
     take();
     send("C");
     expect(take() == "NACK,C,NOIMU\n", "calibration needs the IMU");
+    g_imu.present = true; // IMU plugged in after boot
+    send("S");
+    expect(take() == "ACK,S\n" && imuOk && !imuLost, "S picks up an IMU connected after boot");
 }
 
 static void scenarioImuFail()

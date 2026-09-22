@@ -34,7 +34,7 @@
 #include <Adafruit_PWMServoDriver.h>
 #include <math.h>
 
-Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40); // PCA9685_ADDR
 
 // ---------------------------------------------------------------- servo hardware
 static const uint32_t SERIAL_BAUD = 115200;
@@ -44,6 +44,9 @@ static const uint16_t SERVO_MAX_TICK = 512; // ~= 2.5ms at 50Hz, 12-bit
 // PCA9685 internal oscillators vary (~23-27 MHz). Measure the 50 Hz output with a scope or
 // logic analyser and adjust this value if servo angles are consistently off.
 static const uint32_t PCA9685_OSC_HZ = 27000000;
+static const float TICKS_PER_DEG = (SERVO_MAX_TICK - SERVO_MIN_TICK) / 180.0f;
+static const uint8_t PCA9685_ADDR = 0x40;
+static const uint8_t PCA9685_ALL_LED_ON_L = 0xFA; // ALL_LED_* registers write every channel at once
 
 // Raw servo end-stops (servo degrees) and joint -> PCA9685 channel map.
 static const uint8_t JOINT_MIN_DEG[JOINT_COUNT] = {
@@ -102,6 +105,14 @@ static const float BALANCE_LIMIT_DEG = 20;  // max hip correction
 static const uint32_t LOOP_US = 10000;      // 100 Hz
 static const uint16_t TELEMETRY_MS = 50;
 static const float D_FILTER_HZ = 10;        // low-pass on the D term: rejects vibration and step noise
+static const long MAX_GAIN_X100 = 100000; // K refuses gains above 1000 (the Pi's limit)
+
+// Single-precision constants: Arduino's PI, TWO_PI and RAD_TO_DEG are doubles, and the ESP32 FPU is
+// single-precision only (double math runs in software). On the Nano float and double are the same.
+static const float PI_F = 3.14159265f;
+static const float TWO_PI_F = 6.28318531f;
+static const float RAD_TO_DEG_F = 57.2957795f;
+static const float D_TAU_S = 1.0f / (TWO_PI_F * D_FILTER_HZ);
 
 struct Settings
 {
@@ -254,15 +265,26 @@ void loadSettings()
 void saveSettings()
 {
     settings.magic = SETTINGS_MAGIC;
-    EEPROM.put(0, settings);
+    EEPROM.put(0, settings); // AVR EEPROM.put only rewrites bytes that changed
 }
 
 // ---------------------------------------------------------------- servos
 void allOutputsOff()
 {
-    for (uint8_t ch = 0; ch < 16; ch++)
+    // One ALL_LED write (full-off bit in OFF_H) instead of 16 per-channel writes: E-stop in ~0.2 ms.
+    // The PCA9685 copies it into every channel, so a later setPWM() turns that channel back on.
+    Wire.beginTransmission(PCA9685_ADDR);
+    Wire.write(PCA9685_ALL_LED_ON_L);
+    Wire.write(0x00); // ALL_LED_ON_L
+    Wire.write(0x00); // ALL_LED_ON_H
+    Wire.write(0x00); // ALL_LED_OFF_L
+    Wire.write(0x10); // ALL_LED_OFF_H: full off, no pulses, servos go limp
+    if (Wire.endTransmission() != 0)
     {
-        pwm.setPWM(ch, 0, 4096); // full-off bit: no pulses, servo goes limp
+        for (uint8_t ch = 0; ch < 16; ch++) // bus glitch: fall back to per-channel writes
+        {
+            pwm.setPWM(ch, 0, 4096);
+        }
     }
     for (uint8_t i = 0; i < LEG_COUNT; i++)
     {
@@ -277,8 +299,7 @@ void writeLeg(uint8_t leg)
     const uint8_t joint = LEG_JOINT[leg];
     const float servoDeg = clampf(90 + LEG_TRIM_DEG[leg] + LEG_DIR[leg] * legAngle[leg],
                                   JOINT_MIN_DEG[joint], JOINT_MAX_DEG[joint]);
-    const uint16_t tick = static_cast<uint16_t>(
-        lround(SERVO_MIN_TICK + servoDeg * (SERVO_MAX_TICK - SERVO_MIN_TICK) / 180.0));
+    const uint16_t tick = static_cast<uint16_t>(lroundf(SERVO_MIN_TICK + servoDeg * TICKS_PER_DEG));
     if (tick != lastLegTick[leg])
     {
         pwm.setPWM(JOINT_TO_CHANNEL[joint], 0, tick);
@@ -311,17 +332,17 @@ bool imuReadRaw(int16_t *ax, int16_t *az, int16_t *gy)
     {
         return false;
     }
-    if (Wire.requestFrom(MPU_ADDR, static_cast<uint8_t>(14)) != 14)
+    if (Wire.requestFrom(MPU_ADDR, static_cast<uint8_t>(12)) != 12) // up to GYRO_YOUT_L; GYRO_Z unused
     {
         return false;
     }
-    int16_t v[7];
-    for (uint8_t i = 0; i < 7; i++)
+    int16_t v[6];
+    for (uint8_t i = 0; i < 6; i++)
     {
         const uint8_t hi = Wire.read();
         v[i] = static_cast<int16_t>((hi << 8) | Wire.read());
     }
-    *ax = v[0]; // v[1] = ay, v[3] = temperature, v[4] = gx, v[6] = gz
+    *ax = v[0]; // v[1] = ay, v[3] = temperature, v[4] = gx
     *az = v[2];
     *gy = v[5];
     return true;
@@ -330,7 +351,7 @@ bool imuReadRaw(int16_t *ax, int16_t *az, int16_t *gy)
 float accelPitchDeg(int16_t ax, int16_t az)
 {
     // X forward, Z up: leaning forward makes the X axis read -g*sin(pitch).
-    return atan2(-static_cast<float>(ax), static_cast<float>(az)) * RAD_TO_DEG;
+    return atan2f(-static_cast<float>(ax), static_cast<float>(az)) * RAD_TO_DEG_F;
 }
 
 // Average the resting gyro (and optionally the level pitch). The robot must be still.
@@ -412,9 +433,9 @@ float balanceCorrection(float dt)
         return 0;
     }
     // Anti-windup: the integral alone can never ask for more than the output limit.
-    const float iLimit = settings.ki > 0.001 ? BALANCE_LIMIT_DEG / settings.ki : 0;
+    const float iLimit = settings.ki > 0.001f ? BALANCE_LIMIT_DEG / settings.ki : 0;
     pidInteg = clampf(pidInteg + pitchDeg * dt, -iLimit, iLimit);
-    const float a = dt / (dt + 1.0 / (TWO_PI * D_FILTER_HZ));
+    const float a = dt / (dt + D_TAU_S);
     rateFiltered += (pitchRate - rateFiltered) * a;
     const float u = settings.kp * pitchDeg + settings.ki * pidInteg + settings.kd * rateFiltered;
     return clampf(u, -BALANCE_LIMIT_DEG, BALANCE_LIMIT_DEG);
@@ -433,13 +454,13 @@ void computeLegTargets(float dt, float target[LEG_COUNT])
         stride[s] += clampf(strideTarget[s] - stride[s], -rampStep, rampStep);
     }
 
-    const bool moving = fabs(stride[0]) > 0.01 || fabs(stride[1]) > 0.01;
+    const bool moving = fabsf(stride[0]) > 0.01f || fabsf(stride[1]) > 0.01f;
     if (moving)
     {
-        gaitPhase += TWO_PI * GAIT_HZ * dt;
-        if (gaitPhase >= TWO_PI)
+        gaitPhase += TWO_PI_F * GAIT_HZ * dt;
+        if (gaitPhase >= TWO_PI_F)
         {
-            gaitPhase -= TWO_PI;
+            gaitPhase -= TWO_PI_F;
         }
     }
     else
@@ -457,17 +478,20 @@ void computeLegTargets(float dt, float target[LEG_COUNT])
         }
         else
         {
-            bob = BOB_DEG * sin(PI * t / BOB_MS);
+            bob = BOB_DEG * sinf(PI_F * t / BOB_MS);
         }
     }
 
+    // Legs are half a cycle apart: the right leg's sin/cos are the left leg's, negated.
+    const float sinL = sinf(gaitPhase);
+    const float cosL = cosf(gaitPhase);
     for (uint8_t s = 0; s < 2; s++)
     {
-        const float phi = gaitPhase + (s == 0 ? 0 : PI); // legs half a cycle apart
-        const float swing = HIP_SWING_DEG * stride[s] * sin(phi);
+        const float sn = s == 0 ? sinL : -sinL;
+        const float c = s == 0 ? cosL : -cosL;
+        const float swing = HIP_SWING_DEG * stride[s] * sn;
         // Lift the knee while the leg swings (cos > 0), never during stance.
-        const float c = cos(phi);
-        const float lift = KNEE_LIFT_DEG * clampf(fabs(stride[s]), 0, 1) * (c > 0 ? c : 0);
+        const float lift = KNEE_LIFT_DEG * clampf(fabsf(stride[s]), 0, 1) * (c > 0 ? c : 0);
         target[s == 0 ? L_HIP : R_HIP] = STAND_HIP_DEG - lastCorrection + swing + bob; // hip = knee: torso stays level
         target[s == 0 ? L_KNEE : R_KNEE] = STAND_KNEE_DEG + lift + bob;
     }
@@ -501,7 +525,7 @@ void controlTick(float dt)
 
     if (mode == MODE_BALANCE)
     {
-        if (imuOk && fabs(pitchDeg) > FALL_DEG)
+        if (imuOk && fabsf(pitchDeg) > FALL_DEG)
         {
             if (!fallTiming)
             {
@@ -535,11 +559,11 @@ void controlTick(float dt)
     {
         lastTelemetryMs = millis();
         Serial.print(F("T,"));
-        Serial.print(lround(pitchDeg * 10));
+        Serial.print(lroundf(pitchDeg * 10));
         Serial.print(',');
-        Serial.print(lround(pitchRate * 10));
+        Serial.print(lroundf(pitchRate * 10));
         Serial.print(',');
-        Serial.print(lround(lastCorrection * 10));
+        Serial.print(lroundf(lastCorrection * 10));
         Serial.print(',');
         Serial.println(static_cast<char>(mode));
     }
@@ -553,20 +577,23 @@ void cmdStand()
         sendNack(F("ESTOP"));
         return;
     }
-    if (imuLost && mode != MODE_BALANCE)
+    if (!imuOk && mode != MODE_BALANCE)
     {
-        // The IMU worked at boot and then stopped answering: try to bring it back (e.g. reseated cable).
+        // Try to bring the IMU back (reseated cable, or plugged in after boot). Fails fast if absent.
         imuOk = imuInit();
-        imuLost = !imuOk;
         imuFailCount = 0;
-        if (imuLost)
+        if (imuOk)
+        {
+            imuLost = false;
+            imuUpdate(LOOP_US * 1e-6f); // fresh pitch (the filter re-seeds from the accelerometer)
+        }
+        else if (imuLost) // lost at runtime: never stand blind (booting without one is allowed for bench tests)
         {
             sendNack(F("NOIMU"));
             return;
         }
-        imuUpdate(LOOP_US * 1e-6); // fresh pitch (the filter re-seeds from the accelerometer)
     }
-    if (imuOk && fabs(pitchDeg) > STAND_MAX_TILT_DEG)
+    if (imuOk && fabsf(pitchDeg) > STAND_MAX_TILT_DEG)
     {
         sendNack(F("TILTED"));
         return;
@@ -615,8 +642,8 @@ void cmdWalk(char **fields)
     }
     speed = speed < -100 ? -100 : (speed > 100 ? 100 : speed);
     turn = turn < -100 ? -100 : (turn > 100 ? 100 : turn);
-    speedTarget = speed / 100.0;
-    turnTarget = turn / 100.0;
+    speedTarget = speed / 100.0f;
+    turnTarget = turn / 100.0f;
     lastWalkMs = millis();
     Serial.print(F("ACK,W,"));
     Serial.print(speed);
@@ -661,21 +688,21 @@ void cmdCalibrate()
     }
     saveSettings();
     Serial.print(F("ACK,C,"));
-    Serial.println(lround(settings.pitchOffset * 100));
+    Serial.println(lroundf(settings.pitchOffset * 100));
 }
 
 void cmdGains(char **fields)
 {
     long kp, ki, kd;
     if (!parseIntSafe(fields[1], &kp) || !parseIntSafe(fields[2], &ki) || !parseIntSafe(fields[3], &kd) ||
-        kp < 0 || ki < 0 || kd < 0)
+        kp < 0 || ki < 0 || kd < 0 || kp > MAX_GAIN_X100 || ki > MAX_GAIN_X100 || kd > MAX_GAIN_X100)
     {
         sendNack(F("PARSE"));
         return;
     }
-    settings.kp = kp / 100.0;
-    settings.ki = ki / 100.0;
-    settings.kd = kd / 100.0;
+    settings.kp = kp / 100.0f;
+    settings.ki = ki / 100.0f;
+    settings.kd = kd / 100.0f;
     pidInteg = 0;
     saveSettings();
     Serial.print(F("ACK,K,"));
@@ -899,10 +926,10 @@ void loop()
     const uint32_t now = micros();
     if (now - lastTickUs >= LOOP_US)
     {
-        float dt = (now - lastTickUs) * 1e-6;
-        if (dt > 0.05)
+        float dt = (now - lastTickUs) * 1e-6f;
+        if (dt > 0.05f)
         {
-            dt = 0.05; // after a stall, don't integrate a huge step
+            dt = 0.05f; // after a stall, don't integrate a huge step
         }
         lastTickUs = now;
         controlTick(dt);
