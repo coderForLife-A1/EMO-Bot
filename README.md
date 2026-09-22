@@ -68,7 +68,7 @@ keeps the robot safe even if the Pi stalls.
 | File | What it is |
 | --- | --- |
 | `firmware/emo_esp32/emo_esp32.ino` | **ESP32 firmware (default).** Port of the Nano sketch below: same protocol and control code. ESP32 specifics: I2C on GPIO21/22, settings in flash-emulated EEPROM (`EEPROM.commit()`), I2C timeout via `Wire.setTimeOut()`, and a `LINK_UART2` switch for USB (`Serial`) or the Pi's GPIO UART (`Serial2`, GPIO16/17, 3.3 V, no level shifter). |
-| `firmware/emo_nano/emo_nano.ino` | **Arduino Nano firmware (alternative).** 100 Hz control loop: MPU6050 IMU with a complementary filter, PID on torso pitch through the hips (anti-windup, filtered D term), walking gait with knee lift and smooth start/stop, per-joint speed and angle limits, fall detection, walk watchdog, and calibration and PID gains saved in EEPROM. Speaks a line-based serial protocol (`S` stand, `W,<speed>,<turn>` walk, `G,1` gesture, `E`/`R` E-stop, `C` calibrate, `K` gains, `T` telemetry, `J` raw servo moves for setup). The configuration you adjust for your build (servo trims and directions, stance, gait sizes) is at the top. |
+| `firmware/emo_nano/emo_nano.ino` | **Arduino Nano firmware (alternative).** 100 Hz control loop: MPU6050 IMU with a complementary filter, PID on torso pitch through the hips (anti-windup, filtered D term), walking gait with knee lift and smooth start/stop, per-joint speed and angle limits, fall detection, walk watchdog, and calibration and PID gains saved in EEPROM. Speaks a line-based serial protocol (`S` stand, `W,<speed>,<turn>` walk, `G,1` gesture, `E`/`R` E-stop, `C` calibrate, `K` gains, `T` telemetry, `I` IMU retry without moving, `J` raw servo moves for setup). The configuration you adjust for your build (servo trims and directions, stance, gait sizes) is at the top. |
 
 ### Tools, assets and deployment
 
@@ -100,15 +100,15 @@ keeps the robot safe even if the Pi stalls.
 
 | File | What it tests |
 | --- | --- |
-| `tests/test_firmware.py` | Compiles both firmwares (ESP32, Nano) for your PC and runs 11 scenarios on each against a simulated robot: serial protocol, IMU direction, recovery from a slope, walking, watchdog, fall detection, wrong-sensor-direction safety, calibration + EEPROM, missing IMU, IMU failing while walking (and recovering), telemetry. Skipped if `g++` isn't installed. |
+| `tests/test_firmware.py` | Compiles both firmwares (ESP32, Nano) for your PC and runs 11 scenarios on each against a simulated robot: serial protocol, IMU direction, recovery from a slope, walking, watchdog, fall detection, wrong-sensor-direction safety, calibration + EEPROM, missing IMU (and the `I` retry), IMU failing while walking (and recovering), telemetry. Skipped if `g++` isn't installed. |
 | `tests/firmware/harness.cpp` | The simulator behind those scenarios (and behind `tools/sim_nano.py`): a planar model of the robot, simulated MPU6050, and a `serve` mode. |
 | `tests/firmware/Arduino.h`, `Wire.h`, `EEPROM.h`, `Adafruit_PWMServoDriver.h` | Small stand-ins for the Arduino libraries so the firmware compiles on a PC. |
-| `tests/test_behavior_tree.py` | Standing, walking and its heartbeat, stop, E-stop, falls, rest, calibration, tuning commands, priorities. |
-| `tests/test_serial.py` | Reply parsing, `READY` banner, event/telemetry forwarding, queueing, sim mode. |
-| `tests/test_vision.py` | Face selection, posture rules at any distance, personal baseline, alert timing. |
-| `tests/test_api_routing.py` | The speech pipeline against a mocked HTTP server: WAV output, timeouts, missing keys, fallback, phrase cache. |
+| `tests/test_behavior_tree.py` | Standing, walking and its heartbeat, stop, E-stop (commands refused while latched, re-latched after a controller reboot), falls, rest, calibration, tuning commands and their flash-write limit, IMU fault retry with `I`, priorities. |
+| `tests/test_serial.py` | Reply parsing, `READY` banner, event/telemetry forwarding, queueing, stale commands dropped on reconnect or reset, slow-reply timeouts, sim mode. |
+| `tests/test_vision.py` | Face selection, posture rules at any distance, personal baseline, alert timing, camera pacing between pose frames (no busy loop). |
+| `tests/test_api_routing.py` | The speech pipeline against a mocked HTTP server: WAV output, timeouts, missing keys, fallback, phrase cache, HTTPS-only API keys (cached phrases still play). |
 | `tests/test_main.py` | The whole runtime starts without hardware and stands the legs up. |
-| `tests/test_round2_misc.py` | Round-2 review checks that span modules: MQTT login/TLS, every module using the shared MQTT client, speech cues never evicting a recording, the simulator's private build directory. |
+| `tests/test_round2_misc.py` | Round-2 review checks that span modules: MQTT login/TLS, every module using the shared MQTT client, speech cues never evicting a recording, the simulator's private build directory. Round-3 checks: one shared local-host check, broker connection failures logged once per streak. |
 | `tests/conftest.py` | pytest setup that makes the modules importable. |
 
 ---
@@ -359,9 +359,14 @@ The simplest option is a USB cable (`SERIAL_PORT=/dev/ttyUSB0`). To use the Pi's
 
 - `mosquitto_pub -t robot/error -m error` latches an E-stop: the controller turns every servo output off
   and refuses commands until `mosquitto_pub -t robot/error -m clear`. The E-stop skips ahead of any
-  commands already queued, and a malformed MQTT message can't disable it.
+  commands already queued, and a malformed MQTT message can't disable it. Commands sent during the E-stop
+  (walk, gesture, tuning, calibrate) are refused, so nothing stale runs after `clear`; if the controller
+  reboots during an E-stop, the Pi latches it again.
 - If the IMU stops answering, there is no balance and no fall detection, so the controller stops walking
-  and the Pi relaxes the servos until the IMU answers again (`EVT,IMU_FAIL`).
+  and the Pi relaxes the servos until the IMU answers again (`EVT,IMU_FAIL`). `stand` retries the IMU with
+  `I`, which never moves a servo; the robot stands again once `ACK,I` confirms the IMU.
+- Commands queued while the controller was unplugged or resetting are dropped when it comes back, so an
+  old walk, gesture or calibrate never reaches a freshly booted controller.
 - When the Pi software exits, it stops any walk and switches the servos off first.
 - If the robot tips past 45° for a quarter of a second, the controller switches every servo off
   (`EVT,FALLEN`), the robot asks to be stood back up, and it won't stand again until it is upright and told `stand`.

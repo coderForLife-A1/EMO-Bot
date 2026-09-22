@@ -2,7 +2,7 @@
 
 Code review of `main` @ `b6aa2b2`. API layer (`api_routing_task.py`) out of scope. Line numbers refer to that commit.
 
-**Status: all issues are fixed (1-13 in round 1, 14-26 in round 2, 27-34 in round 3), on `Fixes`.** Each section ends with a *Resolution* note: what changed and which test covers it. Run `pytest` to check them (158 tests, including 11 firmware scenarios run against both the ESP32 and the Nano firmware, compiled for the PC). The firmware fixes are in both sketches (`firmware/emo_esp32`, `firmware/emo_nano`).
+**Status: all issues are fixed (1-13 in round 1, 14-26 in round 2, 27-34 in round 3), on `Fixes` and merged to `main`.** Each section ends with a *Resolution* note: what changed and which test covers it. Run `pytest` to check them (158 tests, including 11 firmware scenarios run against both the ESP32 and the Nano firmware, compiled for the PC). The firmware fixes are in both sketches (`firmware/emo_esp32`, `firmware/emo_nano`).
 
 Severity: 🔴 **Critical** (safety / robot stops responding) · 🟠 **High** (wrong behaviour) · 🟡 **Medium** · ⚪ **Low**
 
@@ -553,7 +553,7 @@ code; they are now fixed on `Fixes`, each section ending with a *Resolution* not
   `test_connection_failures_are_logged_once_per_streak`, `test_user_on_connect_still_runs`.
 
 
-## Firmware (round 3, on the `Fixes` branch)
+## Firmware (round 3)
 
 - **`I` command:** retries the IMU without moving a servo → `ACK,I` / `NACK,I,NOIMU` / `NACK,I,MODE` (while balancing).
   Both sketches; host tests cover all three replies and recovery without moving. Needed for the #28 fix.
