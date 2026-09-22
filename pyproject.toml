@@ -1,0 +1,16 @@
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["tests/firmware"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I", "ASYNC"]
+ignore = ["W191", "E101"]  # serial_module.py is tab-indented
+
+[tool.ruff.lint.isort]
+known-first-party = ["config", "behavior_tree_module", "vision_posture_module", "serial_module",
+                     "audio_trigger_task", "api_routing_task", "main"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

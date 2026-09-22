@@ -1,194 +1,244 @@
-# Personal Desk Robot
+# EMO-Bot: Personal Desk Robot
 
-## Project Overview
+EMO-Bot is a small two-legged desk companion. It stands and keeps its torso level with an
+IMU-driven balance controller, walks on command, reminds you when you slouch, and holds a
+spoken conversation after a wake word.
 
-Personal Desk Robot is a six-layer robotic system in which a Raspberry Pi 5 provides high-level compute and an Arduino Nano provides deterministic actuator control. The Pi runs Python `asyncio` tasks, a local MQTT broker, OpenCV/MediaPipe vision, Porcupine wake-word detection, Whisper transcription, GPT-4o routing, and ElevenLabs text-to-speech; the Nano receives newline-delimited UART joint commands and updates a PCA9685 servo controller over I2C. The event loop must remain non-blocking: blocking device APIs and subprocesses belong in worker threads or asynchronous subprocess interfaces, and runtime modules exchange data only through MQTT or `asyncio.Queue`.
+A **Raspberry Pi 5** does the thinking (vision, speech, decisions). An **Arduino Nano** does the
+fast, safety-critical control (balance PID, walking gait, fall detection) and drives four servos
+through a PCA9685.
 
-## Architecture
+- **Step-by-step setup, running and tuning guide:** [RUNNING.md](RUNNING.md)
+- **No hardware yet?** `python tools/sim_nano.py` runs the real firmware against a simulated robot.
 
-1. **Physical**
-	- 16 servo actuators, mechanical joints, external servo power, PCA9685 PWM expansion, desk enclosure, and audio/visual peripherals.
-2. **Sensing**
-	- ReSpeaker HAT audio input on ALSA `plughw:0`.
-	- Camera on V4L2 `/dev/video0` for face tracking and posture estimation.
-	- VL53L0X time-of-flight distance sensing over I2C.
-3. **Compute**
-	- Raspberry Pi 5: Linux host for asynchronous orchestration, networking, camera, audio, and AI calls.
-	- Arduino Nano: fixed-rate servo command parser and PCA9685 controller.
-4. **Software**
-	- Python `asyncio`, local Mosquitto MQTT, `asyncio.Queue`, `httpx`, PySerial, OpenCV, MediaPipe, and the API service under `api_server/`.
-	- Arduino firmware uses Wire, Adafruit PWM Servo Driver, and non-blocking serial line buffering.
-5. **Intelligence**
-	- `behavior_tree_module.py` runs a 10 Hz priority tree for E-stop, conversation, posture correction, face tracking, and idle motion.
-	- Audio routing is wake word -> 5-second WAV -> Whisper -> GPT-4o -> ElevenLabs -> playback.
-6. **Interaction**
-	- Servo motion, audio playback, MQTT state topics, camera-derived tracking, posture alerts, and the GC9A01 TFT user display.
+---
 
-## Hardware BOM (Bill of Materials)
+## What it does
+
+| Feature | How |
+| --- | --- |
+| Stands and stays level | MPU6050 → complementary filter → PID on torso pitch → both hip servos (100 Hz on the Nano) |
+| Walks and turns | Sinusoidal gait on hips and knees; turning uses different stride lengths per leg |
+| Stays safe | Servos switch off if it falls past 45°, it stops walking if the Pi goes quiet, walks are time-limited, latched E-stop |
+| Posture reminders | Camera + MediaPipe pose; after 3 s of slouching it does a knee bob and says a reminder |
+| Conversation | "Porcupine" wake word → Whisper → GPT → ElevenLabs; the robot stands still while talking |
+| Remote control | Everything is driven over MQTT (`robot/locomotion/cmd`, `robot/error`, ...) |
+
+With hips and knees only (no ankle or sideways hip joints), the legs move forward and back only.
+The feet are flat and rigid, so the robot stands on its own. The balance loop keeps the **torso**
+level against slopes, pushes and the rocking of the gait. It can't lean sideways, so it relies on
+wide, flat feet and walks with a short shuffle.
+
+## How it fits together
+
+```
+ Raspberry Pi 5 (Python, main.py)                                Arduino Nano (firmware, 100 Hz)
+ ┌─────────────────────────────────────────────┐                ┌─────────────────────────────────┐
+ │ vision ──┐                                  │  S / W / G /   │ MPU6050 → pitch filter          │
+ │ wake word├─► MQTT ─► behavior tree ─► serial├─ E / R ... ───►│ PID → hip correction            │
+ │ speech ◄─┘  (Mosquitto)   (10 Hz)           │◄─ ACK / EVT / T│ gait + slew limit → PCA9685     │
+ └─────────────────────────────────────────────┘                │ fall detection, walk watchdog   │
+                                                                └──────────────┬──────────────────┘
+                                                                  4 servos: L/R hip, L/R knee
+```
+
+The Pi decides *what* to do (stand, walk for 3 s, gesture). The Nano decides *how* every 10 ms and
+keeps the robot safe even if the Pi stalls.
+
+---
+
+## Files
+
+### Robot software (Raspberry Pi)
+
+| File | What it is |
+| --- | --- |
+| `main.py` | **Entry point.** Starts every task in one asyncio process and supervises them. If a critical task (serial, behavior tree) crashes, the robot shuts down. If an optional one (vision, wake word, speech) crashes, it is logged and the robot keeps running. Routes the Nano's events to MQTT and turns behavior-tree cues into speech. |
+| `config.py` | **All settings in one place.** Loads `.env` first, then exposes every setting (serial port, camera, audio devices, API keys, timeouts, feature switches) and every MQTT topic name. |
+| `behavior_tree_module.py` | **The robot's decision-making.** A 10 Hz py_trees priority tree: E-stop > fallen > rest > conversation > posture reminder > walk > stand. Turns MQTT commands (`walk,70,0,3`, `stand`, ...) into Nano commands, re-sending walk commands as a heartbeat. Runs standalone for testing: `python behavior_tree_module.py`. |
+| `serial_module.py` | **Link to the Nano.** Opens the serial port (or `socket://` for the simulator), waits for the `READY` banner, sends one command at a time, checks each ACK/NACK, forwards events (`EVT,FALLEN`) and telemetry, detects Nano resets and reconnects forever. `SERIAL_PORT=sim` only logs commands. |
+| `vision_posture_module.py` | **Camera vision.** MediaPipe face detection and pose estimation; decides good or poor posture relative to your own upright baseline, and publishes `POSTURE_POOR` / `POSTURE_OK`. Supports the Pi CSI camera (Picamera2), USB cameras and laptop webcams. Runs standalone. |
+| `audio_trigger_task.py` | **Wake word.** Porcupine listens for the wake word, then records 5 s of speech and hands it to the speech pipeline. Ignores its own voice while replying. Runs standalone to test the microphone. |
+| `api_routing_task.py` | **Speech pipeline.** Whisper (speech → text) → GPT (reply) → ElevenLabs (text → speech) → speaker. Also speaks the robot's cues ("I fell over"). Plays a fallback beep on any failure. `python api_routing_task.py "Hello"` checks keys and speaker. |
+
+### Microcontroller firmware
+
+| File | What it is |
+| --- | --- |
+| `firmware/emo_nano/emo_nano.ino` | **Arduino Nano firmware.** 100 Hz control loop: MPU6050 IMU with a complementary filter, PID on torso pitch through the hips (anti-windup, filtered D term), walking gait with knee lift and smooth start/stop, per-joint speed and angle limits, fall detection, walk watchdog, and calibration and PID gains saved in EEPROM. Speaks a line-based serial protocol (`S` stand, `W,<speed>,<turn>` walk, `G,1` gesture, `E`/`R` E-stop, `C` calibrate, `K` gains, `T` telemetry, `J` raw servo moves for setup). The configuration you adjust for your build (servo trims and directions, stance, gait sizes) is at the top. |
+
+### Tools, assets and deployment
+
+| File | What it is |
+| --- | --- |
+| `tools/sim_nano.py` | **Simulated Nano.** Compiles the real firmware for your PC, runs it against a simulated robot (laggy servos, noisy IMU) and serves it as a serial port on `socket://127.0.0.1:7777`. Type `tilt 8` or `tilt 70 200` to put it on a slope or knock it over. Needs `g++`. |
+| `assets/network_error.wav` | Three descending beeps, played when the cloud speech pipeline fails. |
+| `deploy/emo-bot.service` | systemd unit that starts the robot on boot and restarts it if it crashes (install steps in RUNNING.md section 10). |
+
+### Configuration
+
+| File | What it is |
+| --- | --- |
+| `.env.example` | Template for your `.env` (API keys, serial port, camera, audio devices, feature switches). Copy it to `.env`; `.env` is never committed. |
+| `requirements.txt` | Python packages for the robot (pins `mediapipe==0.10.18`, the newest release that has both the API used here and Raspberry Pi wheels). |
+| `requirements-dev.txt` | Packages to run the tests and linter on any computer, without robot hardware. |
+| `pyproject.toml` | Settings for the `ruff` linter and `pytest`. |
+| `.gitignore` | Keeps `.env`, virtual environments, caches and build output out of git. |
+
+### Documentation
+
+| File | What it is |
+| --- | --- |
+| `README.md` | This overview. |
+| `RUNNING.md` | The full guide: laptop dry run, tests, flashing the Nano, first power-up of the legs, Pi setup, `.env` reference, checking each subsystem, running, starting on boot, PID/gait tuning, troubleshooting. |
+
+### Tests (no hardware needed)
+
+| File | What it tests |
+| --- | --- |
+| `tests/test_firmware.py` | Compiles the Nano firmware for your PC and runs 10 scenarios against a simulated robot: serial protocol, IMU direction, recovery from a slope, walking, watchdog, fall detection, wrong-sensor-direction safety, calibration + EEPROM, missing IMU, telemetry. Skipped if `g++` isn't installed. |
+| `tests/firmware/harness.cpp` | The simulator behind those scenarios (and behind `tools/sim_nano.py`): a planar model of the robot, simulated MPU6050, and a `serve` mode. |
+| `tests/firmware/Arduino.h`, `Wire.h`, `EEPROM.h`, `Adafruit_PWMServoDriver.h` | Small stand-ins for the Arduino libraries so the firmware compiles on a PC. |
+| `tests/test_behavior_tree.py` | Standing, walking and its heartbeat, stop, E-stop, falls, rest, calibration, tuning commands, priorities. |
+| `tests/test_serial.py` | Reply parsing, `READY` banner, event/telemetry forwarding, queueing, sim mode. |
+| `tests/test_vision.py` | Face selection, posture rules at any distance, personal baseline, alert timing. |
+| `tests/test_api_routing.py` | The speech pipeline against a mocked HTTP server: WAV output, timeouts, missing keys, fallback, phrase cache. |
+| `tests/test_main.py` | The whole runtime starts without hardware and stands the legs up. |
+| `tests/conftest.py` | pytest setup that makes the modules importable. |
+
+---
+
+## Quick start
+
+**On a laptop, no hardware** (details in [RUNNING.md section 2](RUNNING.md#2-quick-start-on-a-laptop-no-hardware)):
+
+```bash
+git clone https://github.com/coderForLife-A1/EMO-Bot.git && cd EMO-Bot
+python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env    # set SERIAL_PORT=socket://127.0.0.1:7777, ENABLE_AUDIO=0, ENABLE_VISION=0
+python tools/sim_nano.py          # terminal 1 (needs g++ and a running Mosquitto broker)
+python main.py                    # terminal 2
+mosquitto_pub -t robot/locomotion/cmd -m walk,70,0,3   # terminal 3
+```
+
+**On the robot** (Raspberry Pi OS Bookworm 64-bit, Python 3.11):
+
+```bash
+sudo apt install -y git mosquitto mosquitto-clients python3-venv python3-picamera2 portaudio19-dev alsa-utils
+git clone https://github.com/coderForLife-A1/EMO-Bot.git ~/EMO-Bot && cd ~/EMO-Bot
+python3 -m venv --system-site-packages .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env            # add API keys; set SERIAL_PORT / CAMERA_SOURCE / audio devices
+arduino-cli compile --fqbn arduino:avr:nano firmware/emo_nano
+arduino-cli upload  --fqbn arduino:avr:nano -p /dev/ttyUSB0 firmware/emo_nano
+python main.py
+```
+
+Before the first real run, do [RUNNING.md section 5](RUNNING.md#5-first-power-up-of-the-legs)
+with the robot held in the air: servo trims and directions, IMU direction, level calibration.
+
+**Run the tests:** `pip install -r requirements-dev.txt && ruff check . && pytest`
+
+### Controlling the robot
+
+```bash
+mosquitto_pub -t robot/locomotion/cmd -m stand             # stand and balance
+mosquitto_pub -t robot/locomotion/cmd -m walk,70,0,3       # walk forward 3 s (speed, turn: -100..100)
+mosquitto_pub -t robot/locomotion/cmd -m walk,0,80,2       # turn right in place
+mosquitto_pub -t robot/locomotion/cmd -m rest              # servos off until "stand"
+mosquitto_pub -t robot/locomotion/cmd -m gains,0.8,3,0.03  # tune the balance PID live (saved on the Nano)
+mosquitto_pub -t robot/locomotion/cmd -m telemetry,1       # stream pitch / correction on robot/locomotion/telemetry
+mosquitto_pub -t robot/error -m error                      # E-stop; "clear" releases it
+mosquitto_sub -t 'robot/#' -v                              # watch everything
+```
+
+All topics and the Nano's serial protocol are listed in [RUNNING.md section 1](RUNNING.md#1-how-the-pieces-fit-together).
+
+---
+
+## Hardware
 
 | Component | Function | Interface / electrical requirement |
 | --- | --- | --- |
-| Raspberry Pi 5 | SBC for asynchronous runtime and AI/network work | 5 V USB-C power; 3.3 V GPIO; Linux ALSA/V4L2 |
-| Arduino Nano | MCU for servo command parsing and real-time output | USB/UART at 115200 baud; 5 V logic on typical Nano boards |
-| PCA9685 | 16-channel, 12-bit PWM servo controller | I2C address `0x40`; Arduino A4/A5 in this firmware; separate servo supply |
-| VL53L0X | Time-of-flight distance sensor | I2C, normally address `0x29`; 3.3 V-compatible breakout required |
-| GC9A01 TFT | SPI graphical display | SPI clock/data plus chip-select, data/command, and reset GPIOs |
-| ReSpeaker HAT | Microphone input and audio capture | ALSA device `plughw:0`; verify with `arecord -l` |
-| CSI/USB camera | Face and posture sensing | V4L2 device `/dev/video0` |
-| Servos and regulated power supply | Mechanical actuation | Do not power servo loads from the Pi or Nano 5 V rail |
+| Raspberry Pi 5 | Runs vision, speech, MQTT and the behavior tree | 5 V USB-C power; 3.3 V GPIO; Linux ALSA/V4L2 |
+| Arduino Nano | Balance and gait controller | USB/UART at 115200 baud; 5 V logic on typical Nano boards |
+| PCA9685 | 16-channel, 12-bit PWM servo driver | I2C address `0x40` on the Nano's A4/A5; separate servo supply |
+| MPU6050 | 6-axis IMU for torso pitch (balance, fall detection) | I2C address `0x68` on the Nano's A4/A5 bus, shared with the PCA9685; flat on the pelvis, X arrow forward |
+| 4 leg servos (2 hip, 2 knee) | Legs | PCA9685 channels 0-3; powered from a regulated servo supply, never the Pi or Nano 5 V rail |
+| ReSpeaker HAT | Microphone input | ALSA card 0; check with `arecord -l` and `python -m sounddevice` |
+| CSI/USB camera | Posture sensing | `CAMERA_SOURCE=picamera2` (Pi 5 CSI) or a V4L2 device such as `/dev/video0` |
+| Speaker + amplifier | Speech output | ALSA playback, e.g. `plughw:0` |
+| VL53L0X *(planned)* | Time-of-flight distance sensor | I2C, address `0x29`; 3.3 V-compatible breakout |
+| GC9A01 TFT *(planned)* | Round face display | SPI plus chip-select, data/command and reset GPIOs |
 
 ## Wiring & Pinouts
 
-The following pinout assumes the Pi owns the VL53L0X and GC9A01 buses while the Nano owns the PCA9685 bus. All grounds must be common. Confirm the exact ReSpeaker, TFT breakout, and Nano revision before energizing the system.
+All grounds must be common. Confirm the exact ReSpeaker, TFT breakout and Nano revision before
+powering the system.
 
-### Raspberry Pi 5 I2C
+### Arduino Nano / PCA9685 / MPU6050
+
+- Nano A4/SDA -> PCA9685 `SDA` and MPU6050 `SDA` (shared bus).
+- Nano A5/SCL -> PCA9685 `SCL` and MPU6050 `SCL`.
+- Nano `5V` or the PCA9685 logic supply -> PCA9685 `VCC`, according to the board's logic-voltage specification.
+- Nano `5V` -> MPU6050 `VCC` (GY-521 breakouts have an on-board 3.3 V regulator); MPU6050 `AD0` to `GND` for address `0x68`.
+- Nano `GND` -> PCA9685 `GND` and MPU6050 `GND`.
+- External regulated servo supply -> PCA9685 `V+` and servo power ground. Add a 1000 µF capacitor at the PCA9685.
+- Leg servos: left hip -> channel 0, right hip -> 1, left knee -> 2, right knee -> 3. PWM is 50 Hz.
+- Mount the MPU6050 flat on the pelvis with its X arrow pointing forward, away from servo vibration where possible.
+
+### Pi-to-Nano link
+
+The simplest option is a USB cable (`SERIAL_PORT=/dev/ttyUSB0`). To use the Pi's GPIO UART instead
+(`SERIAL_PORT=/dev/serial0`):
+
+- Pi physical pin 8, GPIO14/TXD -> Nano `RX` through a bidirectional level shifter or a verified 3.3 V-safe input.
+- Nano `TX` -> Pi physical pin 10, GPIO15/RXD through a 5 V-to-3.3 V level shifter. Never connect a typical 5 V Nano TX directly to Pi GPIO15.
+- Pi physical pin 6 (`GND`) -> Nano `GND`.
+- 115200 baud, one ASCII command per line (protocol in [RUNNING.md](RUNNING.md#nano-serial-protocol-115200-baud-one-command-per-line)).
+
+### Raspberry Pi 5 I2C (VL53L0X, planned)
 
 - Pi physical pin 1 (`3V3`) -> VL53L0X `VIN`/`VCC` only when the breakout accepts 3.3 V.
 - Pi physical pin 3, GPIO2/SDA -> VL53L0X `SDA`.
 - Pi physical pin 5, GPIO3/SCL -> VL53L0X `SCL`.
 - Pi physical pin 6 (`GND`) -> VL53L0X `GND`.
-- The PCA9685 is connected to the Nano, not directly to these Pi I2C pins: Nano A4/SDA -> PCA9685 SDA; Nano A5/SCL -> PCA9685 SCL.
-- PCA9685 `V+` is the external servo voltage rail. Tie its logic ground to the Nano ground and do not use the Pi 5 V rail for servo power.
+- The PCA9685 and MPU6050 are on the Nano's bus, not these Pi pins.
 
-### Raspberry Pi 5 SPI / GC9A01
+### Raspberry Pi 5 SPI / GC9A01 (planned)
 
 - Pi physical pin 19, GPIO10/MOSI -> GC9A01 `SDA`/`MOSI`.
 - Pi physical pin 23, GPIO11/SCLK -> GC9A01 `SCL`/`SCK`.
 - Pi physical pin 24, GPIO8/CE0 -> GC9A01 `CS`.
-- A free Pi 3.3 V GPIO -> GC9A01 `DC`.
-- A second free Pi 3.3 V GPIO -> GC9A01 `RST`.
+- A free Pi 3.3 V GPIO -> GC9A01 `DC`; a second one -> GC9A01 `RST`.
 - Pi physical pin 17 (`3V3`) -> GC9A01 `VCC`; Pi physical pin 9 (`GND`) -> `GND`.
-- GC9A01 MISO is normally unused for write-only display operation. Do not drive its logic pins at 5 V.
+- Do not drive the display's logic pins at 5 V.
 
-### Pi-to-Nano UART
+---
 
-- Pi physical pin 8, GPIO14/TXD -> Nano UART `RX` through a bidirectional level shifter or a verified 3.3 V-safe input.
-- Nano UART `TX` -> Pi physical pin 10, GPIO15/RXD through a 5 V-to-3.3 V level shifter. Never connect a typical 5 V Nano TX directly to Pi GPIO15.
-- Pi physical pin 6 (`GND`) -> Nano `GND`.
-- Firmware framing is ASCII `J,<joint>,<angle>\n`; baud rate is `115200`, with joint indexes `0` through `15` and software limits of `10` through `170` degrees.
+## Safety
 
-### Arduino Nano / PCA9685
-
-- Nano A4/SDA -> PCA9685 `SDA`.
-- Nano A5/SCL -> PCA9685 `SCL`.
-- Nano `5V` or the PCA9685 logic supply -> PCA9685 `VCC`, according to the board's logic-voltage specification.
-- Nano `GND` -> PCA9685 `GND`.
-- External regulated servo supply -> PCA9685 `V+` and servo power ground.
-- PCA9685 channels `0` through `15` map one-to-one to logical joints `0` through `15`; PWM frequency is 50 Hz and I2C address is `0x40`.
-
-## Software Setup
-
-Commands below target Raspberry Pi OS/Debian. Run hardware commands with the required privileges.
-
-1. Enable I2C, SPI, serial, and camera interfaces with `sudo raspi-config`, then reboot. Disable the serial login shell while leaving the UART enabled.
-2. Install system packages and Mosquitto:
-
-	```bash
-	sudo apt update
-	sudo apt install -y mosquitto mosquitto-clients python3-venv python3-dev \
-		 build-essential portaudio19-dev libsndfile1 alsa-utils v4l-utils
-	sudo systemctl enable --now mosquitto
-	```
-
-3. Create the Python environment and install the repository dependencies:
-
-	```bash
-	cd ~/EMO-Bot
-	python3 -m venv .venv
-	source .venv/bin/activate
-	python -m pip install --upgrade pip
-	python -m pip install -r requirements.txt
-	python -m pip install paho-mqtt pyserial opencv-python mediapipe py-trees \
-		 pvporcupine sounddevice
-	```
-
-	The second install includes runtime packages imported by the robot scripts but not currently listed in `requirements.txt`.
-
-4. Verify devices and buses before starting the robot:
-
-	```bash
-	arecord -l
-	v4l2-ctl --list-devices
-	i2cdetect -y 1
-	```
-
-5. Install Arduino CLI and flash the Nano. Select the correct port and Nano bootloader variant for the board:
-
-	```bash
-	arduino-cli core update-index
-	arduino-cli core install arduino:avr
-	arduino-cli board list
-	arduino-cli compile --fqbn arduino:avr:nano arduino_nano_pca9685_firmware.ino
-	arduino-cli upload -p /dev/ttyUSB0 --fqbn arduino:avr:nano arduino_nano_pca9685_firmware.ino
-	```
-
-	For a classic Nano that fails upload, retry with the board's old bootloader profile: `arduino:avr:nano:cpu=atmega328old`.
-
-## Environment Variables
-
-Create `.env` in the repository root. The API server loads it through `python-dotenv`; standalone runtime modules read process environment variables, so export or source the values before launching them.
-
-```dotenv
-OPENAI_API_KEY=replace_with_openai_key
-ANTHROPIC_API_KEY=replace_with_anthropic_key
-ELEVENLABS_API_KEY=replace_with_elevenlabs_key
-PORCUPINE_ACCESS_KEY=replace_with_picovoice_key
-PORCUPINE_KEYWORD_PATH=
-ELEVENLABS_VOICE_ID=EXAVITQu4vr4xnSDxMaL
-OPENAI_BASE_URL=https://api.openai.com/v1
-WHISPER_MODEL=whisper-1
-CHAT_MODEL=gpt-4o
-API_TIMEOUT_SECONDS=15
-```
-
-`OPENAI_API_KEY`, `ELEVENLABS_API_KEY`, and `PORCUPINE_ACCESS_KEY` are checked by the API server health endpoint. `ANTHROPIC_API_KEY` is reserved configuration; no current module calls Anthropic. Never commit `.env` or API keys.
-
-## Running the System
-
-From the Pi, use separate terminals or a process supervisor. Start infrastructure before device consumers:
-
-```bash
-cd ~/EMO-Bot
-source .venv/bin/activate
-
-sudo systemctl start mosquitto
-mosquitto_sub -h 127.0.0.1 -t 'robot/#' -v
-```
-
-In a second terminal, verify the Nano responds before starting the runtime:
-
-```bash
-stty -F /dev/ttyUSB0 115200 cs8 -cstopb -parenb
-printf 'J,0,90\n' > /dev/ttyUSB0
-```
-
-In a third terminal, start the asynchronous robot process:
-
-```bash
-cd ~/EMO-Bot
-source .venv/bin/activate
-python main.py
-```
-
-The current `main.py` starts MQTT, opens `/dev/ttyUSB0`, and launches sensor, vision, intelligence, audio placeholder, serial, and MQTT-router tasks. The standalone `audio_trigger_task.py` and `api_routing_task.py` are isolated tasks and are not yet wired into `main.py`; integrate them into the application lifecycle before expecting wake-word-to-TTS operation.
-
-The optional FastAPI service runs independently:
-
-```bash
-uvicorn api_server.main:app --host 127.0.0.1 --port 8000
-curl http://127.0.0.1:8000/health
-```
+- `mosquitto_pub -t robot/error -m error` latches an E-stop: the Nano turns every servo output off
+  and refuses commands until `mosquitto_pub -t robot/error -m clear`.
+- If the robot tips past 45° for a quarter of a second, the Nano switches every servo off
+  (`EVT,FALLEN`), the robot asks to be stood back up, and it won't stand again until it is upright and told `stand`.
+- The Nano stops walking if the Pi hasn't re-sent the walk command for 1 s. A single walk command
+  never lasts longer than 10 s, so the robot doesn't wander off the desk.
+- Joint limits are enforced in the firmware. Set them for your mechanics before running the full
+  robot, with the robot held in the air (RUNNING.md section 5).
 
 ## Troubleshooting
 
-1. **Servo jitter or voltage drop**
-	- Cause: servo current transients, inadequate regulator capacity, shared logic/servo supply noise, or missing common ground.
-	- Fix: power servos from a separate regulated supply sized for stall current, connect grounds at a controlled common point, add bulk decoupling near the PCA9685/servo rail, and keep the Pi/Nano logic rail out of `V+`. Confirm the PCA9685 remains at 50 Hz and reduce mechanical load before widening software limits.
+The most common problems:
 
-2. **I2C address conflicts or missing devices**
-	- Cause: duplicate sensor addresses, incorrect pull-ups/voltage levels, disabled Pi I2C, or the PCA9685 connected to the wrong controller bus.
-	- Fix: run `i2cdetect -y 1`; the Pi-side VL53L0X should normally appear at `0x29`, while the firmware expects the PCA9685 at `0x40` on the Nano's A4/A5 bus. Use XSHUT or an I2C multiplexer for multiple VL53L0X units, verify SDA/SCL continuity, and never expose Pi GPIO to 5 V.
+| Symptom | Fix |
+| --- | --- |
+| Servos jitter, or the Pi reboots when they move | Separate regulated servo supply sized for stall current, 1000 µF at the PCA9685, common ground |
+| Banner says `READY,NOIMU` | Check the MPU6050 wiring on A4/A5 and that `AD0` is low. The robot still stands and walks, without balance |
+| Torso tilts further instead of correcting | Servo direction or IMU direction is wrong: RUNNING.md section 5, steps 3 and 5 |
+| Buzzing while standing | Balance gains too high or loose servo horns: RUNNING.md section 11 |
+| Robot falls sideways when walking | Lower `KNEE_LIFT_DEG`, widen the feet, slow the gait |
+| API errors or timeouts | `python api_routing_task.py "test"` shows the exact error; check `.env` |
 
-3. **API timeouts**
-	- Cause: DNS/connectivity failures, invalid keys, provider latency, or the three-second end-to-end limit in `api_routing_task.py`.
-	- Fix: check `curl http://127.0.0.1:8000/health`, inspect the HTTP status and printed exception, verify `.env`, test outbound HTTPS and system time, and use `network_error.wav` as the expected local fallback. Do not replace asynchronous HTTP with blocking `requests` calls in the event loop.
+Full table: [RUNNING.md section 12](RUNNING.md#12-troubleshooting).

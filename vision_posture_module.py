@@ -1,38 +1,99 @@
+"""Camera vision: MediaPipe face detection and pose estimation.
+
+Publishes the face position (robot/vision/face_error) and posture events (robot/state:
+POSTURE_POOR after 3 s of slouching, POSTURE_OK when it recovers). Supports the Pi CSI camera
+(picamera2), USB/V4L2 cameras and laptop webcams. Run standalone with `python vision_posture_module.py`.
+"""
+import bisect
+import collections
+import logging
 import time
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional
 
 import cv2
-import mediapipe as mp
 import paho.mqtt.client as mqtt
 
+import config
 
-MQTT_HOST = "127.0.0.1"
-MQTT_PORT = 1883
-TOPIC_STATE = "robot/state"
-TOPIC_FACE_ERROR = "robot/vision/face_error"
+logger = logging.getLogger(__name__)
 
-CAMERA_DEVICE = "/dev/video0"
+# Kept for backwards compatibility with older imports; the source of truth is config.
+TOPIC_STATE = config.TOPIC_STATE
+TOPIC_FACE_ERROR = config.TOPIC_FACE_ERROR
+
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 FRAME_FPS = 30
 
 POSE_EVERY_N_FRAMES = 2
 FACE_PUBLISH_MIN_INTERVAL_S = 0.03
-POSTURE_CONFIRM_FRAMES = 3
+
+POSTURE_CONFIRM_S = 3.0  # continuous poor posture before an alert
+POSTURE_CLEAR_S = 1.0  # continuous good posture before POSTURE_OK
+POSTURE_REMIND_S = 60.0  # re-alert while posture stays poor
+POSTURE_ABSENT_RESET_S = 10.0  # user out of view this long -> POSTURE_OK
+
+# MediaPipe Pose landmark indices (stable across releases)
+NOSE = 0
+LEFT_SHOULDER = 11
+RIGHT_SHOULDER = 12
+
+# Posture thresholds are ratios of shoulder width, so they don't depend on distance to the camera.
+# They are starting points: watch the logged metrics and tune for your desk and camera height.
+SHOULDER_TILT_MAX = 0.12  # |left_y - right_y| / shoulder_width (~7 deg of shoulder tilt)
+HEAD_LATERAL_MAX = 0.35  # |nose_x - shoulder_mid_x| / shoulder_width (leaning sideways)
+HEAD_HEIGHT_MIN = 0.30  # (shoulder_mid_y - nose_y) / shoulder_width, absolute floor
+HEAD_DROP_RATIO = 0.75  # poor if head height < 75% of the user's own upright baseline
+
+MEDIAPIPE_HINT = "Install a release with the legacy solutions API: pip install mediapipe==0.10.18"
+
+
+@dataclass
+class PostureMetrics:
+    shoulder_tilt: float
+    head_lateral: float
+    head_height: float
 
 
 def build_mqtt_client() -> mqtt.Client:
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="robot-vision-posture")
-    client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=30)
+    client.connect_async(config.MQTT_HOST, config.MQTT_PORT, keepalive=30)
     client.loop_start()
     return client
+
+
+class _Picamera2Capture:
+    """cv2.VideoCapture-like wrapper around Picamera2 (Pi 5 CSI cameras go through libcamera)."""
+
+    def __init__(self) -> None:
+        from picamera2 import Picamera2  # apt: python3-picamera2
+
+        self._cam = Picamera2()
+        # "RGB888" is stored as B,G,R in memory, which is what OpenCV expects.
+        cfg = self._cam.create_video_configuration(
+            main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "RGB888"},
+            controls={"FrameRate": FRAME_FPS},
+        )
+        self._cam.configure(cfg)
+        self._cam.start()
+
+    def read(self):
+        return True, self._cam.capture_array()
+
+    def release(self) -> None:
+        self._cam.stop()
+        self._cam.close()
 
 
 def open_v4l2_camera(device: str) -> cv2.VideoCapture:
     cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
     if not cap.isOpened():
-        raise RuntimeError(f"Failed to open CSI camera via V4L2 at {device}")
+        raise RuntimeError(f"Failed to open camera via V4L2 at {device}")
+    return _configure_capture(cap)
 
+
+def _configure_capture(cap: cv2.VideoCapture) -> cv2.VideoCapture:
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, FRAME_FPS)
@@ -40,11 +101,25 @@ def open_v4l2_camera(device: str) -> cv2.VideoCapture:
     return cap
 
 
+def open_camera(source: Optional[str] = None):
+    """Open "picamera2", a webcam index such as "0", or a V4L2 device path."""
+    source = source if source is not None else config.CAMERA_SOURCE
+    if source == "picamera2":
+        return _Picamera2Capture()
+    if source.isdigit():
+        cap = cv2.VideoCapture(int(source))
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open webcam index {source}")
+        return _configure_capture(cap)
+    return open_v4l2_camera(source)
+
+
 def select_primary_face(
     detections,
     frame_w: int,
     frame_h: int,
-) -> Optional[Tuple[int, int]]:
+) -> Optional[tuple[int, int]]:
+    """Centre of the most confident, largest face, clamped to the frame."""
     if not detections:
         return None
 
@@ -52,76 +127,202 @@ def select_primary_face(
     best_center = None
     for det in detections:
         rel_box = det.location_data.relative_bounding_box
-        xmin = max(0.0, rel_box.xmin)
-        ymin = max(0.0, rel_box.ymin)
         width = max(0.0, rel_box.width)
         height = max(0.0, rel_box.height)
+        # Use the unclipped box so a face partly off-frame keeps its true centre.
+        cx_rel = min(1.0, max(0.0, rel_box.xmin + width * 0.5))
+        cy_rel = min(1.0, max(0.0, rel_box.ymin + height * 0.5))
 
-        area = width * height
-        score = float(det.score[0]) * area
+        score = float(det.score[0]) * width * height
         if score > best_score:
-            cx = int((xmin + width * 0.5) * frame_w)
-            cy = int((ymin + height * 0.5) * frame_h)
-            best_center = (cx, cy)
+            best_center = (round(cx_rel * frame_w), round(cy_rel * frame_h))
             best_score = score
 
     return best_center
 
 
-def is_poor_posture(pose_landmarks) -> Optional[bool]:
+def posture_metrics(pose_landmarks) -> Optional[PostureMetrics]:
     if pose_landmarks is None:
         return None
 
-    lm = mp.solutions.pose.PoseLandmark
     landmarks = pose_landmarks.landmark
+    left_shoulder = landmarks[LEFT_SHOULDER]
+    right_shoulder = landmarks[RIGHT_SHOULDER]
+    nose = landmarks[NOSE]
+    if min(left_shoulder.visibility, right_shoulder.visibility, nose.visibility) < 0.5:
+        return None
 
-    left_shoulder = landmarks[lm.LEFT_SHOULDER.value]
-    right_shoulder = landmarks[lm.RIGHT_SHOULDER.value]
-    nose = landmarks[lm.NOSE.value]
-
-    if (
-        left_shoulder.visibility < 0.5
-        or right_shoulder.visibility < 0.5
-        or nose.visibility < 0.5
-    ):
+    shoulder_width = abs(left_shoulder.x - right_shoulder.x)
+    if shoulder_width < 0.02:  # side-on or too far away to judge
         return None
 
     shoulder_mid_x = (left_shoulder.x + right_shoulder.x) * 0.5
     shoulder_mid_y = (left_shoulder.y + right_shoulder.y) * 0.5
-
-    shoulder_tilt = abs(left_shoulder.y - right_shoulder.y)
-    neck_forward_offset = abs(nose.x - shoulder_mid_x)
-    head_drop = nose.y - shoulder_mid_y
-
-    # Lightweight heuristic for slouching: uneven shoulders, forward head, or dropped head.
-    return (
-        shoulder_tilt > 0.07
-        or neck_forward_offset > 0.12
-        or head_drop > -0.06
+    return PostureMetrics(
+        shoulder_tilt=abs(left_shoulder.y - right_shoulder.y) / shoulder_width,
+        head_lateral=abs(nose.x - shoulder_mid_x) / shoulder_width,
+        head_height=(shoulder_mid_y - nose.y) / shoulder_width,
     )
+
+
+def is_poor_posture(pose_landmarks, baseline_head_height: Optional[float] = None) -> Optional[bool]:
+    """True/False for poor/good posture, None when the user isn't clearly visible."""
+    metrics = posture_metrics(pose_landmarks)
+    if metrics is None:
+        return None
+
+    min_head_height = HEAD_HEIGHT_MIN
+    if baseline_head_height is not None:
+        min_head_height = max(min_head_height, baseline_head_height * HEAD_DROP_RATIO)
+
+    return (
+        metrics.shoulder_tilt > SHOULDER_TILT_MAX
+        or metrics.head_lateral > HEAD_LATERAL_MAX
+        or metrics.head_height < min_head_height
+    )
+
+
+class HeadHeightBaseline:
+    """The user's upright head height: 90th percentile of one sample per second over ~10 minutes."""
+
+    def __init__(self, window: int = 600, min_samples: int = 30, sample_period_s: float = 1.0) -> None:
+        self.min_samples = min_samples
+        self.sample_period_s = sample_period_s
+        self._samples: collections.deque[float] = collections.deque(maxlen=window)
+        self._sorted: list[float] = []
+        self._last_sample_t = float("-inf")
+
+    def add(self, head_height: float, now: float) -> None:
+        if now - self._last_sample_t < self.sample_period_s:
+            return
+        self._last_sample_t = now
+        if len(self._samples) == self._samples.maxlen:
+            self._sorted.pop(bisect.bisect_left(self._sorted, self._samples[0]))
+        self._samples.append(head_height)
+        bisect.insort(self._sorted, head_height)
+
+    @property
+    def value(self) -> Optional[float]:
+        if len(self._sorted) < self.min_samples:
+            return None
+        return self._sorted[int(0.9 * (len(self._sorted) - 1))]
+
+
+class PostureMonitor:
+    """Turns per-frame posture judgements into POSTURE_POOR / POSTURE_OK events with hysteresis."""
+
+    def __init__(
+        self,
+        confirm_s: float = POSTURE_CONFIRM_S,
+        clear_s: float = POSTURE_CLEAR_S,
+        remind_s: float = POSTURE_REMIND_S,
+        absent_reset_s: float = POSTURE_ABSENT_RESET_S,
+    ) -> None:
+        self.confirm_s, self.clear_s = confirm_s, clear_s
+        self.remind_s, self.absent_reset_s = remind_s, absent_reset_s
+        self.alerted = False
+        self.poor_since: Optional[float] = None
+        self.good_since: Optional[float] = None
+        self.absent_since: Optional[float] = None
+        self.last_alert = 0.0
+
+    def update(self, poor: Optional[bool], now: float) -> Optional[str]:
+        if poor is None:
+            if self.absent_since is None:
+                self.absent_since = now
+            if self.alerted and now - self.absent_since >= self.absent_reset_s:
+                self.alerted = False
+                self.poor_since = None
+                return "POSTURE_OK"
+            return None
+        self.absent_since = None
+
+        if poor:
+            self.good_since = None
+            if self.poor_since is None:
+                self.poor_since = now
+            if not self.alerted and now - self.poor_since >= self.confirm_s:
+                self.alerted, self.last_alert = True, now
+                return "POSTURE_POOR"
+            if self.alerted and now - self.last_alert >= self.remind_s:
+                self.last_alert = now
+                return "POSTURE_POOR"
+            return None
+
+        self.poor_since = None
+        if self.good_since is None:
+            self.good_since = now
+        if self.alerted and now - self.good_since >= self.clear_s:
+            self.alerted = False
+            return "POSTURE_OK"
+        return None
+
+
+class VisionPipeline:
+    """Face tracking + posture monitoring on BGR frames. Returns (topic, payload) messages to publish."""
+
+    def __init__(self) -> None:
+        import mediapipe as mp
+
+        if not hasattr(mp, "solutions"):
+            raise RuntimeError(f"mediapipe {mp.__version__} has no 'solutions' module. {MEDIAPIPE_HINT}")
+
+        self.face_detector = mp.solutions.face_detection.FaceDetection(
+            model_selection=0,
+            min_detection_confidence=0.5,
+        )
+        self.pose_detector = mp.solutions.pose.Pose(
+            static_image_mode=False,
+            model_complexity=0,
+            smooth_landmarks=True,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        self.posture = PostureMonitor()
+        self.baseline = HeadHeightBaseline()
+        self.last_face_pub = 0.0
+        self.frame_idx = 0
+
+    def process(self, frame, now: float) -> list[tuple[str, str]]:
+        messages: list[tuple[str, str]] = []
+        frame_h, frame_w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        face_result = self.face_detector.process(rgb)
+        center = select_primary_face(face_result.detections, frame_w, frame_h)
+        if center is not None and (now - self.last_face_pub) >= FACE_PUBLISH_MIN_INTERVAL_S:
+            x_err = center[0] - (frame_w // 2)
+            y_err = center[1] - (frame_h // 2)
+            messages.append((config.TOPIC_FACE_ERROR, f"{x_err},{y_err}"))
+            self.last_face_pub = now
+
+        if self.frame_idx % POSE_EVERY_N_FRAMES == 0:
+            pose_result = self.pose_detector.process(rgb)
+            metrics = posture_metrics(pose_result.pose_landmarks)
+            if metrics is not None:
+                self.baseline.add(metrics.head_height, now)
+            poor = is_poor_posture(pose_result.pose_landmarks, self.baseline.value)
+            event = self.posture.update(poor, now)
+            if event is not None:
+                logger.info("Posture %s (metrics=%s, baseline=%s)", event, metrics, self.baseline.value)
+                messages.append((config.TOPIC_STATE, event))
+
+        self.frame_idx += 1
+        return messages
+
+    def close(self) -> None:
+        self.face_detector.close()
+        self.pose_detector.close()
 
 
 def run() -> None:
+    """Standalone mode: publish face errors and posture events straight to MQTT."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
     mqtt_client = build_mqtt_client()
-    cap = open_v4l2_camera(CAMERA_DEVICE)
-
-    face_detector = mp.solutions.face_detection.FaceDetection(
-        model_selection=0,
-        min_detection_confidence=0.5,
-    )
-    pose_detector = mp.solutions.pose.Pose(
-        static_image_mode=False,
-        model_complexity=0,
-        smooth_landmarks=True,
-        enable_segmentation=False,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-
-    last_face_pub = 0.0
-    poor_posture_streak = 0
-    posture_alert_sent = False
-    frame_idx = 0
+    cap = open_camera()
+    pipeline = VisionPipeline()
+    print(f"Vision running on camera {config.CAMERA_SOURCE!r} (Ctrl+C to stop)")
 
     try:
         while True:
@@ -129,39 +330,12 @@ def run() -> None:
             if not ok:
                 time.sleep(0.01)
                 continue
-
-            frame_h, frame_w = frame.shape[:2]
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-            face_result = face_detector.process(rgb)
-            center = select_primary_face(face_result.detections, frame_w, frame_h)
-            now = time.monotonic()
-            if center is not None and (now - last_face_pub) >= FACE_PUBLISH_MIN_INTERVAL_S:
-                x_err = center[0] - (frame_w // 2)
-                y_err = center[1] - (frame_h // 2)
-                mqtt_client.publish(TOPIC_FACE_ERROR, f"{x_err},{y_err}", qos=0, retain=False)
-                last_face_pub = now
-
-            if frame_idx % POSE_EVERY_N_FRAMES == 0:
-                pose_result = pose_detector.process(rgb)
-                poor = is_poor_posture(pose_result.pose_landmarks)
-                if poor is True:
-                    poor_posture_streak += 1
-                elif poor is False:
-                    poor_posture_streak = 0
-                    posture_alert_sent = False
-
-                if poor_posture_streak >= POSTURE_CONFIRM_FRAMES and not posture_alert_sent:
-                    mqtt_client.publish(TOPIC_STATE, "POSTURE_POOR", qos=0, retain=False)
-                    posture_alert_sent = True
-
-            frame_idx += 1
-
+            for topic, payload in pipeline.process(frame, time.monotonic()):
+                mqtt_client.publish(topic, payload, qos=0, retain=False)
     except KeyboardInterrupt:
         pass
     finally:
-        face_detector.close()
-        pose_detector.close()
+        pipeline.close()
         cap.release()
         mqtt_client.loop_stop()
         mqtt_client.disconnect()

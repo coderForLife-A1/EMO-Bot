@@ -1,16 +1,15 @@
-fastapi
-uvicorn[standard]
-httpx
-python-dotenv
-python-multipart
-pydantic
-pyserial
-paho-mqtt
-pvporcupine
-pyaudio
-openai
-elevenlabs
-opencv-python
-mediapipe
-py-trees
-python-dotenv
+# Runtime dependencies for the robot (Raspberry Pi OS Bookworm, Python 3.11).
+# On a Pi 5 with a CSI camera also install picamera2 from apt (see RUNNING.md).
+paho-mqtt>=2.0,<3
+py-trees>=2.2,<3
+pyserial>=3.5
+httpx>=0.27
+python-dotenv>=1.0
+numpy<2
+# mediapipe depends on opencv-contrib-python; listing plain opencv-python too would install two conflicting cv2 packages
+opencv-contrib-python>=4.8,<5
+# 0.10.18 is the newest release that has both the legacy mp.solutions API used here
+# and Raspberry Pi (linux aarch64, Python 3.9-3.12) wheels. Newer releases removed mp.solutions.
+mediapipe==0.10.18
+pvporcupine>=3.0
+sounddevice>=0.4.6

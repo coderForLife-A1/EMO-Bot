@@ -1,3 +1,11 @@
+"""EMO-Bot entry point: starts and supervises every runtime task in one asyncio process.
+
+Critical tasks (the robot stops if they crash): serial link to the Nano, behavior tree.
+Optional tasks (logged and skipped if they crash): vision, wake word, cloud speech pipeline.
+Run with `python main.py`; settings come from `.env` via config.py.
+"""
+import config  # noqa: I001  (must be first: loads .env before other modules read settings)
+
 import asyncio
 import contextlib
 import logging
@@ -7,28 +15,31 @@ import threading
 import time
 from typing import Awaitable, Callable
 
-import cv2
-import mediapipe as mp
-from dotenv import load_dotenv
+import paho.mqtt.client as mqtt
 
-from api_routing_task import api_routing_task
-from audio_trigger_task import audio_trigger_task, build_mqtt_client as build_audio_mqtt_client
-from behavior_tree_module import CommandBus, SharedState, build_mqtt_client as build_behavior_mqtt_client, build_tree
-from serial_module import serial_task
-from vision_posture_module import (
-    FACE_PUBLISH_MIN_INTERVAL_S,
-    POSE_EVERY_N_FRAMES,
-    POSTURE_CONFIRM_FRAMES,
-    TOPIC_FACE_ERROR,
-    TOPIC_STATE,
-    build_mqtt_client as build_vision_mqtt_client,
-    open_v4l2_camera,
-    select_primary_face,
-    is_poor_posture,
+from api_routing_task import SAY_JOB, api_routing_task
+from behavior_tree_module import (
+    AUDIO_EMERGENCY_STOP,
+    AUDIO_FALLEN,
+    AUDIO_POSTURE_WARNING,
+    CommandBus,
+    SharedState,
+    apply_serial_line,
+    build_mqtt_client as build_behavior_mqtt_client,
+    build_tree,
+    on_nano_reset,
 )
+from serial_module import offer, serial_task
 
 
 logger = logging.getLogger(__name__)
+
+# What the robot says for each behavior-tree audio cue
+CUE_PHRASES = {
+    AUDIO_POSTURE_WARNING: "Hey, let's sit up a little straighter.",
+    AUDIO_EMERGENCY_STOP: "Emergency stop.",
+    AUDIO_FALLEN: "Whoops, I fell over. Could you stand me back up?",
+}
 
 
 def _configure_logging() -> None:
@@ -47,17 +58,35 @@ def _install_signal_handlers(shutdown_event: asyncio.Event) -> None:
             shutdown_event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
-        with contextlib.suppress(NotImplementedError):
+        try:
             loop.add_signal_handler(sig, _request_shutdown)
+        except (NotImplementedError, RuntimeError):
+            # Windows event loops lack add_signal_handler; hop onto the loop thread safely instead.
+            # signal.signal only works in the main thread; elsewhere the embedder handles shutdown.
+            with contextlib.suppress(ValueError):
+                signal.signal(sig, lambda _s, _f: loop.call_soon_threadsafe(_request_shutdown))
 
-    # Windows can lack loop-level signal handler support for some loops.
-    def _sync_signal_handler(_sig, _frame) -> None:
-        if not shutdown_event.is_set():
-            shutdown_event.set()
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        with contextlib.suppress(Exception):
-            signal.signal(sig, _sync_signal_handler)
+def _serial_line_handler(state: SharedState, publisher: mqtt.Client) -> Callable[[str], None]:
+    """Route unsolicited Nano lines: events/refusals to the behavior tree + MQTT, telemetry to MQTT."""
+
+    def handle(line: str) -> None:
+        if line.startswith("T,"):
+            publisher.publish(config.TOPIC_LOCOMOTION_TELEMETRY, line, qos=0, retain=False)
+            return
+        if line.startswith(("EVT,", "NACK,")):
+            logger.info("Nano: %s", line)
+            publisher.publish(config.TOPIC_LOCOMOTION_EVENT, line, qos=0, retain=False)
+        apply_serial_line(state, line)
+
+    return handle
+
+
+def _build_publisher() -> mqtt.Client:
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="robot-main")
+    client.connect_async(config.MQTT_HOST, config.MQTT_PORT, keepalive=30)
+    client.loop_start()
+    return client
 
 
 def _vision_worker(
@@ -65,103 +94,59 @@ def _vision_worker(
     loop: asyncio.AbstractEventLoop,
     out_queue: asyncio.Queue[tuple[str, str]],
 ) -> None:
-    cap = open_v4l2_camera("/dev/video0")
-    face_detector = mp.solutions.face_detection.FaceDetection(
-        model_selection=0,
-        min_detection_confidence=0.5,
-    )
-    pose_detector = mp.solutions.pose.Pose(
-        static_image_mode=False,
-        model_complexity=0,
-        smooth_landmarks=True,
-        enable_segmentation=False,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
+    from vision_posture_module import VisionPipeline, open_camera
 
-    last_face_pub = 0.0
-    poor_posture_streak = 0
-    posture_alert_sent = False
-    frame_idx = 0
-
+    cap = open_camera()
+    pipeline = VisionPipeline()
+    logger.info("Vision started on camera %r", config.CAMERA_SOURCE)
     try:
         while not stop_flag.is_set():
             ok, frame = cap.read()
             if not ok:
                 time.sleep(0.01)
                 continue
-
-            frame_h, frame_w = frame.shape[:2]
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-            face_result = face_detector.process(rgb)
-            center = select_primary_face(face_result.detections, frame_w, frame_h)
-            now = time.monotonic()
-
-            if center is not None and (now - last_face_pub) >= FACE_PUBLISH_MIN_INTERVAL_S:
-                x_err = center[0] - (frame_w // 2)
-                y_err = center[1] - (frame_h // 2)
-                loop.call_soon_threadsafe(out_queue.put_nowait, (TOPIC_FACE_ERROR, f"{x_err},{y_err}"))
-                last_face_pub = now
-
-            if frame_idx % POSE_EVERY_N_FRAMES == 0:
-                pose_result = pose_detector.process(rgb)
-                poor = is_poor_posture(pose_result.pose_landmarks)
-                if poor is True:
-                    poor_posture_streak += 1
-                elif poor is False:
-                    poor_posture_streak = 0
-                    posture_alert_sent = False
-
-                if poor_posture_streak >= POSTURE_CONFIRM_FRAMES and not posture_alert_sent:
-                    loop.call_soon_threadsafe(out_queue.put_nowait, (TOPIC_STATE, "POSTURE_POOR"))
-                    posture_alert_sent = True
-
-            frame_idx += 1
+            for message in pipeline.process(frame, time.monotonic()):
+                loop.call_soon_threadsafe(offer, out_queue, message)
     finally:
-        face_detector.close()
-        pose_detector.close()
+        pipeline.close()
         cap.release()
 
 
-async def vision_task(shutdown_event: asyncio.Event) -> None:
-    mqtt_client = build_vision_mqtt_client()
+async def vision_task(publisher: mqtt.Client) -> None:
     publish_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=200)
     loop = asyncio.get_running_loop()
     stop_flag = threading.Event()
-    worker_task = asyncio.create_task(
+    worker = asyncio.create_task(
         asyncio.to_thread(_vision_worker, stop_flag, loop, publish_queue),
         name="vision_worker",
     )
 
+    getter: asyncio.Task | None = None
     try:
-        while not shutdown_event.is_set():
-            try:
-                topic, payload = await asyncio.wait_for(publish_queue.get(), timeout=0.2)
-            except asyncio.TimeoutError:
-                continue
-
-            mqtt_client.publish(topic, payload, qos=0, retain=False)
-            publish_queue.task_done()
+        while True:
+            getter = asyncio.create_task(publish_queue.get())
+            done, _ = await asyncio.wait((getter, worker), return_when=asyncio.FIRST_COMPLETED)
+            if worker in done:
+                getter.cancel()
+                worker.result()  # surface the camera/mediapipe error to the supervisor
+                raise RuntimeError("Vision worker exited unexpectedly")
+            topic, payload = getter.result()
+            publisher.publish(topic, payload, qos=0, retain=False)
     finally:
+        if getter is not None:
+            getter.cancel()
         stop_flag.set()
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(worker_task, timeout=2.0)
-        if not worker_task.done():
-            worker_task.cancel()
-            await asyncio.gather(worker_task, return_exceptions=True)
-
-        mqtt_client.loop_stop()
-        with contextlib.suppress(Exception):
-            mqtt_client.disconnect()
+        with contextlib.suppress(asyncio.TimeoutError, Exception):
+            await asyncio.wait_for(asyncio.shield(worker), timeout=2.0)
 
 
 async def behavior_tree_task(
+    state: SharedState,
+    bus: CommandBus,
     serial_queue: asyncio.Queue[str],
-    shutdown_event: asyncio.Event,
+    speech_queue: asyncio.Queue,
+    publisher: mqtt.Client,
 ) -> None:
-    state = SharedState()
-    bus = CommandBus()
     tree = build_tree(state, bus)
     mqtt_client = build_behavior_mqtt_client(state)
 
@@ -169,7 +154,7 @@ async def behavior_tree_task(
     next_tick = time.monotonic()
 
     try:
-        while not shutdown_event.is_set():
+        while True:
             tree.tick()
 
             while True:
@@ -177,13 +162,16 @@ async def behavior_tree_task(
                     command = bus.motor_queue.get_nowait()
                 except queue.Empty:
                     break
-                await serial_queue.put(command)
+                offer(serial_queue, command)  # never block the tree on a slow/dead serial link
 
             while True:
                 try:
-                    _audio_cmd = bus.audio_queue.get_nowait()
+                    cue = bus.audio_queue.get_nowait()
                 except queue.Empty:
                     break
+                publisher.publish(config.TOPIC_AUDIO_INTENT, cue, qos=0, retain=False)
+                if cue in CUE_PHRASES:
+                    offer(speech_queue, (SAY_JOB, CUE_PHRASES[cue]))
 
             next_tick += period
             sleep_time = next_tick - time.monotonic()
@@ -202,100 +190,75 @@ async def _run_guarded(
     name: str,
     coroutine_factory: Callable[[], Awaitable[None]],
     shutdown_event: asyncio.Event,
+    critical: bool,
 ) -> None:
     try:
         await coroutine_factory()
     except asyncio.CancelledError:
         raise
     except Exception:
-        logger.exception("Task %s crashed", name)
-        shutdown_event.set()
-
-
-async def _shutdown_watcher(shutdown_event: asyncio.Event, worker_tasks: list[asyncio.Task[None]]) -> None:
-    await shutdown_event.wait()
-    for task in worker_tasks:
-        task.cancel()
+        if critical:
+            logger.exception("Critical task %s crashed; shutting down", name)
+            shutdown_event.set()
+        else:
+            logger.exception("Optional task %s crashed; robot continues without it", name)
 
 
 async def main() -> None:
-    load_dotenv()
     _configure_logging()
 
     shutdown_event = asyncio.Event()
     _install_signal_handlers(shutdown_event)
 
+    state = SharedState()
+    bus = CommandBus()
     serial_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=200)
-    audio_in_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=50)
+    speech_queue: asyncio.Queue = asyncio.Queue(maxsize=20)
+    conversation_busy = threading.Event()
+    publisher = _build_publisher()
 
-    audio_mqtt_client = build_audio_mqtt_client()
-
-    worker_tasks: list[asyncio.Task[None]] = [
-        asyncio.create_task(
-            _run_guarded(
-                "serial_task",
-                lambda: serial_task(serial_queue),
-                shutdown_event,
-            ),
-            name="serial_task",
-        ),
-        asyncio.create_task(
-            _run_guarded(
-                "audio_trigger_task",
-                lambda: audio_trigger_task(audio_mqtt_client, audio_in_queue),
-                shutdown_event,
-            ),
-            name="audio_trigger_task",
-        ),
-        asyncio.create_task(
-            _run_guarded(
-                "api_routing_task",
-                lambda: api_routing_task(audio_in_queue),
-                shutdown_event,
-            ),
-            name="api_routing_task",
-        ),
-        asyncio.create_task(
-            _run_guarded(
-                "vision_task",
-                lambda: vision_task(shutdown_event),
-                shutdown_event,
-            ),
-            name="vision_task",
-        ),
-        asyncio.create_task(
-            _run_guarded(
-                "behavior_tree_task",
-                lambda: behavior_tree_task(serial_queue, shutdown_event),
-                shutdown_event,
-            ),
-            name="behavior_tree_task",
-        ),
+    # (name, factory, critical)
+    specs: list[tuple[str, Callable[[], Awaitable[None]], bool]] = [
+        ("serial_task", lambda: serial_task(
+            serial_queue,
+            on_connect=lambda: on_nano_reset(state),
+            on_line=_serial_line_handler(state, publisher),
+        ), True),
+        ("behavior_tree_task",
+         lambda: behavior_tree_task(state, bus, serial_queue, speech_queue, publisher), True),
+        ("api_routing_task", lambda: api_routing_task(speech_queue, publisher, conversation_busy), False),
     ]
+    if config.ENABLE_VISION:
+        specs.append(("vision_task", lambda: vision_task(publisher), False))
+    else:
+        logger.info("Vision disabled (ENABLE_VISION=0)")
+    if config.ENABLE_AUDIO:
+        from audio_trigger_task import audio_trigger_task
 
-    watcher = asyncio.create_task(
-        _shutdown_watcher(shutdown_event, worker_tasks),
-        name="shutdown_watcher",
-    )
+        specs.append(("audio_trigger_task",
+                      lambda: audio_trigger_task(publisher, speech_queue, conversation_busy), False))
+    else:
+        logger.info("Wake word disabled (ENABLE_AUDIO=0)")
+
+    worker_tasks = [
+        asyncio.create_task(_run_guarded(name, factory, shutdown_event, critical), name=name)
+        for name, factory, critical in specs
+    ]
+    logger.info("EMO-Bot running: %s (serial=%s)", ", ".join(s[0] for s in specs), config.SERIAL_PORT)
 
     try:
-        await asyncio.gather(*worker_tasks, watcher, return_exceptions=True)
+        await shutdown_event.wait()
     finally:
-        shutdown_event.set()
         for task in worker_tasks:
             task.cancel()
-        watcher.cancel()
-
         await asyncio.gather(*worker_tasks, return_exceptions=True)
-        await asyncio.gather(watcher, return_exceptions=True)
 
-        audio_mqtt_client.loop_stop()
+        publisher.loop_stop()
         with contextlib.suppress(Exception):
-            audio_mqtt_client.disconnect()
+            publisher.disconnect()
+        logger.info("EMO-Bot stopped")
 
 
 if __name__ == "__main__":
-    try:
+    with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
