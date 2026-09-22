@@ -168,37 +168,150 @@ All topics and the controller's serial protocol are listed in [RUNNING.md sectio
 | Arduino Nano *(alternative)* | Balance and gait controller | USB/UART at 115200 baud; 5 V logic on typical Nano boards |
 | PCA9685 | 16-channel, 12-bit PWM servo driver | I2C address `0x40` on the controller's I2C bus (ESP32 GPIO21/22, Nano A4/A5); separate servo supply |
 | MPU6050 | 6-axis IMU for torso pitch (balance, fall detection) | I2C address `0x68` on the same I2C bus, shared with the PCA9685; flat on the pelvis, X arrow forward |
-| 4 leg servos (2 hip, 2 knee) | Legs | PCA9685 channels 0-3; powered from a regulated servo supply, never the Pi or controller rail |
+| 4x MG90S servos (2 hip, 2 knee) | Legs | PCA9685 channels 0-3; 5-6 V servo supply (3 A or more), never the Pi or controller rail |
 | ReSpeaker HAT | Microphone input | ALSA card 0; check with `arecord -l` and `python -m sounddevice` |
 | CSI/USB camera | Posture sensing | `CAMERA_SOURCE=picamera2` (Pi 5 CSI) or a V4L2 device such as `/dev/video0` |
 | Speaker + amplifier | Speech output | ALSA playback, e.g. `plughw:0` |
-| VL53L0X *(planned)* | Time-of-flight distance sensor | I2C, address `0x29`; 3.3 V-compatible breakout |
-| GC9A01 TFT *(planned)* | Round face display | SPI plus chip-select, data/command and reset GPIOs |
+| VL53L0X *(wired, no driver code yet)* | Time-of-flight distance sensor | Pi I2C1 (pins 3/5), address `0x29`; 3.3 V |
+| 2.8" SPI TFT, 240x320, no touch (ILI9341) *(wired, no driver code yet)* | Face display | Pi SPI0 + DC, RESET, backlight GPIOs; 3.3 V logic |
 
 ## Wiring & Pinouts
 
-All grounds must be common. Confirm the exact ReSpeaker, TFT breakout and controller board revision before
-powering the system.
+All grounds must be common. Confirm your exact breakout pin labels before powering up: clone modules
+vary. Pin numbers below are **physical header pins** on the Pi and **GPIO numbers** on the ESP32.
 
-### ESP32 / PCA9685 / MPU6050
+### System overview
 
-- ESP32 GPIO21 (SDA) -> PCA9685 `SDA` and MPU6050 `SDA` (shared bus).
-- ESP32 GPIO22 (SCL) -> PCA9685 `SCL` and MPU6050 `SCL`.
-- ESP32 `3V3` -> PCA9685 `VCC` and MPU6050 `VCC` (bus runs at 3.3 V); MPU6050 `AD0` to `GND` for `0x68`.
-- ESP32 `GND` -> PCA9685 `GND` and MPU6050 `GND`.
-- Power the ESP32 from the Pi's USB port (or a separate 5 V into `VIN`), never the servo rail: servo current dips trip the ESP32 brown-out reset.
-- Servo supply, channels and IMU mounting: same as the Nano list below.
+```mermaid
+flowchart LR
+    subgraph PWR[Power]
+        USBC[5 V 5 A USB-C PSU]
+        SPSU[5-6 V servo PSU, 3 A or more]
+    end
+    subgraph PI[Raspberry Pi 5]
+        PI_USB[USB-A]
+        PI_I2C[I2C1: GPIO2/3]
+        PI_SPI[SPI0: GPIO10/11/8 + GPIO24/25/13]
+    end
+    subgraph ESP[ESP32 DevKit]
+        ESP_USB[Micro-USB]
+        ESP_I2C[I2C: GPIO21/22]
+    end
+    USBC --> PI
+    PI_USB -- "USB serial 115200 (5 V power + data)" --> ESP_USB
+    PI_I2C -- "I2C 0x29" --> TOF[VL53L0X ToF]
+    PI_SPI -- SPI --> TFT[2.8in ILI9341 TFT 240x320]
+    ESP_I2C -- "I2C 0x68" --> IMU[MPU6050]
+    ESP_I2C -- "I2C 0x40" --> PCA[PCA9685]
+    PCA -- "ch 0-3, 50 Hz PWM" --> SERVOS[4x MG90S: L hip, R hip, L knee, R knee]
+    SPSU -- "V+ servo rail" --> PCA
+```
 
-### Arduino Nano / PCA9685 / MPU6050 (alternative)
+### Raspberry Pi 5 header
 
-- Nano A4/SDA -> PCA9685 `SDA` and MPU6050 `SDA` (shared bus).
-- Nano A5/SCL -> PCA9685 `SCL` and MPU6050 `SCL`.
-- Nano `5V` or the PCA9685 logic supply -> PCA9685 `VCC`, according to the board's logic-voltage specification.
-- Nano `5V` -> MPU6050 `VCC` (GY-521 breakouts have an on-board 3.3 V regulator); MPU6050 `AD0` to `GND` for address `0x68`.
-- Nano `GND` -> PCA9685 `GND` and MPU6050 `GND`.
-- External regulated servo supply -> PCA9685 `V+` and servo power ground. Add a 1000 µF capacitor at the PCA9685.
-- Leg servos: left hip -> channel 0, right hip -> 1, left knee -> 2, right knee -> 3. PWM is 50 Hz.
-- Mount the MPU6050 flat on the pelvis with its X arrow pointing forward, away from servo vibration where possible.
+`*` = used. ToF = VL53L0X. `(opt)` = GPIO UART link or optional sensor pins only.
+
+```text
+          ToF VIN *    3V3 ( 1) ( 2) 5V
+          ToF SDA *  GPIO2 ( 3) ( 4) 5V
+          ToF SCL *  GPIO3 ( 5) ( 6) GND    * ESP32 GND (opt, UART)
+                     GPIO4 ( 7) ( 8) GPIO14 * ESP32 GPIO16 (opt, UART)
+          ToF GND *    GND ( 9) (10) GPIO15 * ESP32 GPIO17 (opt, UART)
+                    GPIO17 (11) (12) GPIO18
+                    GPIO27 (13) (14) GND
+  ToF GPIO1 (opt) * GPIO22 (15) (16) GPIO23 * ToF XSHUT (opt)
+          TFT VCC *    3V3 (17) (18) GPIO24 * TFT RESET
+     TFT SDI/MOSI * GPIO10 (19) (20) GND    * TFT GND
+                     GPIO9 (21) (22) GPIO25 * TFT DC/RS
+          TFT SCK * GPIO11 (23) (24) GPIO8  * TFT CS
+                       GND (25) (26) GPIO7
+                     ID_SD (27) (28) ID_SC
+                     GPIO5 (29) (30) GND
+                     GPIO6 (31) (32) GPIO12
+          TFT LED * GPIO13 (33) (34) GND
+                    GPIO19 (35) (36) GPIO16
+                    GPIO26 (37) (38) GPIO20
+                       GND (39) (40) GPIO21
+```
+
+- Enable the buses: `sudo raspi-config` -> Interface Options -> I2C **on**, SPI **on**.
+  For the GPIO UART link also Serial Port -> login shell **off**, hardware **on**.
+- GPIO18-21 (pins 12, 35, 38, 40) are left free for an I2S microphone HAT.
+- ReSpeaker 2-Mics HAT: its APA102 LEDs sit on SPI0 MOSI/SCLK with no chip-select, so TFT traffic
+  also clocks the LEDs. Either ignore the LED flicker or move the TFT to SPI1 (then it clashes with I2S).
+
+### ESP32 DevKit (ESP32-WROOM-32)
+
+| ESP32 pin | Connects to | Notes |
+| --- | --- | --- |
+| Micro-USB | Pi 5 USB-A | Power (5 V) and serial link, `/dev/ttyUSB0` on the Pi |
+| GPIO21 (SDA) | MPU6050 `SDA`, PCA9685 `SDA` | Shared I2C bus, 400 kHz |
+| GPIO22 (SCL) | MPU6050 `SCL`, PCA9685 `SCL` | Shared I2C bus |
+| 3V3 | MPU6050 `VCC`, PCA9685 `VCC` | Logic power only; the bus runs at 3.3 V |
+| GND | MPU6050 `GND`, PCA9685 `GND`, servo PSU `-` | Common ground |
+| GPIO16 (RX2) *(opt)* | Pi pin 8 (GPIO14/TXD) | Only with `#define LINK_UART2 1` |
+| GPIO17 (TX2) *(opt)* | Pi pin 10 (GPIO15/RXD) | Only with `#define LINK_UART2 1` |
+| VIN (5 V) *(opt)* | Separate 5 V supply | Only if not powered over USB; **never** the servo rail (brown-out resets) |
+
+### PCA9685 + 4x MG90S servos
+
+| PCA9685 pin | Connects to | Notes |
+| --- | --- | --- |
+| `VCC` | ESP32 3V3 | Chip logic |
+| `GND` | ESP32 GND | |
+| `SDA` / `SCL` | ESP32 GPIO21 / GPIO22 | Address `0x40` (all A0-A5 jumpers open) |
+| `OE` | Leave open | Pulled low on the board: outputs enabled |
+| `V+` (screw terminal) | Servo PSU `+` (5-6 V) | Add a 1000 µF capacitor across `V+`/`GND` |
+| `GND` (screw terminal) | Servo PSU `-` | Tied to the ESP32 ground |
+| Channel 0 | Left hip MG90S | |
+| Channel 1 | Right hip MG90S | Mirrored: `LEG_DIR` = -1 |
+| Channel 2 | Left knee MG90S | |
+| Channel 3 | Right knee MG90S | Mirrored: `LEG_DIR` = -1 |
+
+MG90S lead colours on each 3-pin PCA9685 header: **brown** = `GND`, **red** = `V+` (4.8-6 V), **orange** = PWM signal.
+Size the servo PSU for stall current: about 0.7 A per MG90S, so 3 A or more for four.
+
+### MPU6050 (GY-521 breakout)
+
+| MPU6050 pin | Connects to | Notes |
+| --- | --- | --- |
+| `VCC` | ESP32 3V3 | GY-521 has an on-board regulator; 3.3 V in is fine |
+| `GND` | ESP32 GND | |
+| `SCL` | ESP32 GPIO22 | Shared with the PCA9685 |
+| `SDA` | ESP32 GPIO21 | Shared with the PCA9685 |
+| `AD0` | GND | Address `0x68` |
+| `XDA`, `XCL`, `INT` | Not connected | |
+
+Mount flat on the pelvis with the X arrow pointing forward, away from servo vibration where possible.
+
+### 2.8" SPI TFT, 240x320, no touch (ILI9341) *(no driver code yet)*
+
+| TFT pin | Pi 5 pin | Notes |
+| --- | --- | --- |
+| `VCC` | 17 (3V3) | Most modules also accept 5 V via an on-board regulator; logic is 3.3 V only |
+| `GND` | 20 (GND) | |
+| `CS` | 24 (GPIO8, SPI0 CE0) | |
+| `RESET` | 18 (GPIO24) | |
+| `DC` / `RS` | 22 (GPIO25) | |
+| `SDI` (MOSI) | 19 (GPIO10, SPI0 MOSI) | |
+| `SCK` | 23 (GPIO11, SPI0 SCLK) | |
+| `LED` | 33 (GPIO13, PWM) | Backlight; modules with an on-board transistor only. Otherwise tie to 3V3 |
+| `SDO` (MISO) | Not connected | Write-only use; pin 21 (GPIO9) if reading back |
+
+Never drive the TFT logic pins at 5 V.
+
+### VL53L0X time-of-flight sensor *(no driver code yet)*
+
+| VL53L0X pin | Pi 5 pin | Notes |
+| --- | --- | --- |
+| `VIN` | 1 (3V3) | |
+| `GND` | 9 (GND) | |
+| `SDA` | 3 (GPIO2, I2C1 SDA) | Address `0x29`; the Pi board has 1.8 kΩ pull-ups |
+| `SCL` | 5 (GPIO3, I2C1 SCL) | |
+| `XSHUT` *(opt)* | 16 (GPIO23) | Hardware reset / sleep; leave open if unused (pulled up on the breakout) |
+| `GPIO1` *(opt)* | 15 (GPIO22) | Data-ready interrupt; leave open if polling |
+
+Check with `i2cdetect -y 1` -> `29`. The PCA9685 and MPU6050 are on the ESP32's bus, not these Pi pins.
 
 ### Pi-to-controller link
 
@@ -220,22 +333,16 @@ The simplest option is a USB cable (`SERIAL_PORT=/dev/ttyUSB0`). To use the Pi's
 - Pi physical pin 6 (`GND`) -> Nano `GND`.
 - 115200 baud, one ASCII command per line (protocol in [RUNNING.md](RUNNING.md#controller-serial-protocol-115200-baud-one-command-per-line)).
 
-### Raspberry Pi 5 I2C (VL53L0X, planned)
+### Arduino Nano / PCA9685 / MPU6050 (alternative)
 
-- Pi physical pin 1 (`3V3`) -> VL53L0X `VIN`/`VCC` only when the breakout accepts 3.3 V.
-- Pi physical pin 3, GPIO2/SDA -> VL53L0X `SDA`.
-- Pi physical pin 5, GPIO3/SCL -> VL53L0X `SCL`.
-- Pi physical pin 6 (`GND`) -> VL53L0X `GND`.
-- The PCA9685 and MPU6050 are on the controller's bus, not these Pi pins.
-
-### Raspberry Pi 5 SPI / GC9A01 (planned)
-
-- Pi physical pin 19, GPIO10/MOSI -> GC9A01 `SDA`/`MOSI`.
-- Pi physical pin 23, GPIO11/SCLK -> GC9A01 `SCL`/`SCK`.
-- Pi physical pin 24, GPIO8/CE0 -> GC9A01 `CS`.
-- A free Pi 3.3 V GPIO -> GC9A01 `DC`; a second one -> GC9A01 `RST`.
-- Pi physical pin 17 (`3V3`) -> GC9A01 `VCC`; Pi physical pin 9 (`GND`) -> `GND`.
-- Do not drive the display's logic pins at 5 V.
+- Nano A4/SDA -> PCA9685 `SDA` and MPU6050 `SDA` (shared bus).
+- Nano A5/SCL -> PCA9685 `SCL` and MPU6050 `SCL`.
+- Nano `5V` or the PCA9685 logic supply -> PCA9685 `VCC`, according to the board's logic-voltage specification.
+- Nano `5V` -> MPU6050 `VCC` (GY-521 breakouts have an on-board 3.3 V regulator); MPU6050 `AD0` to `GND` for address `0x68`.
+- Nano `GND` -> PCA9685 `GND` and MPU6050 `GND`.
+- External regulated servo supply -> PCA9685 `V+` and servo power ground. Add a 1000 µF capacitor at the PCA9685.
+- Leg servos: left hip -> channel 0, right hip -> 1, left knee -> 2, right knee -> 3. PWM is 50 Hz.
+- Mount the MPU6050 flat on the pelvis with its X arrow pointing forward, away from servo vibration where possible.
 
 ---
 
