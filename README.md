@@ -69,7 +69,7 @@ keeps the robot safe even if the Pi stalls.
 
 | File | What it is |
 | --- | --- |
-| `firmware/emo_esp32/emo_esp32.ino` | **ESP32 firmware (default).** Port of the Nano sketch below: same protocol and control code. ESP32 specifics: I2C on GPIO21/22, the VL53L0X time-of-flight sensor on that bus (`D` command; `TOF_ENABLED` switch), settings in flash-emulated EEPROM (`EEPROM.commit()`), I2C timeout via `Wire.setTimeOut()`, and a `LINK_UART2` switch for USB (`Serial`) or the Pi's GPIO UART (`Serial2`, GPIO16/17, 3.3 V, no level shifter). |
+| `firmware/emo_esp32/emo_esp32.ino` | **ESP32 firmware (default).** Port of the Nano sketch below: same protocol and control code. ESP32 specifics: I2C on GPIO21/22, the VL53L0X time-of-flight sensor on that bus (`D` command; `TOF_ENABLED` switch), settings in flash-emulated EEPROM (`EEPROM.commit()`), I2C timeout via `Wire.setTimeOut()`, and a `LINK_UART2` switch for the Pi's GPIO UART (`Serial2`, GPIO16/17, 3.3 V, no level shifter; the default) or USB (`Serial`). |
 | `firmware/emo_nano/emo_nano.ino` | **Arduino Nano firmware (alternative).** 100 Hz control loop: MPU6050 IMU with a complementary filter, PID on torso pitch through the hips (anti-windup, filtered D term), walking gait with knee lift and smooth start/stop, per-joint speed and angle limits, fall detection, walk watchdog, and calibration and PID gains saved in EEPROM. Speaks a line-based serial protocol (`S` stand, `W,<speed>,<turn>` walk, `G,1` gesture, `E`/`R` E-stop, `C` calibrate, `K` gains, `T` telemetry, `I` IMU retry without moving, `J` raw servo moves for setup). The configuration you adjust for your build (servo trims and directions, stance, gait sizes) is at the top. |
 
 ### Tools, assets and deployment
@@ -77,6 +77,7 @@ keeps the robot safe even if the Pi stalls.
 | File | What it is |
 | --- | --- |
 | `tools/sim_nano.py` | **Simulated controller.** Compiles the real firmware (ESP32 by default, `--firmware nano` for the Nano) for your PC, runs it against a simulated robot (laggy servos, noisy IMU) and serves it as a serial port on `socket://127.0.0.1:7777`. Type `tilt 8` or `tilt 70 200` to put it on a slope or knock it over. Needs `g++`. |
+| `tools/leg_test.py` | **One-leg bench test.** Moves one leg's hip and knee through the ESP32 with raw servo moves (no IMU, MQTT or Pi software needed): straight leg, stance, sweeps, steps in the air, and an interactive prompt to find each servo's trim and direction. `python tools/leg_test.py --side left demo`. |
 | `assets/network_error.wav` | Three descending beeps, played when the cloud speech pipeline fails. |
 | `deploy/emo-bot.service` | systemd unit that starts the robot on boot and restarts it if it crashes (install steps in RUNNING.md section 10). |
 
@@ -253,13 +254,13 @@ flowchart LR
 
 | ESP32 pin | Connects to | Notes |
 | --- | --- | --- |
-| Micro-USB | Pi 5 USB-A | Power (5 V) and serial link, `/dev/ttyUSB0` on the Pi |
+| Micro-USB | Pi 5 USB-A | Power (5 V) and flashing; the serial link only with `#define LINK_UART2 0` (`/dev/ttyUSB0`) |
 | GPIO21 (SDA) | MPU6050 `SDA`, PCA9685 `SDA`, VL53L0X `SDA` | Shared I2C bus, 400 kHz |
 | GPIO22 (SCL) | MPU6050 `SCL`, PCA9685 `SCL`, VL53L0X `SCL` | Shared I2C bus |
 | 3V3 | MPU6050 `VCC`, PCA9685 `VCC`, VL53L0X `VIN` | Logic power only; the bus runs at 3.3 V |
 | GND | MPU6050 `GND`, PCA9685 `GND`, VL53L0X `GND`, servo PSU `-` | Common ground |
-| GPIO16 (RX2) *(opt)* | Pi pin 8 (GPIO14/TXD) | Only with `#define LINK_UART2 1` |
-| GPIO17 (TX2) *(opt)* | Pi pin 10 (GPIO15/RXD) | Only with `#define LINK_UART2 1` |
+| GPIO16 (RX2) | Pi pin 8 (GPIO14/TXD) | Serial link to the Pi (`#define LINK_UART2 1`, the default), `/dev/serial0` |
+| GPIO17 (TX2) | Pi pin 10 (GPIO15/RXD) | Serial link to the Pi |
 | VIN (5 V) *(opt)* | Separate 5 V supply | Only if not powered over USB; **never** the servo rail (brown-out resets) |
 
 ### PCA9685 + 4x MG90S servos
@@ -334,10 +335,10 @@ Never drive the TFT logic pins at 5 V.
 
 ### Pi-to-controller link
 
-The simplest option is a USB cable (`SERIAL_PORT=/dev/ttyUSB0`). To use the Pi's GPIO UART instead
-(`SERIAL_PORT=/dev/serial0`):
+The ESP32 firmware uses the Pi's GPIO UART by default (`SERIAL_PORT=/dev/serial0`). A USB cable
+(`SERIAL_PORT=/dev/ttyUSB0`) works too, with `#define LINK_UART2 0` on the ESP32 (the Nano always uses it):
 
-**ESP32** (set `#define LINK_UART2 1` in `firmware/emo_esp32/emo_esp32.ino`; both sides 3.3 V, no level shifter):
+**ESP32** (`#define LINK_UART2 1` in `firmware/emo_esp32/emo_esp32.ino`, the default; set it to 0 for the USB cable instead; both sides 3.3 V, no level shifter):
 
 - Pi physical pin 8, GPIO14/TXD -> ESP32 GPIO16 (RX2).
 - ESP32 GPIO17 (TX2) -> Pi physical pin 10, GPIO15/RXD.

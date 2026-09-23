@@ -47,7 +47,7 @@ TOPIC_DISTANCE = "robot/sensor/distance"  # <mm> from the ESP32's VL53L0X, -1 = 
 TOPIC_VISION_STATE = "robot/vision/state"  # UP / DOWN when the camera starts or stops delivering frames
 
 # Pi <-> controller (ESP32 or Nano) serial link. "sim" logs commands instead of opening a port.
-SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/ttyUSB0")
+SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/serial0")
 SERIAL_BAUD = int(os.getenv("SERIAL_BAUD", "115200"))
 
 # Subsystem switches (the robot keeps running in degraded mode if an optional one fails)

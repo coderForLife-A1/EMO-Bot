@@ -57,3 +57,4 @@ struct FakeSerial
     }
 };
 extern FakeSerial Serial;
+#define Serial2 Serial // ESP32 second UART (LINK_UART2 1): the same fake port on the host

@@ -232,7 +232,8 @@ arduino-cli upload  --fqbn esp32:esp32:esp32 -p /dev/ttyUSB0 firmware/emo_esp32
 - Verified: compiles with no warnings on `esp32:esp32` core 3.3.11 (about 24% flash, 7% RAM), USB and UART links
   (checked before the VL53L0X support was added).
 - No VL53L0X fitted: set `#define TOF_ENABLED 0` to build without the Pololu library (`D` then answers `NACK,D,NOTOF`).
-- Pi GPIO UART instead of USB: set `#define LINK_UART2 1` (Serial2 on GPIO16 RX / GPIO17 TX), `SERIAL_PORT=/dev/serial0`.
+- The firmware talks to the Pi over its GPIO UART by default (`#define LINK_UART2 1`: Serial2 on GPIO16 RX / GPIO17 TX, `SERIAL_PORT=/dev/serial0`).
+  For the USB cable instead, set it to 0 and use `SERIAL_PORT=/dev/ttyUSB0`. Flashing always goes over USB.
 - Upload fails with `Failed to connect to ESP32` / `Wrong boot mode`: hold **BOOT** while the upload starts.
 - The ESP32 prints ROM boot text before `READY`; the Pi skips it.
 - Some USB bridges don't reset the board when the port opens: the Pi logs `No READY ... continuing anyway` and carries on.
@@ -251,7 +252,7 @@ clones): use `--fqbn arduino:avr:nano:cpu=atmega328old` for compile and upload.
 Open a serial terminal and check the banner:
 
 ```bash
-python -m serial.tools.miniterm /dev/ttyUSB0 115200 --eol LF
+python -m serial.tools.miniterm /dev/serial0 115200 --eol LF   # ESP32 on the GPIO UART; USB link: /dev/ttyUSB0
 # press the board's reset (EN/RST) button -> READY,IMU     (READY,NOIMU = check MPU6050 wiring/power)
 # type P -> ACK,P
 # type D -> ACK,D,<mm>  (ESP32; hold a hand in front of the ToF; NACK,D,NOTOF = check VL53L0X wiring)
@@ -343,7 +344,7 @@ access once.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `SERIAL_PORT` | `/dev/ttyUSB0` | `/dev/serial0` for GPIO UART, `socket://127.0.0.1:7777` for `tools/sim_nano.py`, `sim` to only log |
+| `SERIAL_PORT` | `/dev/serial0` | `/dev/ttyUSB0` for USB (Nano, or ESP32 with `LINK_UART2 0`), `socket://127.0.0.1:7777` for `tools/sim_nano.py`, `sim` to only log |
 | `SERIAL_BAUD` | `115200` | Must match the firmware |
 | `OPENAI_API_KEY` | – | Whisper + chat. Without it, conversations play the fallback sound |
 | `ELEVENLABS_API_KEY` | – | Text to speech |
@@ -373,7 +374,8 @@ Run these on the Pi with the venv active. Keep a terminal on `mosquitto_sub -t '
 
 | What | Command | Expect |
 | --- | --- | --- |
-| Controller + legs | `python -m serial.tools.miniterm /dev/ttyUSB0 115200 --eol LF`, then `S`, `T,1`, `W,40,0` | Section 5 behaviour |
+| Controller + legs | `python -m serial.tools.miniterm /dev/serial0 115200 --eol LF`, then `S`, `T,1`, `W,40,0` | Section 5 behaviour |
+| One leg, no IMU needed | `python tools/leg_test.py --side left demo` (`--side right` for the other leg) | Straight leg, stance, hip and knee sweeps, 3 steps in the air, then servos off |
 | Behavior tree | `python behavior_tree_module.py` + `mosquitto_pub -t robot/locomotion/cmd -m walk,50,0,2` | Prints `MOTOR_CMD: S`, `W,50,0` every 0.2 s, then `W,0,0` |
 | Buses and devices | `i2cdetect -y 1`, `rpicam-hello -t 3000`, `arecord -l && aplay -l` | Pi I2C devices, camera preview, sound cards |
 | Speaker | `aplay assets/network_error.wav` | Three descending beeps |
