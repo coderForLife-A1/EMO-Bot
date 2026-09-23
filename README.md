@@ -21,7 +21,9 @@ through a PCA9685 and reads the VL53L0X time-of-flight distance sensor.
 | Walks and turns | Sinusoidal gait on hips and knees; turning uses different stride lengths per leg |
 | Stays safe | Servos switch off if it falls past 45°, it stops walking if the Pi goes quiet, walks are time-limited, latched E-stop |
 | Posture reminders | Camera + MediaPipe pose; after 3 s of slouching it does a knee bob and says a reminder |
-| Conversation | "Porcupine" wake word → Whisper → GPT → ElevenLabs; the robot stands still while talking |
+| Conversation | Push-to-talk on the laptop console (or the "Porcupine" wake word on a Pi mic) → Whisper → GPT → ElevenLabs; the robot stands still while talking |
+| Face, mic and speaker on a laptop | `console_server.py` serves EMO's animated eyes and status to a browser, records the laptop mic and plays the robot's voice (RUNNING.md 9b) |
+| Calibrated sensors | `tools/calibrate_sensors.py`: IMU noise, pitch sign and level; ToF offset and scale fit, applied to every distance |
 | Measures distance | VL53L0X time-of-flight sensor on the ESP32's I2C bus; `distance` on MQTT publishes it in mm on `robot/sensor/distance` |
 | Remote control | Everything is driven over MQTT (`robot/locomotion/cmd`, `robot/error`, ...) |
 
@@ -44,6 +46,9 @@ wide, flat feet and walks with a short shuffle.
                                                                   4 servos: L/R hip, L/R knee
 ```
 
+A laptop browser connects to the Pi's console (SSH tunnel, port 8080): it shows the face and status,
+records push-to-talk speech and plays the replies.
+
 The Pi decides *what* to do (stand, walk for 3 s, gesture). The ESP32 decides *how* every 10 ms and
 keeps the robot safe even if the Pi stalls.
 
@@ -63,6 +68,11 @@ keeps the robot safe even if the Pi stalls.
 | `serial_module.py` | **Link to the ESP32 (or Nano).** Opens the serial port (or `socket://` for the simulator), waits for the `READY` banner, sends one command at a time and matches each ACK/NACK to its command, gives the E-stop priority, forwards events (`EVT,FALLEN`) and telemetry, detects controller resets, parks the servos on shutdown and reconnects forever. `SERIAL_PORT=sim` only logs commands. |
 | `vision_posture_module.py` | **Camera vision.** MediaPipe pose estimation decides good or poor posture relative to your own upright baseline and publishes `POSTURE_POOR` / `POSTURE_OK`. Reopens the camera if it drops out and publishes `robot/vision/state` `UP`/`DOWN`. Face detection is optional (`FACE_DETECTION=1`). Supports the Pi CSI camera (Picamera2), USB cameras and laptop webcams. Runs standalone. |
 | `audio_trigger_task.py` | **Wake word.** Porcupine listens for the wake word, then records 5 s of speech and hands it to the speech pipeline. Ignores its own voice while replying. Runs standalone to test the microphone. |
+| `console_server.py` | **Laptop console.** aiohttp server for `web/console.html`: pushes robot state to the page at 10 Hz over a WebSocket, accepts push-to-talk WAV uploads (`/api/listen`) and console commands, and is the speech pipeline's audio sink (the browser plays the voice). Local-only by default; on the network it requires a token, and it checks the Origin of every request. |
+| `web/console.html` | **The console page** (no external files): EMO's animated eyes, status panel, leg controls, E-stop, push-to-talk recorder (16 kHz WAV), in-browser playback and the opt-in webcam stream. |
+| `robot_status.py` | **What the controller last said**: link health, pitch telemetry, calibrated ToF distance, recent events. Fed by `main.py`, read by the console and the distance poller. |
+| `calibration.py` | **Per-robot sensor calibration** in `calibration.json`: ToF straight-line fit (applied to every distance), IMU level offset copy, pitch-sign check, noise figures. Atomic writes; a bad file falls back to "uncalibrated". |
+| `frame_mailbox.py` | Latest-frame hand-off from the console's webcam to the vision thread (`CAMERA_SOURCE=console`). |
 | `api_routing_task.py` | **Speech pipeline.** Whisper (speech → text) → GPT (reply) → ElevenLabs (text → speech) → speaker. Also speaks the robot's cues ("I fell over"). Plays a fallback beep on any failure. `python api_routing_task.py "Hello"` checks keys and speaker. |
 
 ### Microcontroller firmware
@@ -78,8 +88,11 @@ keeps the robot safe even if the Pi stalls.
 | --- | --- |
 | `tools/sim_nano.py` | **Simulated controller.** Compiles the real firmware (ESP32 by default, `--firmware nano` for the Nano) for your PC, runs it against a simulated robot (laggy servos, noisy IMU) and serves it as a serial port on `socket://127.0.0.1:7777`. Type `tilt 8` or `tilt 70 200` to put it on a slope or knock it over. Needs `g++`. |
 | `tools/leg_test.py` | **One-leg bench test.** Moves one leg's hip and knee through the ESP32 with raw servo moves (no IMU, MQTT or Pi software needed): straight leg, stance, sweeps, steps in the air, and an interactive prompt to find each servo's trim and direction. `python tools/leg_test.py --side left demo`. |
+| `tools/calibrate_sensors.py` | **Sensor calibration** (RUNNING.md 5b): `status`, `imu` (noise), `imu-sign`, `imu-level` (stores `C` with sanity checks), `tof --target-mm N --save` (offset/scale fit). Never moves a servo. |
+| `tools/make_console_cert.sh` | Self-signed HTTPS certificate and `.env` lines for a console reachable from the network. |
 | `assets/network_error.wav` | Three descending beeps, played when the cloud speech pipeline fails. |
 | `deploy/emo-bot.service` | systemd unit that starts the robot on boot and restarts it if it crashes (install steps in RUNNING.md section 10). |
+| `deploy/install-service.sh` | Installs that unit for the current user and checkout, after checking the venv, `.env` and serial permissions. |
 
 ### Configuration
 
@@ -110,7 +123,10 @@ keeps the robot safe even if the Pi stalls.
 | `tests/test_serial.py` | Reply parsing, `READY` banner, event/telemetry forwarding, queueing, stale commands dropped on reconnect or reset, slow-reply timeouts (incl. `D`), sim mode. |
 | `tests/test_vision.py` | Face selection, posture rules at any distance, personal baseline, alert timing, camera pacing between pose frames (no busy loop). |
 | `tests/test_api_routing.py` | The speech pipeline against a mocked HTTP server: WAV output, timeouts, missing keys, fallback, phrase cache, HTTPS-only API keys (cached phrases still play). |
-| `tests/test_main.py` | The whole runtime starts without hardware and stands the legs up. |
+| `tests/test_main.py` | The whole runtime starts without hardware (console included) and stands the legs up. |
+| `tests/test_console.py` | Console: allowed commands, token and Origin checks, push-to-talk uploads (queued once, bad or overlong WAVs refused), audio routing between the laptop and the Pi speaker, state snapshots. |
+| `tests/test_calibration.py` | Calibration file round trip and bad files, ToF offset/scale fits and their limits, calibrated distances in the status and on MQTT. |
+| `tests/test_calibrate_tool.py` | `tools/calibrate_sensors.py` against a fake controller (level refused when tilted or moving, sign check both ways, ToF fits), the webcam frame hand-off, exactly-once delivery of in-process topics. |
 | `tests/test_round2_misc.py` | Round-2 review checks that span modules: MQTT login/TLS, every module using the shared MQTT client, speech cues never evicting a recording, the simulator's private build directory. Round-3 checks: one shared local-host check, broker connection failures logged once per streak. |
 | `tests/conftest.py` | pytest setup that makes the modules importable. |
 

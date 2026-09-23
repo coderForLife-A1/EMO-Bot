@@ -37,10 +37,6 @@ SYSTEM_PROMPT = (
 _phrase_cache: dict[str, bytes] = {}
 
 
-def _missing_keys() -> list[str]:
-    return [name for name in ("OPENAI_API_KEY", "ELEVENLABS_API_KEY") if not getattr(config, name)]
-
-
 def require_https(url: str) -> None:
     """API keys go in request headers: refuse plain HTTP unless the server is on this machine.
 
@@ -150,41 +146,94 @@ async def _play_fallback() -> None:
         logger.warning("Fallback audio failed: %s", exc)
 
 
-async def _cascade(client: httpx.AsyncClient, wav_bytes: bytes) -> bytes:
+class LocalSpeaker:
+    """Audio sink for the Pi's own speaker (aplay on AUDIO_OUTPUT_DEVICE). Other sinks (the laptop console,
+    console_server.ConsoleSink) implement the same four methods."""
+
+    async def play_wav(self, wav_bytes: bytes) -> None:
+        await _play_wav_bytes(wav_bytes)
+
+    async def play_fallback(self) -> None:
+        await _play_fallback()
+
+    async def speak_text(self, text: str) -> bool:
+        """Speak ``text`` without the cloud (e.g. the browser's own voice). False: this sink can't."""
+        return False
+
+    def event(self, kind: str, text: str = "") -> None:
+        """Progress for a display: thinking / heard / reply / speaking / idle / error."""
+
+
+LOCAL_SPEAKER = LocalSpeaker()
+
+
+def _missing_keys(kind: str = LISTEN_JOB) -> list[str]:
+    needed = ("OPENAI_API_KEY", "ELEVENLABS_API_KEY") if kind == LISTEN_JOB else ("ELEVENLABS_API_KEY",)
+    return [name for name in needed if not getattr(config, name)]
+
+
+async def _cascade(client: httpx.AsyncClient, wav_bytes: bytes, sink: LocalSpeaker) -> bytes:
     transcript = await _transcribe(client, wav_bytes)
     logger.debug("Heard: %r", transcript)  # DEBUG: keep conversations out of the system journal
+    sink.event("heard", transcript)
     response_text = await _request_response(client, transcript)
     logger.debug("Replying: %r", response_text)
+    sink.event("reply", response_text)
     return await _synthesize(client, response_text)
 
 
-async def _speech_for(client: httpx.AsyncClient, kind: str, value) -> bytes:
+async def _speech_for(client: httpx.AsyncClient, kind: str, value, sink: LocalSpeaker) -> bytes:
     if kind == SAY_JOB:
         if value not in _phrase_cache:
+            missing = _missing_keys(SAY_JOB)
+            if missing:
+                raise RuntimeError(f"missing {', '.join(missing)} in .env")
             _phrase_cache[value] = await _synthesize(client, value)
         return _phrase_cache[value]
-    return await _cascade(client, value)
+    missing = _missing_keys(LISTEN_JOB)
+    if missing:
+        raise RuntimeError(f"missing {', '.join(missing)} in .env")
+    return await _cascade(client, value, sink)
 
 
-async def handle_job(client: httpx.AsyncClient, kind: str, value) -> bool:
+def _short_reason(exc: BaseException) -> str:
+    if isinstance(exc, asyncio.TimeoutError):
+        return f"no answer within {config.API_TIMEOUT_SECONDS:.0f} s"
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"{exc.request.url.host} answered HTTP {exc.response.status_code}"
+    if isinstance(exc, httpx.TransportError):
+        return f"network error ({type(exc).__name__})"
+    return str(exc) or type(exc).__name__
+
+
+async def handle_job(client: httpx.AsyncClient, kind: str, value, sink: Optional[LocalSpeaker] = None) -> bool:
     """Run one job end to end (``value``: WAV bytes for LISTEN_JOB, text for SAY_JOB).
 
-    Returns False if the fallback sound was played instead.
+    Returns False if the fallback sound was played instead. A SAY_JOB the cloud can't voice is spoken
+    by the sink itself when it can (the console uses the browser's voice), which counts as success.
     """
+    sink = sink or LOCAL_SPEAKER
+    sink.event("thinking")
     try:
-        missing = _missing_keys()
-        if missing:
-            raise RuntimeError(f"missing {', '.join(missing)} in .env")
-        wav_bytes = await asyncio.wait_for(_speech_for(client, kind, value), timeout=config.API_TIMEOUT_SECONDS)
+        wav_bytes = await asyncio.wait_for(_speech_for(client, kind, value, sink), timeout=config.API_TIMEOUT_SECONDS)
     except Exception as exc:  # noqa: BLE001 - any failure falls back to the local sound
         logger.warning("API %s job failed: %r", kind, exc)
-        await _play_fallback()
+        try:
+            if kind == SAY_JOB and await sink.speak_text(value):
+                return True
+            sink.event("error", _short_reason(exc))
+            await sink.play_fallback()
+        finally:
+            sink.event("idle")
         return False
 
     try:
-        await _play_wav_bytes(wav_bytes)
+        sink.event("speaking")
+        await sink.play_wav(wav_bytes)
     except (OSError, RuntimeError) as exc:
         logger.warning("Playback failed: %s", exc)
+    finally:
+        sink.event("idle")
     return True
 
 
@@ -193,11 +242,12 @@ async def api_routing_task(
     mqtt_client=None,
     busy_event: Optional[threading.Event] = None,
     client: Optional[httpx.AsyncClient] = None,
+    sink: Optional[LocalSpeaker] = None,
 ) -> None:
     """Consume (LISTEN_JOB, wav_bytes) and (SAY_JOB, text) jobs.
 
     After each LISTEN_JOB the conversation flag is cleared on MQTT and ``busy_event`` is released
-    so the wake-word listener re-arms.
+    so the wake-word listener re-arms. ``sink`` plays the result (default: the Pi's speaker).
     """
     owns_client = client is None
     client = client or httpx.AsyncClient(timeout=httpx.Timeout(config.API_TIMEOUT_SECONDS))
@@ -205,7 +255,7 @@ async def api_routing_task(
         while True:
             kind, value = await job_queue.get()
             try:
-                await handle_job(client, kind, value)
+                await handle_job(client, kind, value, sink)
             finally:
                 if kind == LISTEN_JOB:
                     if mqtt_client is not None:

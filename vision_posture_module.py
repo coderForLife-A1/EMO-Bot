@@ -3,8 +3,9 @@
 Publishes posture events (robot/state: POSTURE_POOR after 3 s of slouching, POSTURE_OK when it
 recovers) and camera health (robot/vision/state: UP/DOWN; the camera is reopened with backoff if it
 drops out). Face detection (robot/vision/face_error) is optional: FACE_DETECTION=1. Supports the Pi
-CSI camera (picamera2), USB/V4L2 cameras and laptop webcams. Run standalone with
-`python vision_posture_module.py`.
+CSI camera (picamera2), USB/V4L2 cameras, a webcam on this machine, and the laptop console's webcam
+(CAMERA_SOURCE=console: frames arrive over the console's WebSocket, see console_server.py). Run standalone
+with `python vision_posture_module.py`.
 """
 import bisect
 import collections
@@ -31,6 +32,9 @@ POSTURE_CLEAR_S = 1.0  # continuous good posture before POSTURE_OK
 POSTURE_REMIND_S = 60.0  # re-alert while posture stays poor
 POSTURE_ABSENT_RESET_S = 10.0  # user out of view this long -> POSTURE_OK
 POSTURE_ABSENT_GRACE_S = 1.0  # out of view this long -> slouch/good timers restart (ignores dropouts)
+
+CONSOLE_SOURCE = "console"
+CONSOLE_FRAME_WAIT_S = 0.5  # the page sends ~5 frames/s while its camera is on
 
 MIN_FRAME_WAIT_S = 0.002  # a grab() faster than this didn't wait for a frame (run_vision then sleeps)
 CAMERA_FAIL_LIMIT = 30  # consecutive failed reads (~0.3 s) before the camera is reopened
@@ -87,6 +91,40 @@ class _Picamera2Capture:
         self._cam.close()
 
 
+class _ConsoleCapture:
+    """cv2.VideoCapture-like reader of the frames the laptop console sends (frame_mailbox.CONSOLE_FRAMES).
+
+    A read with no new frame within CONSOLE_FRAME_WAIT_S fails, so ResilientCamera reports the camera DOWN
+    when the page's camera is switched off or the page is closed.
+    """
+
+    def __init__(self, mailbox=None) -> None:
+        from frame_mailbox import CONSOLE_FRAMES
+
+        self.mailbox = mailbox or CONSOLE_FRAMES
+        self.seq = self.mailbox.seq  # only frames sent after opening
+
+    def _next(self):
+        seq, jpeg = self.mailbox.wait_newer(self.seq, CONSOLE_FRAME_WAIT_S)
+        self.seq = seq
+        return jpeg
+
+    def read(self):
+        import numpy as np
+
+        jpeg = self._next()
+        if jpeg is None:
+            return False, None
+        frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        return frame is not None, frame
+
+    def grab(self):
+        return self._next() is not None
+
+    def release(self) -> None:
+        pass
+
+
 def open_v4l2_camera(device: str) -> cv2.VideoCapture:
     cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
     if not cap.isOpened():
@@ -103,8 +141,10 @@ def _configure_capture(cap: cv2.VideoCapture) -> cv2.VideoCapture:
 
 
 def open_camera(source: Optional[str] = None):
-    """Open "picamera2", a webcam index such as "0", or a V4L2 device path."""
+    """Open "picamera2", "console" (the laptop console's webcam), a webcam index such as "0", or a V4L2 path."""
     source = source if source is not None else config.CAMERA_SOURCE
+    if source == CONSOLE_SOURCE:
+        return _ConsoleCapture()
     if source == "picamera2":
         return _Picamera2Capture()
     if source.isdigit():

@@ -9,10 +9,12 @@ next one depends on it.
 3. [Tests and checks](#3-tests-and-checks)
 4. [Flash the controller (ESP32 or Nano)](#4-flash-the-controller-esp32-or-nano)
 5. [First power-up of the legs](#5-first-power-up-of-the-legs)
+   - [5b. Calibrate the sensors (IMU, ToF)](#5b-calibrate-the-sensors-imu-tof)
 6. [Set up the Raspberry Pi](#6-set-up-the-raspberry-pi)
 7. [Configure `.env`](#7-configure-env)
 8. [Check each subsystem on its own](#8-check-each-subsystem-on-its-own)
 9. [Run the whole robot](#9-run-the-whole-robot)
+   - [9b. Laptop console: face, mic and speaker](#9b-laptop-console-face-mic-and-speaker)
 10. [Start on boot (systemd)](#10-start-on-boot-systemd)
 11. [Tuning the balance PID and gait](#11-tuning-the-balance-pid-and-gait)
 12. [Troubleshooting](#12-troubleshooting)
@@ -293,11 +295,12 @@ with both feet level. Type `O` to relax.
 **3. Check the IMU direction.** Type `T,1` to stream telemetry (`T,<pitch x10>,...`). Tilt the robot
 forward by hand: the first number must go **positive**. If it goes negative, set `PITCH_SIGN = -1.0`
 and reflash. The sensor is expected flat on the pelvis with its X arrow pointing forward; mounted
-another way, swap the axes in `imuReadRaw()`.
+another way, swap the axes in `imuReadRaw()`. (`python tools/calibrate_sensors.py imu-sign` does this
+check for you, see 5b.)
 
 **4. Calibrate level.** Stand the robot upright on a flat table, holding it still with the servos
 relaxed (`O`), and type `C`. The offset is stored in EEPROM and survives reboots. Telemetry pitch
-should now read about 0.
+should now read about 0. (`python tools/calibrate_sensors.py imu-level` does the same with checks, see 5b.)
 
 **5. Check the balance direction.** Put it down, type `S`, and gently tilt the table (or press on the
 back of the torso). The hips should move to keep the torso **level**. If they make it worse, the
@@ -306,6 +309,36 @@ and the `wrong_sign` test scenario shows it.
 
 **6. First steps.** Type `W,40,0`, then `W,0,0` within a second (or let the 1 s watchdog stop it).
 Hold a hand near the robot. Continue with section 11 to tune.
+
+---
+
+## 5b. Calibrate the sensors (IMU, ToF)
+
+`tools/calibrate_sensors.py` talks to the controller directly (stop `main.py` first) and never moves a
+servo: every IMU step starts with `O`. Results go to `calibration.json` (per robot, not committed), which
+`main.py` loads at start-up. The IMU's level offset itself is stored in the ESP32's flash by `C`.
+
+```bash
+python tools/calibrate_sensors.py status       # link: ACK,P   IMU: ACK,I   ToF: <mm> raw
+python tools/calibrate_sensors.py imu          # robot still: pitch noise < 0.5 deg, gyro noise < 3 deg/s
+python tools/calibrate_sensors.py imu-sign     # then tilt the robot FORWARD 20-30 deg and hold it
+python tools/calibrate_sensors.py imu-level    # robot upright as it should stand, still
+python tools/calibrate_sensors.py tof --target-mm 100 --save   # flat matte card 100 mm from the sensor
+python tools/calibrate_sensors.py tof --target-mm 400 --save   # a second distance also fits the scale
+python tools/calibrate_sensors.py show
+```
+
+- **imu-sign** must report `OK`. `REVERSED` means leaning forward reads negative pitch: set `PITCH_SIGN`
+  to `-1` in the firmware and reflash, or remount the MPU6050 with its X arrow forward.
+- **imu-level** refuses if the robot moves, or if the IMU reads more than 15° from level. That means the
+  robot isn't upright or the MPU6050 isn't fixed flat to the pelvis. Use `--force` only if the board is
+  deliberately mounted at an angle. Only calibrate with the IMU mounted in its final place.
+- **tof**: one distance corrects the offset; two or more (spread at least 50 mm apart) fit
+  `distance = scale x raw + offset`. `main.py` applies the fit to every reading it publishes. A fit a working
+  VL53L0X would never need (scale outside 0.8-1.25, offset beyond ±200 mm) is refused. `tof --reset` forgets
+  the points. `NACK,D,NOTOF` means the ESP32 can't see the sensor at 0x29 (see section 12).
+
+The console's **Level-calibrate IMU** button sends the same `C` through the running robot.
 
 ---
 
@@ -354,12 +387,20 @@ access once.
 | `CHAT_MODEL` / `WHISPER_MODEL` | `gpt-4o` / `whisper-1` | |
 | `OPENAI_BASE_URL`, `ELEVENLABS_TTS_URL` | official endpoints | Change for a proxy / compatible API |
 | `API_TIMEOUT_SECONDS` | `15` | Budget for Whisper → LLM → TTS; playback isn't counted |
-| `CAMERA_SOURCE` | `/dev/video0` | `picamera2` (Pi 5 CSI camera), `/dev/video0` (USB), `0` (laptop webcam) |
+| `CAMERA_SOURCE` | `/dev/video0` | `picamera2` (Pi 5 CSI camera), `/dev/video0` (USB), `0` (a webcam on this machine), `console` (the laptop console's webcam) |
 | `AUDIO_INPUT_DEVICE` | system default | Mic name substring or index from `python -m sounddevice`, e.g. `seeed` |
 | `AUDIO_OUTPUT_DEVICE` | ALSA default | `aplay -D` device, e.g. `plughw:0` |
 | `ENABLE_VISION` / `ENABLE_AUDIO` | `1` | Set to `0` to skip a subsystem |
 | `FACE_DETECTION` | `0` | Run MediaPipe face detection and publish `robot/vision/face_error`. Off by default: nothing uses it yet and it costs Pi CPU |
 | `ALLOW_NO_IMU` | `0` | Let the robot stand and walk when the controller booted without an IMU (no balance, no fall detection). Bench tests only |
+| `START_RESTING` | `0` | Start with the servos off until `stand` (console button or MQTT). For bench tests |
+| `DISTANCE_POLL_S` / `DISTANCE_BACKOFF_S` | `0.5` / `10` | ToF poll period (`0` = only on request), and the slower period while the sensor is missing |
+| `CALIBRATION_FILE` | `calibration.json` | Written by `tools/calibrate_sensors.py` (section 5b) |
+| `ENABLE_CONSOLE` | `1` | The laptop console (section 9b) |
+| `CONSOLE_HOST` / `CONSOLE_PORT` | `127.0.0.1` / `8080` | `127.0.0.1` = reach it through an SSH tunnel. `0.0.0.0` = network, needs `CONSOLE_TOKEN` |
+| `CONSOLE_TOKEN` | empty | Required when `CONSOLE_HOST` isn't local. Open the page as `...:8080/?token=<token>` |
+| `CONSOLE_CERT` / `CONSOLE_KEY` | empty | HTTPS for a network console (the browser only allows the mic on https or localhost). `tools/make_console_cert.sh` |
+| `AUDIO_OUTPUT` | `auto` | The robot's voice: `auto` = the console while one is open, else `aplay`; `console`; `local` |
 | `MQTT_HOST` / `MQTT_PORT` | `127.0.0.1` / empty | Empty port = 1883, or 8883 with `MQTT_TLS=1` |
 | `MQTT_USERNAME` / `MQTT_PASSWORD` | empty | Broker login (section 13) |
 | `MQTT_TLS` / `MQTT_CA_CERTS` | `0` / empty | Connect with TLS; CA file for a self-signed broker certificate |
@@ -382,6 +423,8 @@ Run these on the Pi with the venv active. Keep a terminal on `mosquitto_sub -t '
 | API keys + TTS | `python api_routing_task.py "Hello, I am EMO"` | Speech, or beeps and a logged reason |
 | Mic + wake word | `python -m sounddevice`, then `python audio_trigger_task.py` | Say "porcupine": "Wake word detected" |
 | Vision | `python vision_posture_module.py` | Slouch for 3 s → `robot/state POSTURE_POOR` |
+| Sensors | `python tools/calibrate_sensors.py status` | `ACK,P`, `ACK,I`, a ToF distance (section 5b) |
+| Laptop console | `START_RESTING=1 python main.py`, then section 9b | Eyes, "Controller connected", live pitch |
 
 ---
 
@@ -397,8 +440,12 @@ Healthy startup looks like:
 ```
 INFO [serial_module] Controller ready: READY,IMU
 INFO [serial_module] Serial connected: /dev/ttyUSB0 @ 115200
-INFO [__main__] EMO-Bot running: serial_task, behavior_tree_task, api_routing_task, vision_task, audio_trigger_task
+INFO [__main__] EMO-Bot running: serial_task, behavior_tree_task, api_routing_task, console_task, distance_poll_task, vision_task
+INFO [console_server] Console on http://localhost:8080/
 ```
+
+Without Mosquitto the robot still runs: the console, speech and vision are in the same process and
+reach the behavior tree directly. Only MQTT control and monitoring (`mosquitto_pub/sub`) need the broker.
 
 > If you secured the broker with a login (section 13), add `-u <user> -P <password>` to every `mosquitto_pub` / `mosquitto_sub` command.
 
@@ -426,15 +473,54 @@ What the robot does:
 Stop with **Ctrl+C** (or `SIGTERM`). The Pi stops any walk and switches the servos off (`W,0,0`,
 then `O`) before closing the serial port, so the servos don't stay powered after the program exits.
 
+### 9b. Laptop console: face, mic and speaker
+
+The robot has no screen, microphone or speaker of its own; a laptop provides all three through a web page
+that `main.py` serves (`console_server.py`, `web/console.html`).
+
+**Open it** (default, most secure: the console only listens on the Pi itself):
+
+```bash
+# on the laptop
+ssh -L 8080:localhost:8080 <user>@<pi-address>
+# then browse to http://localhost:8080 and click Start
+```
+
+The tunnel makes the page `localhost` to the browser, which is what browsers require before they allow the
+microphone, and SSH does the authentication.
+
+**What it does**
+
+- **Face**: EMO's eyes, full screen with **F**; **P** hides the side panel. They blink and glance around
+  when idle, grow when listening, look up with "• • •" while thinking, smile and bounce while speaking,
+  sleep ("z z z") when resting, droop when fallen, turn amber for a posture reminder or IMU fault, and go
+  red for an E-stop. The face tilts with the robot's pitch.
+- **Mic**: hold **HOLD TO TALK** (or the space bar), speak, release. The page records up to 15 s, sends a
+  16 kHz WAV to the Pi, and the usual Whisper → GPT → ElevenLabs pipeline answers. The robot stands still
+  meanwhile. Needs `OPENAI_API_KEY` and `ELEVENLABS_API_KEY`; the page says so if they're missing.
+- **Speaker**: the robot's voice plays in the browser (`AUDIO_OUTPUT=auto`). Cues ("I fell over", posture
+  reminders) use the browser's own voice when there is no ElevenLabs key.
+- **Status**: controller link, legs, IMU and its calibration, live pitch, calibrated ToF distance, voice
+  state, recent controller events.
+- **Controls**: Stand, Rest, Stop, Bob, walk/turn for 2 s, Level-calibrate IMU, and **EMERGENCY STOP**
+  (also **Esc**), which turns into **CLEAR E-STOP**.
+- **Camera** (with `CAMERA_SOURCE=console`): a **Camera** button sends the laptop webcam to the posture
+  monitor at 5 frames/s. Off until you press it; frames are kept in memory only, never stored.
+
+**From another device on the network** instead of a tunnel: run `./tools/make_console_cert.sh`, add the
+lines it prints (`CONSOLE_HOST=0.0.0.0`, a `CONSOLE_TOKEN`, `CONSOLE_CERT`, `CONSOLE_KEY`) to `.env`, restart,
+and open `https://<pi-address>:8080/?token=<token>` (accept the self-signed certificate once). Without a token
+the console refuses to start on a network address. Every WebSocket and upload must come from the console page
+itself (Origin check), so other websites open in the same browser can't drive the robot.
+
 ---
 
 ## 10. Start on boot (systemd)
 
 ```bash
-# Edit User= and the paths in the unit file if your user isn't "pi" or the repo isn't ~/EMO-Bot
-sudo cp deploy/emo-bot.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now emo-bot
+./deploy/install-service.sh          # fills in your user and this checkout's path, checks the venv,
+                                     # .env and dialout group, then enables and starts the service
+./deploy/install-service.sh --dry-run   # just print the unit
 
 journalctl -u emo-bot -f            # live logs
 sudo systemctl restart emo-bot      # after pulling new code or editing .env
@@ -498,7 +584,12 @@ Also worth tuning:
 | Stands leaning forward or back | Calibration or stance | Recalibrate (`calibrate`) on a flat surface; adjust `STAND_HIP_DEG`/`STAND_KNEE_DEG` together |
 | `NACK,S,TILTED` when standing | IMU reads more than 30° | Robot is lying down; or run `calibrate` if it is upright |
 | `NACK,S,NOIMU` / `NACK,W,NOIMU` | IMU failed and still isn't answering | Check the MPU6050 wiring, then send `stand` again |
-| `NACK,D,NOTOF` | VL53L0X not answering, or it stopped measuring | Check `VIN`/`GND`/`SDA` (GPIO21)/`SCL` (GPIO22). Send `rest`, then `distance`: the ESP32 re-initialises it only while not balancing |
+| `NACK,D,NOTOF` | VL53L0X not answering, or it stopped measuring | Check `VIN`/`GND`/`SDA` (GPIO21)/`SCL` (GPIO22), that SDA/SCL aren't swapped, and that `XSHUT` (if the breakout brings it out) isn't pulled low. A firmware built with `TOF_ENABLED 0` always answers this. Send `rest`, then `distance`: the ESP32 re-initialises it only while not balancing. `main.py` retries every `DISTANCE_BACKOFF_S` |
+| `imu-level` refuses: "reads +74 deg from level" | Robot not upright, or MPU6050 not fixed flat to the pelvis | Mount it X arrow forward, hold the robot upright and still, rerun (section 5b) |
+| Garbage bytes, no `ACK,P` on `/dev/ttyAMA0` | ESP32 unpowered, no common ground, or TX/RX swapped | Power the ESP32 (USB or 5V/VIN), join the grounds, Pi pin 8 → ESP32 GPIO16, pin 10 ← GPIO17 |
+| `/dev/serial0` points at `ttyAMA10` on a Pi 5 | That's the 3-pin debug UART, not GPIO14/15 | Use `SERIAL_PORT=/dev/ttyAMA0` (after `raspi-config nonint do_serial_hw 0` and a reboot) |
+| Console: talk button greyed out / "mic blocked" | Page not on `https://` or `localhost`, missing API keys, or E-stop latched | Open it through the SSH tunnel (section 9b); the panel names any missing key |
+| Console: "Controller not answering" | `main.py` can't reach the ESP32 | As for `No READY` below; the console updates as soon as the link is back |
 | `robot/vision/state DOWN` | Camera unplugged or not delivering frames | Check the cable/`CAMERA_SOURCE`; vision reopens it automatically |
 | Walking stops after a second with `EVT,WATCHDOG` | `W` not being repeated | Normal when sending `W` by hand; via `main.py` it means the Pi stalled |
 | Robot falls sideways when walking | Single-foot phase too long or feet too narrow | Lower `KNEE_LIFT_DEG`, widen the feet, slower `GAIT_HZ` |

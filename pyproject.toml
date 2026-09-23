@@ -9,7 +9,8 @@ ignore = ["W191", "E101"]  # serial_module.py is tab-indented
 
 [tool.ruff.lint.isort]
 known-first-party = ["config", "behavior_tree_module", "vision_posture_module", "serial_module",
-                     "audio_trigger_task", "api_routing_task", "main"]
+                     "audio_trigger_task", "api_routing_task", "main", "calibration", "robot_status",
+                     "console_server", "frame_mailbox", "mqtt_client", "netutil"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

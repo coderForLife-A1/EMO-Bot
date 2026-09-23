@@ -25,6 +25,8 @@ REPLY_TIMEOUT_S = 0.3
 SLOW_REPLY_TIMEOUT_S = {"C": 1.5, "S": 1.0, "I": 1.0, "D": 1.0}
 IDLE_POLL_S = 0.5  # ping when idle so events (EVT,FALLEN) are read promptly
 PARK_COMMANDS = ("W,0,0", "O")  # sent on shutdown: stop walking, then switch the servos off
+# Refusals that are expected and reported elsewhere (E-stop latched; ToF missing: main.py logs the change)
+QUIET_REFUSALS = (",ESTOP", "NACK,D,NOTOF")
 
 LineHandler = Callable[[str], None]
 
@@ -216,7 +218,7 @@ async def serial_task(
 							logger.info("Dropped %d command(s) meant for the controller before its reset", stale)
 						if on_connect:
 							on_connect()
-					elif reply.startswith("NACK") and ",ESTOP" not in reply:
+					elif reply.startswith("NACK") and not any(q in reply for q in QUIET_REFUSALS):
 						logger.warning("Command %r refused: %s", payload.strip(), reply)
 					elif not reply:
 						logger.warning("Command %r got no reply (timeout)", payload.strip())
