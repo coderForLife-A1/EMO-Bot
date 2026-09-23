@@ -6,6 +6,7 @@
 
 Type into this console while it runs:
     tilt <deg> [deg/s]   tilt the ground/robot (tilt 8 = slope, tilt 70 200 = knock it over, tilt 0 = upright)
+    dist <mm>            what the ToF measures, read with the D command (ESP32 only; 8190 = nothing in range)
     state                print the simulated body state
     quit
 
@@ -72,13 +73,15 @@ def console(commands: "queue.Queue[str]") -> None:
             continue
         if words[0] == "tilt" and len(words) >= 2:
             commands.put(f"@tilt {words[1]} {words[2] if len(words) > 2 else 40}")
+        elif words[0] == "dist" and len(words) == 2 and words[1].isdigit():
+            commands.put(f"@dist {words[1]}")
         elif words[0] == "state":
             commands.put("@state")
         elif words[0] in ("quit", "exit"):
             commands.put("quit")
             return
         else:
-            print("commands: tilt <deg> [deg/s] | state | quit")
+            print("commands: tilt <deg> [deg/s] | dist <mm> | state | quit")
 
 
 def serve_client(conn: socket.socket, sim: Simulator, commands: "queue.Queue[str]") -> bool:

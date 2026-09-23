@@ -395,7 +395,7 @@ def apply_locomotion_command(state: SharedState, payload: str) -> None:
     """robot/locomotion/cmd payloads:
 
     stand | rest | stop | walk,<speed>,<turn>[,<seconds>] | gesture | telemetry,<0|1> |
-    gains,<kp>,<ki>,<kd> (floats) | calibrate
+    gains,<kp>,<ki>,<kd> (floats) | calibrate | distance (read the ToF once)
     """
     parts = [p.strip() for p in payload.strip().lower().split(",")]
     cmd, args = parts[0], parts[1:]
@@ -425,6 +425,8 @@ def apply_locomotion_command(state: SharedState, payload: str) -> None:
             _queue_raw(state, GESTURE_BOB)
         elif cmd == "telemetry":
             _queue_raw(state, f"T,{1 if parse_bool(args[0]) else 0}")
+        elif cmd == "distance":
+            _queue_raw(state, "D")  # the reply is published on robot/sensor/distance (main.py)
         elif cmd == "gains":
             kp, ki, kd = (round(_finite(a) * 100) for a in args[:3])
             if min(kp, ki, kd) < 0 or max(kp, ki, kd) > 100_000:

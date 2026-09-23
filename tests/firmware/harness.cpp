@@ -14,11 +14,13 @@
 #include "Arduino.h"
 #include "EEPROM.h"
 #include "Wire.h"
+#include "VL53L0X.h"
 
 FakeSerial Serial;
 FakeWire Wire;
 FakeEEPROM EEPROM;
 SimImu g_imu;
+SimTof g_tof;
 uint32_t g_micros = 0;
 std::vector<PwmCall> g_pwm;
 uint16_t g_chan[16];
@@ -455,6 +457,58 @@ static void scenarioTelemetry()
     expect(has(t, ",B\n"), "telemetry reports balance mode");
 }
 
+static void scenarioTof()
+{
+#if defined(TOF_ENABLED) && TOF_ENABLED
+    g_tof.mm = 350;
+    boot();
+    expect(has(take(), "READY,IMU"), "boot banner unchanged with the ToF");
+    run(0.2f);
+    send("D");
+    expect(take() == "ACK,D,350\n", "D reports the distance in mm");
+    g_tof.mm = 8190; // nothing in range
+    run(0.2f);
+    send("D");
+    expect(take() == "ACK,D,-1\n", "no target reads -1");
+
+    g_tof.mm = 200;
+    send("S");
+    send("W,50,0");
+    take();
+    g_tof.present = false; // ToF cable falls out while walking
+    for (int i = 0; i < 10; i++)
+    {
+        send("W,50,0");
+        run(0.05f);
+    }
+    expect(mode == MODE_BALANCE && imuOk && stride[0] > 0.3f, "losing the ToF doesn't disturb walking",
+           fmt("stride=%.2f", stride[0]));
+    take();
+    send("D");
+    expect(take() == "NACK,D,NOTOF\n", "a lost ToF is reported");
+    g_tof.present = true; // reseated
+    send("D");
+    expect(take() == "NACK,D,NOTOF\n", "no ToF re-init while balancing");
+    send("O");
+    take();
+    send("D");
+    expect(take() == "ACK,D,200\n", "D re-initialises a reconnected ToF when not balancing");
+
+    g_tof.halted = true; // still answers I2C, but no new ranges
+    run(1.0f);
+    expect(!tofOk && tofMm == -1, "a ToF that stops ranging is dropped");
+    send("D");
+    run(0.1f);
+    send("D");
+    expect(take() == "ACK,D,200\nACK,D,200\n" && tofOk, "and restarted by D");
+#else
+    boot();
+    take();
+    send("D");
+    expect(take() == "NACK,D,CMD\n", "no ToF in this firmware: D is unknown");
+#endif
+}
+
 struct Scenario
 {
     const char *name;
@@ -464,13 +518,14 @@ static const Scenario SCENARIOS[] = {
     {"protocol", scenarioProtocol},     {"imu_sign", scenarioImuSign},   {"slope", scenarioSlopeRejection},
     {"walking", scenarioWalking},       {"watchdog", scenarioWatchdog},  {"fall", scenarioFall},
     {"wrong_sign", scenarioWrongSignIsSafe}, {"calibration", scenarioCalibration}, {"no_imu", scenarioNoImu},
-    {"imu_fail", scenarioImuFail}, {"telemetry", scenarioTelemetry},
+    {"imu_fail", scenarioImuFail}, {"telemetry", scenarioTelemetry}, {"tof", scenarioTof},
 };
 
 // "serve" mode for tools/sim_nano.py: line-oriented control over stdin/stdout.
 //   @boot            power-on (runs setup)
 //   @t <ms>          advance simulated time
 //   @tilt <deg> <deg/s>  move the ground/robot tilt (e.g. 70 175 = knocked over)
+//   @dist <mm>       what the simulated ToF measures (ESP32 firmware; 8190 = nothing in range)
 //   @state           print the simulated body state
 //   anything else    a line received on the Nano's serial port
 // After each input, everything the firmware printed is written out, followed by "@@".
@@ -492,6 +547,8 @@ static void serve()
             std::sscanf(cmd.c_str() + 6, "%f %f", &target, &rate);
             setTilt(target, rate);
         }
+        else if (cmd.compare(0, 6, "@dist ") == 0)
+            g_tof.mm = static_cast<uint16_t>(std::atoi(cmd.c_str() + 6));
         else if (cmd == "@state")
             std::printf("#sim tilt=%.1f pitch=%.2f est=%.2f mode=%c hipL=%.1f kneeL=%.1f hipR=%.1f kneeR=%.1f\n",
                         P.groundTilt, P.pitch, pitchDeg, static_cast<char>(mode), P.joint[L_HIP], P.joint[L_KNEE],

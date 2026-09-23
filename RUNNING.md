@@ -64,9 +64,10 @@ no mic, bad API key), the error is logged and everything else keeps running.
 
 | Topic | Direction | Payload |
 | --- | --- | --- |
-| `robot/locomotion/cmd` | → robot | `stand`, `rest`, `stop`, `walk,<speed>,<turn>[,<seconds>]`, `gesture`, `telemetry,<0\|1>`, `gains,<kp>,<ki>,<kd>`, `calibrate` |
+| `robot/locomotion/cmd` | → robot | `stand`, `rest`, `stop`, `walk,<speed>,<turn>[,<seconds>]`, `gesture`, `telemetry,<0\|1>`, `gains,<kp>,<ki>,<kd>`, `calibrate`, `distance` |
 | `robot/locomotion/event` | robot → | `EVT,FALLEN`, `EVT,WATCHDOG`, `EVT,IMU_FAIL`, `NACK,<cmd>,<reason>` and `READY,...` from the controller |
 | `robot/locomotion/telemetry` | robot → | `T,<pitch x10>,<pitch rate x10>,<hip correction x10>,<mode>` at 20 Hz when enabled. Mode: `B` balancing, `O` off, `M` manual, `F` fallen |
+| `robot/sensor/distance` | robot → | VL53L0X distance in mm, `-1` = nothing in range, once per `distance` command (ESP32 only) |
 | `robot/error` | → robot | `error` = E-stop (all servos off), `clear` = release |
 | `robot/state` | vision → | `POSTURE_POOR` / `POSTURE_OK`: knee-bob gesture and a spoken reminder |
 | `robot/audio/wake_flag` | audio → | `1` during a conversation (robot stands still), then `0` |
@@ -94,12 +95,13 @@ never wanders off the desk on its own), then it stands.
 | `E` / `R` | `ACK,E` / `ACK,R` | Emergency stop (all off, latched) / release |
 | `P` | `ACK,P` | Ping |
 | `I` | `ACK,I` / `NACK,I,NOIMU` | Retry the IMU without moving a servo (re-initialises it if it was missing). `NACK,I,MODE` while balancing: the gyro bias needs the robot still. The Pi uses it to recover from an IMU fault |
+| `D` | `ACK,D,<mm>` / `NACK,D,NOTOF` | ESP32 only: latest VL53L0X distance, `-1` = nothing in range (~2 m). A missing sensor is re-initialised first, but only while not balancing. The Nano answers `NACK,D,CMD` |
 | *(unsolicited)* | `EVT,FALLEN`, `EVT,WATCHDOG`, `EVT,IMU_FAIL`, `T,...` | Events and telemetry. On `EVT,IMU_FAIL` the controller stops walking; the Pi relaxes the servos |
-| rejected | `NACK,<cmd>,<reason>` | `<cmd>` is the command letter being answered (`?` for an overflowed line). `<reason>`: `FORMAT`, `CMD`, `PARSE`, `JOINT`, `ESTOP`, `MODE`, `TILTED`, `NOIMU`, `OVERFLOW`. Nothing moves |
+| rejected | `NACK,<cmd>,<reason>` | `<cmd>` is the command letter being answered (`?` for an overflowed line). `<reason>`: `FORMAT`, `CMD`, `PARSE`, `JOINT`, `ESTOP`, `MODE`, `TILTED`, `NOIMU`, `NOTOF`, `OVERFLOW`. Nothing moves |
 
 The Pi matches every reply to its command by that letter, so a late reply (e.g. calibration, which takes
 ~0.35 s) is never mistaken for the reply to the next command. Slow commands get longer timeouts
-(`C` 1.5 s, `S` 1 s, others 0.3 s), and the E-stop skips ahead of anything already queued.
+(`C` 1.5 s, `S`, `I` and `D` 1 s, others 0.3 s), and the E-stop skips ahead of anything already queued.
 
 ---
 
@@ -183,7 +185,7 @@ pytest
 
 | File | Covers |
 | --- | --- |
-| `tests/test_firmware.py` | Compiles both firmwares (ESP32, Nano) for your PC and runs 11 scenarios on each against a simulated biped + IMU: protocol, IMU sign, slope rejection, walking, watchdog, fall detection, wrong-sign safety, calibration + EEPROM, no-IMU fallback, IMU failure while walking + recovery, telemetry. Skipped without `g++`. |
+| `tests/test_firmware.py` | Compiles both firmwares (ESP32, Nano) for your PC and runs 12 scenarios on each against a simulated biped + IMU: protocol, IMU sign, slope rejection, walking, watchdog, fall detection, wrong-sign safety, calibration + EEPROM, no-IMU fallback, IMU failure while walking + recovery, telemetry, ToF distance + ToF failure. Skipped without `g++`. |
 | `tests/test_behavior_tree.py` | Stand/walk/stop, walk heartbeat and time limit, E-stop latch/release, fall handling, rest, calibration, tuning pass-through, conversation and posture priorities |
 | `tests/test_serial.py` | ACK/NACK parsing, READY banner, event/telemetry forwarding, drop-oldest queueing, sim mode |
 | `tests/test_vision.py` | Posture rules, personal baseline, alert hysteresis |
@@ -207,7 +209,8 @@ Compile for the real board with `arduino-cli compile --fqbn esp32:esp32:esp32 fi
 ## 4. Flash the controller (ESP32 or Nano)
 
 Wiring (full details in [README.md](README.md#wiring--pinouts)): the PCA9685 **and** the MPU6050
-both connect to the controller's I2C bus (ESP32: GPIO21 = SDA, GPIO22 = SCL; Nano: A4 = SDA, A5 = SCL; shared). Leg servos go on PCA9685 channels
+both connect to the controller's I2C bus (ESP32: GPIO21 = SDA, GPIO22 = SCL; Nano: A4 = SDA, A5 = SCL; shared).
+On the ESP32 the VL53L0X time-of-flight sensor joins the same bus (`VIN` 3V3, `GND`, `SDA` GPIO21, `SCL` GPIO22). Leg servos go on PCA9685 channels
 0-3, powered from the separate servo supply.
 
 ```bash
@@ -219,13 +222,16 @@ ESP32_URL=https://espressif.github.io/arduino-esp32/package_esp32_index.json
 arduino-cli core update-index --additional-urls $ESP32_URL
 arduino-cli core install esp32:esp32 --additional-urls $ESP32_URL
 arduino-cli lib install "Adafruit PWM Servo Driver Library"
+arduino-cli lib install VL53L0X                          # Pololu's library, for the ToF sensor (ESP32)
 
 arduino-cli board list                                  # find the port, usually /dev/ttyUSB0
 arduino-cli compile --fqbn esp32:esp32:esp32 firmware/emo_esp32
 arduino-cli upload  --fqbn esp32:esp32:esp32 -p /dev/ttyUSB0 firmware/emo_esp32
 ```
 
-- Verified: compiles with no warnings on `esp32:esp32` core 3.3.11 (about 24% flash, 7% RAM), USB and UART links.
+- Verified: compiles with no warnings on `esp32:esp32` core 3.3.11 (about 24% flash, 7% RAM), USB and UART links
+  (checked before the VL53L0X support was added).
+- No VL53L0X fitted: set `#define TOF_ENABLED 0` to build without the Pololu library (`D` then answers `NACK,D,NOTOF`).
 - Pi GPIO UART instead of USB: set `#define LINK_UART2 1` (Serial2 on GPIO16 RX / GPIO17 TX), `SERIAL_PORT=/dev/serial0`.
 - Upload fails with `Failed to connect to ESP32` / `Wrong boot mode`: hold **BOOT** while the upload starts.
 - The ESP32 prints ROM boot text before `READY`; the Pi skips it.
@@ -247,7 +253,9 @@ Open a serial terminal and check the banner:
 ```bash
 python -m serial.tools.miniterm /dev/ttyUSB0 115200 --eol LF
 # press the board's reset (EN/RST) button -> READY,IMU     (READY,NOIMU = check MPU6050 wiring/power)
-# type P -> ACK,P       Ctrl+] to exit
+# type P -> ACK,P
+# type D -> ACK,D,<mm>  (ESP32; hold a hand in front of the ToF; NACK,D,NOTOF = check VL53L0X wiring)
+# Ctrl+] to exit
 ```
 
 > **Keep the servo power switched off** until section 5.
@@ -488,6 +496,7 @@ Also worth tuning:
 | Stands leaning forward or back | Calibration or stance | Recalibrate (`calibrate`) on a flat surface; adjust `STAND_HIP_DEG`/`STAND_KNEE_DEG` together |
 | `NACK,S,TILTED` when standing | IMU reads more than 30° | Robot is lying down; or run `calibrate` if it is upright |
 | `NACK,S,NOIMU` / `NACK,W,NOIMU` | IMU failed and still isn't answering | Check the MPU6050 wiring, then send `stand` again |
+| `NACK,D,NOTOF` | VL53L0X not answering, or it stopped measuring | Check `VIN`/`GND`/`SDA` (GPIO21)/`SCL` (GPIO22). Send `rest`, then `distance`: the ESP32 re-initialises it only while not balancing |
 | `robot/vision/state DOWN` | Camera unplugged or not delivering frames | Check the cable/`CAMERA_SOURCE`; vision reopens it automatically |
 | Walking stops after a second with `EVT,WATCHDOG` | `W` not being repeated | Normal when sending `W` by hand; via `main.py` it means the Pi stalled |
 | Robot falls sideways when walking | Single-foot phase too long or feet too narrow | Lower `KNEE_LIFT_DEG`, widen the feet, slower `GAIT_HZ` |

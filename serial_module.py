@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 READY_TIMEOUT_S = 3.0  # opening the port resets a USB-attached board; its bootloader takes ~1-2 s
 REPLY_TIMEOUT_S = 0.3
 # Commands that take longer on the controller: C samples the IMU for ~0.35 s; S and I may re-initialise
-# the IMU (re-measuring the gyro bias) before answering.
-SLOW_REPLY_TIMEOUT_S = {"C": 1.5, "S": 1.0, "I": 1.0}
+# the IMU (re-measuring the gyro bias) before answering; D may re-initialise the ToF sensor.
+SLOW_REPLY_TIMEOUT_S = {"C": 1.5, "S": 1.0, "I": 1.0, "D": 1.0}
 IDLE_POLL_S = 0.5  # ping when idle so events (EVT,FALLEN) are read promptly
 PARK_COMMANDS = ("W,0,0", "O")  # sent on shutdown: stop walking, then switch the servos off
 
@@ -130,6 +130,8 @@ def sim_reply(command: str) -> str:
 	fields = command.split(",")
 	if fields[0] == "J" and len(fields) == 3:
 		return f"ACK,{fields[1]},{fields[2]},{fields[2]}"
+	if command == "D":
+		return "ACK,D,-1"  # nothing in range
 	return "ACK," + command
 
 

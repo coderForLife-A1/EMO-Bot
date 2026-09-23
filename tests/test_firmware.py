@@ -16,7 +16,7 @@ SKETCHES = {
     "nano": FIRMWARE_DIR / "emo_nano" / "emo_nano.ino",
 }
 SCENARIOS = ["protocol", "imu_sign", "slope", "walking", "watchdog", "fall", "wrong_sign", "calibration",
-             "no_imu", "imu_fail", "telemetry"]
+             "no_imu", "imu_fail", "telemetry", "tof"]
 
 pytestmark = pytest.mark.skipif(shutil.which("g++") is None, reason="g++ not installed")
 

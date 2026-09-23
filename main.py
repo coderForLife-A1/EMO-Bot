@@ -74,11 +74,15 @@ def _install_signal_handlers(shutdown_event: asyncio.Event) -> None:
 
 def _serial_line_handler(state: SharedState, publisher: mqtt.Client) -> Callable[[str], None]:
     """Route every controller line: replies/events update the behavior tree; events and refusals are
-    published on robot/locomotion/event, telemetry on robot/locomotion/telemetry."""
+    published on robot/locomotion/event, telemetry on robot/locomotion/telemetry, ToF distances on
+    robot/sensor/distance."""
 
     def handle(line: str) -> None:
         if line.startswith("T,"):
             publisher.publish(config.TOPIC_LOCOMOTION_TELEMETRY, line, qos=0, retain=False)
+            return
+        if line.startswith("ACK,D,"):
+            publisher.publish(config.TOPIC_DISTANCE, line[6:], qos=0, retain=False)
             return
         if line.startswith(("EVT,", "NACK,", "READY")):
             logger.info("Controller: %s", line)

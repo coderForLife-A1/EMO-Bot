@@ -43,6 +43,7 @@ TOPIC_AUDIO_INTENT = "robot/audio/intent"  # audio cues requested by the behavio
 TOPIC_LOCOMOTION_CMD = "robot/locomotion/cmd"  # stand | rest | stop | walk,<speed>,<turn>[,<s>] | ...
 TOPIC_LOCOMOTION_EVENT = "robot/locomotion/event"  # EVT,FALLEN / EVT,WATCHDOG / NACK,... from the controller
 TOPIC_LOCOMOTION_TELEMETRY = "robot/locomotion/telemetry"  # T,<pitch x10>,<rate x10>,<corr x10>,<mode>
+TOPIC_DISTANCE = "robot/sensor/distance"  # <mm> from the ESP32's VL53L0X, -1 = nothing in range (after "distance")
 TOPIC_VISION_STATE = "robot/vision/state"  # UP / DOWN when the camera starts or stops delivering frames
 
 # Pi <-> controller (ESP32 or Nano) serial link. "sim" logs commands instead of opening a port.

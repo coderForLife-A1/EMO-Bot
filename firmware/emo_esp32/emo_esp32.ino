@@ -2,7 +2,8 @@
 // Port of firmware/emo_nano/emo_nano.ino with the same serial protocol, so the Pi side is unchanged.
 //
 // Hardware: ESP32 DevKit (ESP32-WROOM-32, 3.3 V logic). PCA9685 (0x40) drives the servos; MPU6050
-//   (0x68) on the same I2C bus (SDA = GPIO21, SCL = GPIO22; change I2C_SDA_PIN / I2C_SCL_PIN below).
+//   (0x68) and the VL53L0X time-of-flight sensor (0x29) on the same I2C bus (SDA = GPIO21, SCL = GPIO22;
+//   change I2C_SDA_PIN / I2C_SCL_PIN below). Set TOF_ENABLED to 0 to build without the VL53L0X.
 //   Channel 0 = left hip, 1 = right hip, 2 = left knee, 3 = right knee.
 //   Mount the MPU6050 flat on the pelvis with its X arrow pointing forward.
 //   Pi link: the board's USB port (Serial) by default; see LINK_UART2 below for the Pi's GPIO UART.
@@ -26,8 +27,10 @@
 //   E / R               emergency stop (latched, all off) / release    -> ACK,E / ACK,R
 //   P                   ping                                      -> ACK,P
 //   I                   retry the IMU without moving (not while balancing) -> ACK,I / NACK,I,NOIMU
+//   D                   ToF distance in mm, -1 = nothing in range  -> ACK,D,<mm> / NACK,D,NOTOF
+//                       (re-initialises a missing sensor first, but not while balancing)
 // Errors: NACK,<cmd>,<reason>: <cmd> is the command letter it answers ('?' if unknown, e.g. for an
-//         overflowed line), <reason> is FORMAT|CMD|PARSE|JOINT|ESTOP|MODE|TILTED|NOIMU|OVERFLOW.
+//         overflowed line), <reason> is FORMAT|CMD|PARSE|JOINT|ESTOP|MODE|TILTED|NOIMU|NOTOF|OVERFLOW.
 //         The letter lets the Pi match every reply to its command even if one arrives late.
 // Events: EVT,FALLEN  EVT,WATCHDOG (walk stopped: no W for 1 s)
 //         EVT,IMU_FAIL (IMU stopped answering: walking stops, balance and fall detection are off)
@@ -37,6 +40,14 @@
 #include <EEPROM.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <math.h>
+
+// VL53L0X time-of-flight distance sensor on the shared I2C bus. 1 needs Pololu's "VL53L0X" library;
+// 0 builds without it (D then answers NACK,D,NOTOF).
+#define TOF_ENABLED 1
+#if TOF_ENABLED
+#include <VL53L0X.h>
+VL53L0X tof;
+#endif
 
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40); // PCA9685_ADDR
 
@@ -131,6 +142,13 @@ static const uint16_t TELEMETRY_MS = 50;
 static const float D_FILTER_HZ = 10;        // low-pass on the D term: rejects vibration and step noise
 static const long MAX_GAIN_X100 = 100000; // K refuses gains above 1000 (the Pi's limit)
 
+// ---------------------------------------------------------------- time-of-flight (VL53L0X, 0x29)
+static const uint16_t TOF_PERIOD_MS = 50;      // continuous ranging, 20 Hz
+static const uint16_t TOF_POLL_MS = 20;        // data-ready check: one short I2C read, never waits
+static const uint16_t TOF_STALE_MS = 500;      // no new range for this long = sensor stopped ranging
+static const uint16_t TOF_IO_TIMEOUT_MS = 100; // library timeout while (re)initialising only
+static const uint16_t TOF_MAX_MM = 2000;       // beyond the VL53L0X's range (8190/8191 = no target)
+
 // Single-precision constants: Arduino's PI, TWO_PI and RAD_TO_DEG are doubles, and the ESP32 FPU is
 // single-precision only (double math runs in software). On the Nano float and double are the same.
 static const float PI_F = 3.14159265f;
@@ -173,6 +191,12 @@ float pitchRate = 0;   // deg/s, forward positive
 float pidInteg = 0;
 float lastCorrection = 0;
 float rateFiltered = 0; // low-passed pitch rate for the D term
+
+bool tofOk = false;
+uint8_t tofFailCount = 0;
+int16_t tofMm = -1; // latest distance, -1 = nothing in range (or no reading yet)
+uint32_t lastTofPollMs = 0;
+uint32_t lastTofMs = 0; // time of the latest range
 
 float legAngle[LEG_COUNT];
 uint16_t lastLegTick[LEG_COUNT] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
@@ -456,6 +480,73 @@ void imuUpdate(float dt)
     pitchRate = PITCH_SIGN * rate;
 }
 
+// ---------------------------------------------------------------- time-of-flight
+#if TOF_ENABLED
+bool tofInit()
+{
+    tof.setBus(&Wire);
+    tof.setTimeout(TOF_IO_TIMEOUT_MS);
+    tofFailCount = 0;
+    tofMm = -1;
+    if (!tof.init()) // fails fast (model ID check) when the sensor doesn't answer
+    {
+        return false;
+    }
+    tof.startContinuous(TOF_PERIOD_MS);
+    lastTofPollMs = lastTofMs = millis();
+    return true;
+}
+
+void tofStore(uint16_t mm)
+{
+    tofMm = mm < TOF_MAX_MM ? static_cast<int16_t>(mm) : -1;
+    lastTofMs = millis();
+}
+
+void tofFailed()
+{
+    if (++tofFailCount >= 10)
+    {
+        tofOk = false;
+        tofMm = -1;
+    }
+}
+
+// Runs in the control loop: checks the data-ready flag and reads a range only when one is waiting,
+// so the loop never blocks on the sensor. A missing or stalled ToF never affects balance.
+void tofPoll()
+{
+    if (!tofOk || millis() - lastTofPollMs < TOF_POLL_MS)
+    {
+        return;
+    }
+    lastTofPollMs = millis();
+    const uint8_t status = tof.readReg(VL53L0X::RESULT_INTERRUPT_STATUS);
+    if (tof.last_status != 0)
+    {
+        tofFailed();
+        return;
+    }
+    if ((status & 0x07) == 0) // no new range yet
+    {
+        if (millis() - lastTofMs > TOF_STALE_MS) // e.g. the sensor reset itself and sits in standby
+        {
+            tofOk = false;
+            tofMm = -1;
+        }
+        return;
+    }
+    const uint16_t mm = tof.readRangeContinuousMillimeters(); // data ready: returns without waiting
+    if (tof.last_status != 0 || tof.timeoutOccurred())
+    {
+        tofFailed();
+        return;
+    }
+    tofFailCount = 0;
+    tofStore(mm);
+}
+#endif
+
 // ---------------------------------------------------------------- control
 float balanceCorrection(float dt)
 {
@@ -599,6 +690,10 @@ void controlTick(float dt)
         LINK.print(',');
         LINK.println(static_cast<char>(mode));
     }
+
+#if TOF_ENABLED
+    tofPoll();
+#endif
 }
 
 // ---------------------------------------------------------------- commands
@@ -635,6 +730,33 @@ void cmdImu()
     {
         sendNack(F("NOIMU"));
     }
+}
+
+// D: latest ToF distance. A missing sensor is re-initialised first, which blocks for up to ~0.2 s,
+// so only when not balancing.
+void cmdDistance()
+{
+#if TOF_ENABLED
+    if (!tofOk && mode != MODE_BALANCE)
+    {
+        tofOk = tofInit();
+        if (tofOk)
+        {
+            const uint16_t mm = tof.readRangeContinuousMillimeters(); // waits for the first range
+            if (!tof.timeoutOccurred())
+            {
+                tofStore(mm);
+            }
+        }
+    }
+    if (tofOk)
+    {
+        LINK.print(F("ACK,D,"));
+        LINK.println(tofMm);
+        return;
+    }
+#endif
+    sendNack(F("NOTOF"));
 }
 
 void cmdStand()
@@ -849,6 +971,7 @@ void processCommand(char *line)
     case 'R':
     case 'P':
     case 'I':
+    case 'D':
         expected = 1;
         break;
     case 'G':
@@ -918,6 +1041,9 @@ void processCommand(char *line)
     case 'I':
         cmdImu();
         break;
+    case 'D':
+        cmdDistance();
+        break;
     }
 }
 
@@ -979,6 +1105,9 @@ void setup()
 
     loadSettings();
     imuOk = imuInit();
+#if TOF_ENABLED
+    tofOk = tofInit(); // same bus: after Wire.begin()
+#endif
 
     LINK.println(imuOk ? F("READY,IMU") : F("READY,NOIMU"));
     lastTickUs = micros();

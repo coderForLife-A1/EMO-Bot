@@ -504,3 +504,10 @@ def test_command_flood_logs_once(robot, caplog):
         for _ in range(500):
             loco(state, "gesture")
     assert caplog.text.count("Too many queued tuning commands") == 1
+
+
+def test_distance_reads_the_tof(robot):
+    state, bus, tree = standing(robot)
+    loco(state, "distance")
+    motor, _ = tick(tree, bus)
+    assert "D" in motor

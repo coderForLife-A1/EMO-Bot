@@ -24,3 +24,20 @@ def test_main_runs_in_sim_mode(monkeypatch, caplog):
     assert "EMO-Bot running" in caplog.text
     assert "SIM serial -> S" in caplog.text  # the legs were told to stand and balance
     assert "crashed" not in caplog.text
+
+
+def test_distance_reply_is_published():
+    class Publisher:
+        def __init__(self):
+            self.sent = []
+
+        def publish(self, topic, payload, **_):
+            self.sent.append((topic, payload))
+
+    from behavior_tree_module import SharedState
+
+    publisher = Publisher()
+    handle = main._serial_line_handler(SharedState(), publisher)
+    handle("ACK,D,350")
+    handle("NACK,D,NOTOF")
+    assert publisher.sent == [(config.TOPIC_DISTANCE, "350"), (config.TOPIC_LOCOMOTION_EVENT, "NACK,D,NOTOF")]

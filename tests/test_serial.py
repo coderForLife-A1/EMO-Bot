@@ -176,3 +176,10 @@ def test_backlog_is_dropped_on_reconnect(monkeypatch):
 def test_i_command_gets_the_slow_timeout():
     """#28: I re-initialises the IMU like S, so it gets the same longer timeout."""
     assert serial_module.reply_timeout("I") == serial_module.reply_timeout("S") >= 1.0
+
+
+def test_distance_command():
+    assert serial_module.reply_timeout("D") >= 1.0  # D may re-initialise the ToF sensor
+    assert serial_module.is_reply_to("D", "ACK,D,350")
+    assert serial_module.is_reply_to("D", "NACK,D,NOTOF")
+    assert serial_module.sim_reply("D") == "ACK,D,-1"

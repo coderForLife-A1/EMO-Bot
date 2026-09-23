@@ -5,8 +5,8 @@ IMU-driven balance controller, walks on command, reminds you when you slouch, an
 spoken conversation after a wake word.
 
 A **Raspberry Pi 5** does the thinking (vision, speech, decisions). An **ESP32** does the
-fast, safety-critical control (balance PID, walking gait, fall detection) and drives four servos
-through a PCA9685.
+fast, safety-critical control (balance PID, walking gait, fall detection), drives four servos
+through a PCA9685 and reads the VL53L0X time-of-flight distance sensor.
 
 - **Step-by-step setup, running and tuning guide:** [RUNNING.md](RUNNING.md)
 - **No hardware yet?** `python tools/sim_nano.py` runs the real firmware against a simulated robot.
@@ -22,6 +22,7 @@ through a PCA9685.
 | Stays safe | Servos switch off if it falls past 45°, it stops walking if the Pi goes quiet, walks are time-limited, latched E-stop |
 | Posture reminders | Camera + MediaPipe pose; after 3 s of slouching it does a knee bob and says a reminder |
 | Conversation | "Porcupine" wake word → Whisper → GPT → ElevenLabs; the robot stands still while talking |
+| Measures distance | VL53L0X time-of-flight sensor on the ESP32's I2C bus; `distance` on MQTT publishes it in mm on `robot/sensor/distance` |
 | Remote control | Everything is driven over MQTT (`robot/locomotion/cmd`, `robot/error`, ...) |
 
 With hips and knees only (no ankle or sideways hip joints), the legs move forward and back only.
@@ -38,6 +39,7 @@ wide, flat feet and walks with a short shuffle.
  │ wake word├─► MQTT ─► behavior tree ─► serial├─ E / R ... ───►│ PID → hip correction            │
  │ speech ◄─┘  (Mosquitto)   (10 Hz)           │◄─ ACK / EVT / T│ gait + slew limit → PCA9685     │
  └─────────────────────────────────────────────┘                │ fall detection, walk watchdog   │
+                                                                │ VL53L0X distance (D)            │
                                                                 └──────────────┬──────────────────┘
                                                                   4 servos: L/R hip, L/R knee
 ```
@@ -67,7 +69,7 @@ keeps the robot safe even if the Pi stalls.
 
 | File | What it is |
 | --- | --- |
-| `firmware/emo_esp32/emo_esp32.ino` | **ESP32 firmware (default).** Port of the Nano sketch below: same protocol and control code. ESP32 specifics: I2C on GPIO21/22, settings in flash-emulated EEPROM (`EEPROM.commit()`), I2C timeout via `Wire.setTimeOut()`, and a `LINK_UART2` switch for USB (`Serial`) or the Pi's GPIO UART (`Serial2`, GPIO16/17, 3.3 V, no level shifter). |
+| `firmware/emo_esp32/emo_esp32.ino` | **ESP32 firmware (default).** Port of the Nano sketch below: same protocol and control code. ESP32 specifics: I2C on GPIO21/22, the VL53L0X time-of-flight sensor on that bus (`D` command; `TOF_ENABLED` switch), settings in flash-emulated EEPROM (`EEPROM.commit()`), I2C timeout via `Wire.setTimeOut()`, and a `LINK_UART2` switch for USB (`Serial`) or the Pi's GPIO UART (`Serial2`, GPIO16/17, 3.3 V, no level shifter). |
 | `firmware/emo_nano/emo_nano.ino` | **Arduino Nano firmware (alternative).** 100 Hz control loop: MPU6050 IMU with a complementary filter, PID on torso pitch through the hips (anti-windup, filtered D term), walking gait with knee lift and smooth start/stop, per-joint speed and angle limits, fall detection, walk watchdog, and calibration and PID gains saved in EEPROM. Speaks a line-based serial protocol (`S` stand, `W,<speed>,<turn>` walk, `G,1` gesture, `E`/`R` E-stop, `C` calibrate, `K` gains, `T` telemetry, `I` IMU retry without moving, `J` raw servo moves for setup). The configuration you adjust for your build (servo trims and directions, stance, gait sizes) is at the top. |
 
 ### Tools, assets and deployment
@@ -100,11 +102,11 @@ keeps the robot safe even if the Pi stalls.
 
 | File | What it tests |
 | --- | --- |
-| `tests/test_firmware.py` | Compiles both firmwares (ESP32, Nano) for your PC and runs 11 scenarios on each against a simulated robot: serial protocol, IMU direction, recovery from a slope, walking, watchdog, fall detection, wrong-sensor-direction safety, calibration + EEPROM, missing IMU (and the `I` retry), IMU failing while walking (and recovering), telemetry. Skipped if `g++` isn't installed. |
+| `tests/test_firmware.py` | Compiles both firmwares (ESP32, Nano) for your PC and runs 12 scenarios on each against a simulated robot: serial protocol, IMU direction, recovery from a slope, walking, watchdog, fall detection, wrong-sensor-direction safety, calibration + EEPROM, missing IMU (and the `I` retry), IMU failing while walking (and recovering), telemetry, ToF distance (and the ToF failing without disturbing balance). Skipped if `g++` isn't installed. |
 | `tests/firmware/harness.cpp` | The simulator behind those scenarios (and behind `tools/sim_nano.py`): a planar model of the robot, simulated MPU6050, and a `serve` mode. |
-| `tests/firmware/Arduino.h`, `Wire.h`, `EEPROM.h`, `Adafruit_PWMServoDriver.h` | Small stand-ins for the Arduino libraries so the firmware compiles on a PC. |
+| `tests/firmware/Arduino.h`, `Wire.h`, `EEPROM.h`, `Adafruit_PWMServoDriver.h`, `VL53L0X.h` | Small stand-ins for the Arduino libraries so the firmware compiles on a PC. |
 | `tests/test_behavior_tree.py` | Standing, walking and its heartbeat, stop, E-stop (commands refused while latched, re-latched after a controller reboot), falls, rest, calibration, tuning commands and their flash-write limit, IMU fault retry with `I`, priorities. |
-| `tests/test_serial.py` | Reply parsing, `READY` banner, event/telemetry forwarding, queueing, stale commands dropped on reconnect or reset, slow-reply timeouts, sim mode. |
+| `tests/test_serial.py` | Reply parsing, `READY` banner, event/telemetry forwarding, queueing, stale commands dropped on reconnect or reset, slow-reply timeouts (incl. `D`), sim mode. |
 | `tests/test_vision.py` | Face selection, posture rules at any distance, personal baseline, alert timing, camera pacing between pose frames (no busy loop). |
 | `tests/test_api_routing.py` | The speech pipeline against a mocked HTTP server: WAV output, timeouts, missing keys, fallback, phrase cache, HTTPS-only API keys (cached phrases still play). |
 | `tests/test_main.py` | The whole runtime starts without hardware and stands the legs up. |
@@ -154,6 +156,7 @@ mosquitto_pub -t robot/locomotion/cmd -m walk,0,80,2       # turn right in place
 mosquitto_pub -t robot/locomotion/cmd -m rest              # servos off until "stand"
 mosquitto_pub -t robot/locomotion/cmd -m gains,0.8,3,0.03  # tune the balance PID live (saved on the ESP32)
 mosquitto_pub -t robot/locomotion/cmd -m telemetry,1       # stream pitch / correction on robot/locomotion/telemetry
+mosquitto_pub -t robot/locomotion/cmd -m distance          # read the ToF once: mm on robot/sensor/distance (-1 = nothing in range)
 mosquitto_pub -t robot/error -m error                      # E-stop; "clear" releases it
 mosquitto_sub -t 'robot/#' -v                              # watch everything
 ```
@@ -175,7 +178,7 @@ All topics and the controller's serial protocol are listed in [RUNNING.md sectio
 | ReSpeaker HAT | Microphone input | ALSA card 0; check with `arecord -l` and `python -m sounddevice` |
 | CSI/USB camera | Posture sensing | `CAMERA_SOURCE=picamera2` (Pi 5 CSI) or a V4L2 device such as `/dev/video0` |
 | Speaker + amplifier | Speech output | ALSA playback, e.g. `plughw:0` |
-| VL53L0X *(wired, no driver code yet)* | Time-of-flight distance sensor | Pi I2C1 (pins 3/5), address `0x29`; 3.3 V |
+| VL53L0X | Time-of-flight distance sensor (up to ~2 m) | I2C address `0x29` on the ESP32's I2C bus (GPIO21/22), shared with the PCA9685 and MPU6050; 3.3 V |
 | 2.8" SPI TFT, 240x320, no touch (ILI9341) *(wired, no driver code yet)* | Face display | Pi SPI0 + DC, RESET, backlight GPIOs; 3.3 V logic |
 
 ## Wiring & Pinouts
@@ -193,7 +196,6 @@ flowchart LR
     end
     subgraph PI[Raspberry Pi 5]
         PI_USB[USB-A]
-        PI_I2C[I2C1: GPIO2 SDA / GPIO3 SCL]
         PI_SPI[SPI0: GPIO10 MOSI / GPIO11 SCLK / GPIO8 CE0]
         PI_TFT[TFT control: GPIO24 RESET / GPIO25 DC / GPIO13 backlight]
     end
@@ -203,11 +205,11 @@ flowchart LR
     end
     USBC --> PI
     PI_USB -- "USB serial 115200 (5 V power + data)" --> ESP_USB
-    PI_I2C -- "I2C 0x29" --> TOF[VL53L0X ToF]
     PI_SPI -- "MOSI / SCLK / CS" --> TFT[2.8in ILI9341 TFT 240x320]
     PI_TFT -- "RESET / DC / LED" --> TFT
     ESP_I2C -- "I2C 0x68" --> IMU[MPU6050]
     ESP_I2C -- "I2C 0x40" --> PCA[PCA9685]
+    ESP_I2C -- "I2C 0x29" --> TOF[VL53L0X ToF]
     PCA -- "ch 0-3, 50 Hz PWM" --> SERVOS[4x MG90S: L hip, R hip, L knee, R knee]
     SPSU -- "V+ servo rail" --> PCA
     SPSU -- "GND (common)" --> PCA
@@ -216,17 +218,17 @@ flowchart LR
 
 ### Raspberry Pi 5 header
 
-`*` = used. ToF = VL53L0X. `(opt)` = GPIO UART link or optional sensor pins only.
+`*` = used. `(opt)` = GPIO UART link only. The VL53L0X time-of-flight sensor is wired to the ESP32, not to the Pi.
 
 ```text
-          ToF VIN *    3V3 ( 1) ( 2) 5V
-          ToF SDA *  GPIO2 ( 3) ( 4) 5V
-          ToF SCL *  GPIO3 ( 5) ( 6) GND    * ESP32 GND (opt, UART)
+                       3V3 ( 1) ( 2) 5V
+                     GPIO2 ( 3) ( 4) 5V
+                     GPIO3 ( 5) ( 6) GND    * ESP32 GND (opt, UART)
                      GPIO4 ( 7) ( 8) GPIO14 * ESP32 GPIO16 (opt, UART)
-          ToF GND *    GND ( 9) (10) GPIO15 * ESP32 GPIO17 (opt, UART)
+                       GND ( 9) (10) GPIO15 * ESP32 GPIO17 (opt, UART)
                     GPIO17 (11) (12) GPIO18
                     GPIO27 (13) (14) GND
-  ToF GPIO1 (opt) * GPIO22 (15) (16) GPIO23 * ToF XSHUT (opt)
+                    GPIO22 (15) (16) GPIO23
           TFT VCC *    3V3 (17) (18) GPIO24 * TFT RESET
      TFT SDI/MOSI * GPIO10 (19) (20) GND    * TFT GND
                      GPIO9 (21) (22) GPIO25 * TFT DC/RS
@@ -252,10 +254,10 @@ flowchart LR
 | ESP32 pin | Connects to | Notes |
 | --- | --- | --- |
 | Micro-USB | Pi 5 USB-A | Power (5 V) and serial link, `/dev/ttyUSB0` on the Pi |
-| GPIO21 (SDA) | MPU6050 `SDA`, PCA9685 `SDA` | Shared I2C bus, 400 kHz |
-| GPIO22 (SCL) | MPU6050 `SCL`, PCA9685 `SCL` | Shared I2C bus |
-| 3V3 | MPU6050 `VCC`, PCA9685 `VCC` | Logic power only; the bus runs at 3.3 V |
-| GND | MPU6050 `GND`, PCA9685 `GND`, servo PSU `-` | Common ground |
+| GPIO21 (SDA) | MPU6050 `SDA`, PCA9685 `SDA`, VL53L0X `SDA` | Shared I2C bus, 400 kHz |
+| GPIO22 (SCL) | MPU6050 `SCL`, PCA9685 `SCL`, VL53L0X `SCL` | Shared I2C bus |
+| 3V3 | MPU6050 `VCC`, PCA9685 `VCC`, VL53L0X `VIN` | Logic power only; the bus runs at 3.3 V |
+| GND | MPU6050 `GND`, PCA9685 `GND`, VL53L0X `GND`, servo PSU `-` | Common ground |
 | GPIO16 (RX2) *(opt)* | Pi pin 8 (GPIO14/TXD) | Only with `#define LINK_UART2 1` |
 | GPIO17 (TX2) *(opt)* | Pi pin 10 (GPIO15/RXD) | Only with `#define LINK_UART2 1` |
 | VIN (5 V) *(opt)* | Separate 5 V supply | Only if not powered over USB; **never** the servo rail (brown-out resets) |
@@ -308,18 +310,27 @@ Mount flat on the pelvis with the X arrow pointing forward, away from servo vibr
 
 Never drive the TFT logic pins at 5 V.
 
-### VL53L0X time-of-flight sensor *(no driver code yet)*
+### VL53L0X time-of-flight sensor
 
-| VL53L0X pin | Pi 5 pin | Notes |
+| VL53L0X pin | ESP32 pin | Notes |
 | --- | --- | --- |
-| `VIN` | 1 (3V3) | |
-| `GND` | 9 (GND) | |
-| `SDA` | 3 (GPIO2, I2C1 SDA) | Address `0x29`; the Pi board has 1.8 kΩ pull-ups |
-| `SCL` | 5 (GPIO3, I2C1 SCL) | |
-| `XSHUT` *(opt)* | 16 (GPIO23) | Hardware reset / sleep; leave open if unused (pulled up on the breakout) |
-| `GPIO1` *(opt)* | 15 (GPIO22) | Data-ready interrupt; leave open if polling |
+| `VIN` | 3V3 | Common breakouts (Pololu, GY-530) regulate to 2.8 V and level-shift SDA/SCL |
+| `GND` | GND | |
+| `SDA` | GPIO21 | Shared with the PCA9685 and MPU6050; address `0x29` (no clash with `0x40` / `0x68`) |
+| `SCL` | GPIO22 | Shared with the PCA9685 and MPU6050 |
+| `XSHUT` | Not connected | Pulled up on the breakout: always on |
+| `GPIO1` | Not connected | The firmware polls the data-ready flag instead of using the interrupt |
 
-Check with `i2cdetect -y 1` -> `29`. The PCA9685 and MPU6050 are on the ESP32's bus, not these Pi pins.
+- Needs Pololu's `VL53L0X` Arduino library (`arduino-cli lib install VL53L0X`, [RUNNING.md section 4](RUNNING.md#4-flash-the-controller-esp32-or-nano)).
+  No sensor? Set `#define TOF_ENABLED 0` in `firmware/emo_esp32/emo_esp32.ino` to build without the library.
+- The sensor measures continuously at 20 Hz. The control loop checks for a new reading every 20 ms without
+  waiting, so the sensor never slows the balance loop. A missing or failed sensor never affects balance
+  or walking: `D` answers `NACK,D,NOTOF`.
+- Check it: send `D` on the ESP32's serial port -> `ACK,D,<mm>` (`-1` = nothing within ~2 m), or run
+  `mosquitto_sub -t robot/sensor/distance` and `mosquitto_pub -t robot/locomotion/cmd -m distance`.
+- It shares the bus with the IMU: keep its wires short (a loose cable can glitch IMU reads too) and
+  mount it facing forward with the cover glass clear.
+- The Arduino Nano firmware has no ToF support (`D` -> `NACK,D,CMD`).
 
 ### Pi-to-controller link
 
@@ -387,7 +398,8 @@ The most common problems:
 | Symptom | Fix |
 | --- | --- |
 | Servos jitter, or the Pi reboots when they move | Separate regulated servo supply sized for stall current, 1000 µF at the PCA9685, common ground |
-| Banner says `READY,NOIMU` | Check the MPU6050 wiring on A4/A5 and that `AD0` is low. The robot still stands and walks, without balance |
+| Banner says `READY,NOIMU` | Check the MPU6050 wiring (ESP32 GPIO21/22, Nano A4/A5) and that `AD0` is low. The robot still stands and walks, without balance |
+| `NACK,D,NOTOF` | VL53L0X not answering: check `VIN`, `GND`, `SDA` (GPIO21), `SCL` (GPIO22). Then send `rest` and `distance` again: the ESP32 re-initialises it only while not balancing |
 | Torso tilts further instead of correcting | Servo direction or IMU direction is wrong: RUNNING.md section 5, steps 3 and 5 |
 | Buzzing while standing | Balance gains too high or loose servo horns: RUNNING.md section 11 |
 | Robot falls sideways when walking | Lower `KNEE_LIFT_DEG`, widen the feet, slow the gait |
