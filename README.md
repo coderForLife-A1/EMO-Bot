@@ -95,7 +95,6 @@ keeps the robot safe even if the Pi stalls.
 | File | What it is |
 | --- | --- |
 | `README.md` | This overview. |
-| `Issues.md` | Code review of the Raspberry Pi side (by Pratik): 13 issues ranked by severity, each with how it was fixed. |
 | `RUNNING.md` | The full guide: laptop dry run, tests, flashing the controller (ESP32 or Nano), first power-up of the legs, Pi setup, `.env` reference, checking each subsystem, running, starting on boot, PID/gait tuning, troubleshooting. |
 
 ### Tests (no hardware needed)
