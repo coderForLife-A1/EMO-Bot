@@ -177,6 +177,7 @@ async def api_routing_task(
     """
     owns_client = client is None
     client = client or httpx.AsyncClient(timeout=httpx.Timeout(config.API_TIMEOUT_SECONDS))
+    warm_up = asyncio.create_task(llm_client.warm_up(client), name="llm_warm_up")
     try:
         while True:
             kind, value = await job_queue.get()
@@ -189,7 +190,11 @@ async def api_routing_task(
                     if busy_event is not None:
                         busy_event.clear()
                 job_queue.task_done()
+            if kind == LISTEN_JOB:
+                await llm_client.rewarm_after_escalation(client)  # robot is idle now; next question stays fast
     finally:
+        warm_up.cancel()
+        await asyncio.gather(warm_up, return_exceptions=True)
         if owns_client:
             await client.aclose()
 

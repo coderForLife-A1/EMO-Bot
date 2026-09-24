@@ -89,13 +89,19 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o")  # cloud reply model: the fallbac
 # Reply model on the laptop's Ollama, e.g. http://192.168.43.20:11434 (llm_client.py).
 # Empty = skip it and always use CHAT_MODEL. Plain http is allowed only to a LAN address; Ollama gets no API key.
 LOCAL_LLM_URL = os.getenv("LOCAL_LLM_URL", "").strip()
-LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "").strip() or "qwen3:4b"
-# Asked when LOCAL_LLM_MODEL is unsure; "off" = go straight to CHAT_MODEL instead
-_escalate = os.getenv("LOCAL_LLM_ESCALATE_MODEL", "").strip() or "gemma4:e4b"
+# Must not be a thinking model (they reason out loud and are slow). gemma4:e4b: 3.2 GB of GPU memory at a
+# 4096 context, about 0.5-1.7 s per reply, and says when its knowledge may be out of date.
+LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "").strip() or "gemma4:e4b"
+# Second local model asked when LOCAL_LLM_MODEL is unsure; "off" (default) = the cloud CHAT_MODEL is asked instead.
+# Only worth it if both models fit in GPU memory together, or each escalation reloads a model for seconds.
+_escalate = os.getenv("LOCAL_LLM_ESCALATE_MODEL", "").strip() or "off"
 LOCAL_LLM_ESCALATE_MODEL = "" if _escalate.lower() in {"off", "none", "0"} else _escalate
 LOCAL_LLM_CONNECT_TIMEOUT = _env_float("LOCAL_LLM_CONNECT_TIMEOUT", 1.0)  # laptop unreachable -> cloud quickly
 LOCAL_LLM_TIMEOUT = _env_float("LOCAL_LLM_TIMEOUT", 5.0)  # longest wait for the next piece of a reply
 LOCAL_LLM_KEEP_ALIVE = os.getenv("LOCAL_LLM_KEEP_ALIVE", "").strip() or "30m"  # keep the model loaded on the laptop
+# Context window in tokens. Ollama may otherwise pick the model's maximum (131k for gemma3:4b), which pushes part
+# of the model out of an 8 GB GPU onto the CPU. A short spoken chat needs far less.
+LOCAL_LLM_CONTEXT = int(os.getenv("LOCAL_LLM_CONTEXT", "").strip() or "4096")
 
 # Reply tuning (laptop and cloud models). Low temperature = fewer made-up facts; a reply cut by the token
 # limit is trimmed back to its last full sentence.
