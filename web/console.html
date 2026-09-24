@@ -1,0 +1,622 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EMO Console</title>
+<style>
+  :root {
+    --bg: #05070a;
+    --panel: #0d1117;
+    --panel-2: #151b23;
+    --line: #232b36;
+    --text: #d6dde6;
+    --muted: #7d8793;
+    --eye: #3ff0ff;
+    --ok: #3fd07a;
+    --warn: #f0b429;
+    --bad: #ff4d4f;
+    --radius: 14px;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { display: grid; grid-template-columns: 1fr 340px; height: 100vh; overflow: hidden; }
+  body.face-only { grid-template-columns: 1fr 0; }
+  body.face-only #panel { display: none; }
+
+  #stage { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    min-width: 0; padding: 16px; }
+  #face { width: min(100%, 1100px); aspect-ratio: 16 / 9; max-height: calc(100vh - 260px); display: block; }
+  #caption { min-height: 3.2em; max-width: 900px; text-align: center; font-size: clamp(16px, 2.2vw, 26px);
+    color: var(--text); padding: 0 16px; }
+  #caption .you { color: var(--muted); display: block; font-size: .75em; }
+  #caption .err { color: var(--warn); }
+  #banner { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); padding: 6px 14px;
+    border-radius: 999px; font-weight: 600; letter-spacing: .02em; display: none; }
+  #banner.show { display: block; }
+  #banner.bad { background: var(--bad); color: #fff; }
+  #banner.warn { background: var(--warn); color: #111; }
+  #topbar { position: absolute; top: 12px; right: 12px; display: flex; gap: 8px; }
+  .icon-btn { background: var(--panel-2); border: 1px solid var(--line); color: var(--text); border-radius: 10px;
+    padding: 6px 10px; cursor: pointer; font-size: 13px; }
+  .icon-btn:hover { border-color: var(--muted); }
+
+  #talk { margin-top: 10px; width: 96px; height: 96px; border-radius: 50%; border: 3px solid var(--eye);
+    background: radial-gradient(circle, #0f2a30 0%, #081418 70%); color: var(--eye); font-weight: 700;
+    cursor: pointer; user-select: none; touch-action: none; transition: transform .1s, box-shadow .1s; }
+  #talk:disabled { opacity: .35; cursor: not-allowed; }
+  #talk.rec { transform: scale(1.08); box-shadow: 0 0 0 calc(var(--level, 0) * 26px + 4px) rgba(63, 240, 255, .25);
+    border-color: #fff; color: #fff; }
+  #talk-hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+
+  #ask { width: min(100%, 900px); margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+  #examples { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; }
+  .chip { background: var(--panel-2); border: 1px solid var(--line); color: var(--text); border-radius: 999px;
+    padding: 7px 14px; cursor: pointer; font-size: 14px; }
+  .chip:hover:not(:disabled) { border-color: var(--eye); color: var(--eye); }
+  .chip:disabled { opacity: .4; cursor: not-allowed; }
+  #ask-form { display: flex; gap: 8px; }
+  #ask-text { flex: 1; min-width: 0; background: var(--panel); border: 1px solid var(--line); color: var(--text);
+    border-radius: 12px; padding: 10px 14px; font: inherit; }
+  #ask-text:focus { outline: none; border-color: var(--eye); }
+  #ask-send { background: #0f2a30; border: 2px solid var(--eye); color: var(--eye); border-radius: 12px; padding: 0 18px;
+    font-weight: 700; cursor: pointer; }
+  #ask-send:disabled { opacity: .4; cursor: not-allowed; }
+
+  #panel { background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto; padding: 14px;
+    display: flex; flex-direction: column; gap: 12px; }
+  .card { background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px; }
+  .card h2 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  .row { display: flex; justify-content: space-between; align-items: center; padding: 3px 0; gap: 8px; }
+  .row .k { color: var(--muted); }
+  .row .v { font-variant-numeric: tabular-nums; text-align: right; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; background: var(--muted); }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+  .gauge { position: relative; height: 8px; background: #0a0e13; border-radius: 4px; margin-top: 6px; overflow: hidden; }
+  .gauge i { position: absolute; top: 0; bottom: 0; width: 4px; margin-left: -2px; background: var(--eye); left: 50%; }
+  .gauge::after { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--line); }
+  .btns { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .btn { background: #1c2430; border: 1px solid var(--line); color: var(--text); border-radius: 10px; padding: 9px 6px;
+    cursor: pointer; font-size: 14px; }
+  .btn:hover:not(:disabled) { border-color: var(--eye); }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .btn.wide { grid-column: span 3; }
+  #estop { width: 100%; padding: 16px; font-size: 18px; font-weight: 800; letter-spacing: .06em; border-radius: 12px;
+    border: 2px solid #ff8a8b; background: var(--bad); color: #fff; cursor: pointer; }
+  #estop.latched { background: #1c2430; border-color: var(--ok); color: var(--ok); }
+  .note { font-size: 12px; color: var(--warn); margin-top: 6px; }
+  #events { font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); max-height: 150px;
+    overflow-y: auto; white-space: pre-wrap; }
+
+  #overlay { position: fixed; inset: 0; background: rgba(3, 5, 8, .92); display: flex; align-items: center;
+    justify-content: center; flex-direction: column; gap: 14px; z-index: 10; text-align: center; padding: 24px; }
+  #overlay.hidden { display: none; }
+  #overlay h1 { margin: 0; font-size: 28px; }
+  #overlay p { margin: 0; color: var(--muted); max-width: 520px; }
+  #start { font-size: 18px; padding: 12px 28px; border-radius: 12px; border: 2px solid var(--eye); background: #0f2a30;
+    color: var(--eye); cursor: pointer; }
+  #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--panel-2);
+    border: 1px solid var(--line); padding: 8px 14px; border-radius: 10px; display: none; z-index: 5; max-width: 90vw; }
+  #toast.show { display: block; }
+
+  @media (max-width: 900px) {
+    body { grid-template-columns: 1fr; grid-template-rows: 60vh auto; overflow: auto; height: auto; }
+    #panel { border-left: 0; border-top: 1px solid var(--line); }
+    body.face-only { grid-template-rows: 100vh 0; }
+  }
+</style>
+</head>
+<body>
+<main id="stage">
+  <div id="banner"></div>
+  <div id="topbar">
+    <button class="icon-btn" id="btn-cam" title="Send this laptop's webcam to EMO's posture monitor" hidden>Camera: off</button>
+    <button class="icon-btn" id="btn-panel" title="Show or hide the side panel (P)">Panel</button>
+    <button class="icon-btn" id="btn-full" title="Full screen (F)">Full screen</button>
+  </div>
+  <canvas id="face" width="1600" height="900" aria-label="EMO's face"></canvas>
+  <div id="caption" aria-live="polite"></div>
+  <section id="ask" aria-label="Ask EMO">
+    <div id="examples"></div>
+    <form id="ask-form" autocomplete="off">
+      <input id="ask-text" maxlength="300" placeholder="Type a question for EMO&hellip;" aria-label="Question for EMO">
+      <button id="ask-send" type="submit">Ask</button>
+    </form>
+  </section>
+  <button id="talk" disabled aria-label="Hold to talk" hidden>HOLD<br>TO TALK</button>
+  <div id="talk-hint">click an example, type a question, or hold the button (or space bar) and speak &middot; Esc = emergency stop</div>
+</main>
+
+<aside id="panel">
+  <button id="estop" title="Emergency stop: all servos off (Esc)">EMERGENCY STOP</button>
+
+  <section class="card">
+    <h2>Robot</h2>
+    <div class="row"><span class="k">Software</span><span class="v" id="s-ws"><span class="dot"></span>connecting</span></div>
+    <div class="row"><span class="k">Controller</span><span class="v" id="s-link"><span class="dot"></span>–</span></div>
+    <div class="row"><span class="k">Legs</span><span class="v" id="s-legs">–</span></div>
+    <div class="row"><span class="k">IMU</span><span class="v" id="s-imu">–</span></div>
+    <div class="row"><span class="k">Pitch</span><span class="v" id="s-pitch">–</span></div>
+    <div class="gauge" title="Torso pitch, -45 to +45 degrees"><i id="g-pitch"></i></div>
+    <div class="row" style="margin-top:6px"><span class="k">Distance</span><span class="v" id="s-dist">–</span></div>
+    <div class="row"><span class="k">Voice</span><span class="v" id="s-voice">–</span></div>
+    <div class="note" id="s-keys"></div>
+  </section>
+
+  <section class="card">
+    <h2>Legs</h2>
+    <div class="btns">
+      <button class="btn" data-cmd="stand">Stand</button>
+      <button class="btn" data-cmd="rest">Rest</button>
+      <button class="btn" data-cmd="stop">Stop</button>
+      <span></span>
+      <button class="btn" data-cmd="walk,60,0,2" title="Walk forward for 2 s">&#9650;</button>
+      <span></span>
+      <button class="btn" data-cmd="walk,0,-60,2" title="Turn left for 2 s">&#9664;</button>
+      <button class="btn" data-cmd="gesture" title="Knee bob">Bob</button>
+      <button class="btn" data-cmd="walk,0,60,2" title="Turn right for 2 s">&#9654;</button>
+      <span></span>
+      <button class="btn" data-cmd="walk,-60,0,2" title="Walk backward for 2 s">&#9660;</button>
+      <span></span>
+      <button class="btn wide" id="btn-level" title="Measure the IMU's level offset (robot upright and still)">Level-calibrate IMU&hellip;</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Recent events</h2>
+    <div id="events">–</div>
+  </section>
+</aside>
+
+<div id="overlay">
+  <h1>EMO console</h1>
+  <p>This laptop is EMO's face and screen. Click an example question (or type your own) and EMO answers in text.</p>
+  <button id="start">Start</button>
+  <p id="overlay-note"></p>
+</div>
+<div id="toast" role="status"></div>
+
+<script>
+"use strict";
+// ------------------------------------------------------------------ connection
+const params = new URLSearchParams(location.search);
+if (params.get("token")) {
+  try { sessionStorage.setItem("emo-token", params.get("token")); } catch (e) {}
+  history.replaceState(null, "", location.pathname); // keep the token out of the address bar and history
+}
+let token = "";
+try { token = sessionStorage.getItem("emo-token") || ""; } catch (e) {}
+
+let ws = null, wsUp = false, retry = 500;
+let state = null;
+let voice = { status: "idle", heard: "", reply: "", error: "" };
+let examples = [];
+
+function connect() {
+  const url = new URL("ws", location.href);
+  url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  if (token) url.searchParams.set("token", token);
+  ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { wsUp = true; retry = 500; render(); };
+  ws.onclose = () => { wsUp = false; state = null; if (rec && rec.robot) rec = null; render(); setTimeout(connect, retry); retry = Math.min(retry * 2, 5000); };
+  ws.onmessage = (ev) => {
+    if (typeof ev.data !== "string") { playWav(ev.data); return; }
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "state") { state = msg; voice = msg.voice; if (rec && rec.robot) rec.level = msg.mic_level; render(); }
+    else if (msg.type === "voice") { voice = msg; render(); }
+    else if (msg.type === "say") { sayWithBrowser(msg.text); }
+    else if (msg.type === "examples") { examples = msg.items || []; renderExamples(); render(); }
+    else if (msg.type === "error") { toast(msg.text); if (rec && rec.robot) { rec = null; render(); } }
+  };
+}
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) { ws.send(JSON.stringify(obj)); return true; }
+  toast("Not connected to the robot"); return false;
+}
+
+// ------------------------------------------------------------------ audio out
+let audioCtx = null, analyser = null, playChain = Promise.resolve(), speakLevel = 0, browserSpeaking = false;
+function ensureAudio() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.connect(audioCtx.destination);
+  }
+  if (audioCtx.state === "suspended") audioCtx.resume();
+}
+function playWav(buffer) {
+  ensureAudio();
+  playChain = playChain.then(() => audioCtx.decodeAudioData(buffer.slice(0)).then((decoded) => new Promise((done) => {
+    const src = audioCtx.createBufferSource();
+    src.buffer = decoded;
+    src.connect(analyser);
+    src.onended = done;
+    src.start();
+  }))).catch((e) => { console.warn("playback failed", e); });
+}
+function sayWithBrowser(text) {
+  if (!("speechSynthesis" in window)) return;
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = 1.05; u.pitch = 1.3;
+  u.onstart = () => { browserSpeaking = true; };
+  u.onend = u.onerror = () => { browserSpeaking = false; };
+  speechSynthesis.speak(u);
+}
+const levelBuf = new Uint8Array(512);
+function outputLevel() {
+  if (browserSpeaking) return 0.35 + 0.25 * Math.abs(Math.sin(performance.now() / 90));
+  if (!analyser) return 0;
+  analyser.getByteTimeDomainData(levelBuf);
+  let sum = 0;
+  for (const v of levelBuf) { const d = (v - 128) / 128; sum += d * d; }
+  return Math.min(1, Math.sqrt(sum / levelBuf.length) * 4);
+}
+
+// ------------------------------------------------------------------ microphone (push-to-talk)
+const TARGET_RATE = 16000, MIN_S = 0.4, MAX_S = 15;
+let rec = null; // { stream, ctx, node, chunks, rate, started, level }
+const WORKLET = `
+class Tap extends AudioWorkletProcessor {
+  process(inputs) { const ch = inputs[0][0]; if (ch) this.port.postMessage(ch.slice(0)); return true; }
+}
+registerProcessor("tap", Tap);`;
+
+async function startRecording() {
+  if (rec || !canTalk()) return;
+  if (state.robot_mic) { // the Pi records its own mic (the webcam's); the page only says start/stop
+    rec = { robot: true, started: performance.now(), level: 0 };
+    if (!send({ type: "listening" })) rec = null;
+    render();
+    return;
+  }
+  if (!window.isSecureContext || !navigator.mediaDevices) {
+    toast("The browser only allows the mic on https:// or localhost: open the console through the SSH tunnel");
+    return;
+  }
+  ensureAudio();
+  rec = { chunks: [], started: performance.now(), level: 0, pending: true };
+  if (!send({ type: "listening" })) { rec = null; return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    const ctx = new AudioContext();
+    const url = URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }));
+    await ctx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+    const node = new AudioWorkletNode(ctx, "tap");
+    node.port.onmessage = (ev) => {
+      if (!rec) return;
+      rec.chunks.push(ev.data);
+      let s = 0; for (const v of ev.data) s += v * v;
+      rec.level = Math.min(1, Math.sqrt(s / ev.data.length) * 6);
+      if (performance.now() - rec.started > MAX_S * 1000) stopRecording();
+    };
+    ctx.createMediaStreamSource(stream).connect(node);
+    Object.assign(rec, { stream, ctx, node, rate: ctx.sampleRate, pending: false });
+    if (rec.stopRequested) stopRecording();
+  } catch (e) {
+    toast("Microphone unavailable: " + e.message);
+    teardown(); send({ type: "cancel" });
+  }
+  render();
+}
+function teardown() {
+  if (!rec) return;
+  if (rec.stream) rec.stream.getTracks().forEach((t) => t.stop());
+  if (rec.ctx) rec.ctx.close();
+  rec = null;
+  render();
+}
+async function stopRecording() {
+  if (!rec) return;
+  if (rec.robot) {
+    const held = (performance.now() - rec.started) / 1000;
+    rec = null;
+    if (held < MIN_S) { send({ type: "cancel" }); toast("Hold the button while you speak"); }
+    else send({ type: "stop" });
+    render();
+    return;
+  }
+  if (rec.pending) { rec.stopRequested = true; return; }
+  const { chunks, rate } = rec;
+  teardown();
+  const samples = concat(chunks);
+  if (samples.length / rate < MIN_S) { send({ type: "cancel" }); toast("Hold the button while you speak"); return; }
+  const wav = encodeWav(resample(samples, rate, TARGET_RATE), TARGET_RATE);
+  try {
+    const res = await fetch("api/listen", { method: "POST", body: wav,
+      headers: { "Content-Type": "audio/wav", "X-Console-Token": token } });
+    if (!res.ok) { toast(await res.text()); send({ type: "cancel" }); }
+  } catch (e) { toast("Upload failed: " + e.message); send({ type: "cancel" }); }
+}
+function concat(chunks) {
+  let n = 0; for (const c of chunks) n += c.length;
+  const out = new Float32Array(n); let o = 0;
+  for (const c of chunks) { out.set(c, o); o += c.length; }
+  return out;
+}
+function resample(input, from, to) {
+  if (from === to) return input;
+  const ratio = from / to, out = new Float32Array(Math.floor(input.length / ratio));
+  for (let i = 0; i < out.length; i++) { // box filter over each output sample's span: cheap anti-aliasing
+    const a = Math.floor(i * ratio), b = Math.min(input.length, Math.floor((i + 1) * ratio));
+    let s = 0; for (let j = a; j < b; j++) s += input[j];
+    out[i] = s / Math.max(1, b - a);
+  }
+  return out;
+}
+function encodeWav(samples, rate) {
+  const buf = new ArrayBuffer(44 + samples.length * 2), v = new DataView(buf);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, "RIFF"); v.setUint32(4, 36 + samples.length * 2, true); str(8, "WAVE"); str(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, rate, true);
+  v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); str(36, "data");
+  v.setUint32(40, samples.length * 2, true);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buf], { type: "audio/wav" });
+}
+function voiceKeys() { return !!(state && state.can_listen); }
+function canAsk() {
+  return wsUp && state && !state.busy && !state.estop && !rec;
+}
+function ask(text) {
+  text = (text || "").trim();
+  if (!text || !canAsk()) return;
+  if (send({ type: "ask", text })) $("ask-text").value = "";
+}
+function renderExamples() {
+  const box = $("examples");
+  box.textContent = "";
+  for (const q of examples) {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "chip"; b.textContent = q;
+    b.addEventListener("click", () => ask(q));
+    box.appendChild(b);
+  }
+}
+function canTalk() {
+  return wsUp && state && state.can_listen && !state.busy && !state.estop;
+}
+
+// ------------------------------------------------------------------ webcam for posture monitoring (opt-in)
+const CAM_PERIOD_MS = 200, CAM_W = 640, CAM_H = 480;
+let cam = null; // { stream, video, canvas, timer }
+async function startCamera() {
+  if (!window.isSecureContext || !navigator.mediaDevices) { toast("The camera needs https:// or localhost (SSH tunnel)"); return; }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: CAM_W, height: CAM_H } });
+    const video = document.createElement("video");
+    video.muted = true; video.playsInline = true; video.srcObject = stream; await video.play();
+    const c = document.createElement("canvas"); c.width = CAM_W; c.height = CAM_H;
+    const ctx = c.getContext("2d");
+    cam = { stream, video, canvas: c, busy: false };
+    cam.timer = setInterval(() => {
+      if (!cam || cam.busy || !ws || ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 256 * 1024) return;
+      cam.busy = true;
+      ctx.drawImage(video, 0, 0, CAM_W, CAM_H);
+      c.toBlob((blob) => {
+        if (blob && cam && ws && ws.readyState === WebSocket.OPEN) blob.arrayBuffer().then((b) => ws.send(b));
+        if (cam) cam.busy = false;
+      }, "image/jpeg", 0.7);
+    }, CAM_PERIOD_MS);
+  } catch (e) { toast("Camera unavailable: " + e.message); cam = null; }
+  render();
+}
+function stopCamera() {
+  if (!cam) return;
+  clearInterval(cam.timer);
+  cam.stream.getTracks().forEach((t) => t.stop());
+  cam = null;
+  render();
+}
+
+// ------------------------------------------------------------------ face
+const canvas = document.getElementById("face"), g = canvas.getContext("2d");
+const W = canvas.width, H = canvas.height;
+const EXPR = {
+  //         w    h    r   gx   gy  lidIn lidOut happy color
+  idle:     [230, 290, 60,  0,   0,  0,    0,     0,   "#3ff0ff"],
+  listening:[250, 330, 70,  0,  -10, 0,    0,     0,   "#7ff7ff"],
+  thinking: [220, 250, 60,  70, -70, 0.15, 0.15,  0,   "#3ff0ff"],
+  speaking: [240, 280, 70,  0,   0,  0,    0,     0.45,"#3ff0ff"],
+  resting:  [240,  22, 11,  0,  70,  0,    0,     0,   "#2aa9b4"],
+  fallen:   [210, 250, 60,  0,  40,  0,    0.45,  0,   "#6aa0ff"],
+  estop:    [220, 230, 40,  0,   0,  0.5,  0,     0,   "#ff4d4f"],
+  posture:  [260, 320, 70,  0,  60,  0,    0,     0,   "#f0b429"],
+  fault:    [200, 240, 50, -30,  0,  0.3,  0,     0,   "#f0b429"],
+  offline:  [200, 200, 100, 0,   0,  0,    0,     0,   "#3a4350"],
+};
+let cur = EXPR.idle.slice(0, 8).map(Number), curColor = EXPR.idle[8];
+let blink = 0, nextBlink = performance.now() + 2500, glance = [0, 0], nextGlance = performance.now() + 3000;
+
+function expression() {
+  if (!wsUp || !state) return "offline";
+  if (state.estop) return "estop";
+  if (!state.link) return "offline";
+  if (state.fallen) return "fallen";
+  if (state.imu_fault) return "fault";
+  if (rec || voice.status === "listening") return "listening";
+  if (voice.status === "speaking" || outputLevel() > 0.05) return "speaking";
+  if (voice.status === "thinking") return "thinking";
+  if (state.posture_poor) return "posture";
+  if (state.resting) return "resting";
+  return "idle";
+}
+function roundRect(x, y, w, h, r) {
+  r = Math.max(0, Math.min(r, w / 2, h / 2));
+  g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+}
+function drawEye(cx, cy, p, mirror) {
+  let [w, h, r, gx, gy, lidIn, lidOut, happy] = p;
+  h *= 1 - blink;
+  const x = cx + gx - w / 2, y = cy + gy - h / 2;
+  g.save();
+  roundRect(x, y, w, Math.max(h, 4), r);
+  g.fillStyle = curColor; g.shadowColor = curColor; g.shadowBlur = 40; g.fill();
+  g.shadowBlur = 0; g.fillStyle = "#05070a";
+  // slanted upper lids: lidIn lowers the inner corner (angry), lidOut the outer corner (sad)
+  const inner = mirror ? x : x + w, outer = mirror ? x + w : x;
+  if (lidIn > 0 || lidOut > 0) {
+    g.beginPath();
+    g.moveTo(inner, y - 2 + h * lidIn); g.lineTo(outer, y - 2 + h * lidOut);
+    g.lineTo(outer, y - 60); g.lineTo(inner, y - 60); g.closePath(); g.fill();
+  }
+  if (happy > 0) { // lower lid pushes up in an arc: smiling eyes
+    g.beginPath();
+    g.ellipse(x + w / 2, y + h + h * 0.15, w * 0.75, h * happy, 0, Math.PI, 0, true);
+    g.lineTo(x + w + 40, y + h + 80); g.lineTo(x - 40, y + h + 80); g.closePath(); g.fill();
+  }
+  g.restore();
+}
+function frame(now) {
+  const name = expression(), target = EXPR[name];
+  const level = outputLevel();
+  for (let i = 0; i < 8; i++) cur[i] += (target[i] - cur[i]) * 0.18;
+  curColor = target[8];
+  // blinking and small glances, only when the face is "alive"
+  if (["idle", "listening", "posture", "speaking"].includes(name)) {
+    if (now > nextBlink) { blink = 1; nextBlink = now + 2500 + Math.random() * 3500; }
+    if (now > nextGlance) { glance = name === "idle" ? [(Math.random() - .5) * 120, (Math.random() - .5) * 50] : [0, 0];
+      nextGlance = now + 1500 + Math.random() * 3000; }
+  } else { glance = [0, 0]; }
+  blink = Math.max(0, blink - 0.12);
+  const p = cur.slice();
+  p[3] += glance[0]; p[4] += glance[1];
+  if (name === "speaking") { p[1] *= 1 - level * 0.25; p[4] -= level * 30; }
+  if (name === "listening" && rec) { p[0] += rec.level * 30; p[1] += rec.level * 40; }
+  const tilt = state && state.pitch != null ? Math.max(-12, Math.min(12, state.pitch * 0.4)) : 0;
+
+  g.clearRect(0, 0, W, H);
+  g.save();
+  g.translate(W / 2, H / 2); g.rotate(tilt * Math.PI / 180); g.translate(-W / 2, -H / 2);
+  const bob = name === "idle" ? Math.sin(now / 900) * 6 : 0;
+  drawEye(W / 2 - 250, H / 2 - 20 + bob, p, false);
+  drawEye(W / 2 + 250, H / 2 - 20 + bob, p, true);
+  g.restore();
+
+  g.fillStyle = curColor; g.font = "600 56px system-ui, sans-serif"; g.textAlign = "center";
+  if (name === "thinking") {
+    const n = 1 + Math.floor(now / 350) % 3;
+    g.fillText("• ".repeat(n).trim(), W / 2, H - 90);
+  } else if (name === "resting") {
+    g.globalAlpha = 0.5 + 0.5 * Math.sin(now / 600);
+    g.fillText("z z z", W / 2 + 420, H / 2 - 160);
+    g.globalAlpha = 1;
+  } else if (name === "offline") {
+    g.font = "500 40px system-ui, sans-serif"; g.fillStyle = "#56606d";
+    g.fillText(!wsUp ? "robot software offline" : "controller not answering", W / 2, H - 90);
+  }
+  const talk = document.getElementById("talk");
+  talk.style.setProperty("--level", rec ? rec.level.toFixed(2) : 0);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ------------------------------------------------------------------ panel
+const $ = (id) => document.getElementById(id);
+const dot = (cls) => `<span class="dot ${cls}"></span>`;
+const MODE = { B: "balancing", M: "manual (J)", O: "servos off", F: "fallen" };
+
+function render() {
+  $("s-ws").innerHTML = wsUp ? dot("ok") + "connected" : dot("bad") + "offline";
+  const s = state;
+  const disabled = !wsUp || !s;
+  document.querySelectorAll("[data-cmd]").forEach((b) => { b.disabled = disabled || s.estop; });
+  $("btn-level").disabled = disabled || s.estop;
+  $("talk").disabled = !canTalk() && !rec;
+  $("talk").hidden = !voiceKeys() && !rec;
+  const askOk = canAsk();
+  $("ask-send").disabled = !askOk;
+  document.querySelectorAll("#examples .chip").forEach((b) => { b.disabled = !askOk; });
+  const camBtn = $("btn-cam");
+  camBtn.hidden = !(s && s.camera);
+  camBtn.textContent = cam ? "Camera: on" : "Camera: off";
+  if (cam && !(s && s.camera)) stopCamera();
+  $("talk").classList.toggle("rec", !!rec);
+  const banner = $("banner");
+  banner.className = "";
+  if (!s) { $("s-link").innerHTML = dot("") + "–"; return; }
+
+  $("s-link").innerHTML = s.link ? dot("ok") + (s.banner.replace("READY,", "ESP32 · ") || "connected") : dot("bad") + "not answering";
+  let legs = s.estop ? "E-stop latched" : s.fallen ? "fallen: needs Stand" : s.resting ? "resting" :
+    s.walking ? "walking" : s.standing ? "standing" : "starting…";
+  if (s.mode) legs += ` · ${MODE[s.mode] || s.mode}`;
+  $("s-legs").textContent = legs;
+  const cal = s.calibration;
+  $("s-imu").innerHTML = s.imu_fault ? dot("bad") + "fault" :
+    s.banner === "READY,NOIMU" ? dot("warn") + "not found" :
+    dot(cal.imu_level ? "ok" : "warn") + (cal.imu_level ? "calibrated" : "not level-calibrated");
+  $("s-pitch").textContent = s.pitch == null ? "–" : `${s.pitch.toFixed(1)}°  (${s.rate.toFixed(0)}°/s)`;
+  $("g-pitch").style.left = s.pitch == null ? "50%" : `${50 + Math.max(-45, Math.min(45, s.pitch)) / 90 * 100}%`;
+  $("s-dist").innerHTML = s.tof_missing ? dot("bad") + "sensor missing" : s.distance == null ? "–" :
+    s.distance < 0 ? dot("ok") + "nothing in range" : dot(cal.tof ? "ok" : "warn") + `${s.distance} mm` + (cal.tof ? "" : " (uncal.)");
+  $("s-voice").textContent = rec ? "recording…" : voice.status;
+  $("s-keys").textContent = s.keys.gemini ? "" : "Typed questions need GEMINI_API_KEY in .env (preset examples still get canned answers).";
+
+  const estop = $("estop");
+  estop.classList.toggle("latched", s.estop);
+  estop.textContent = s.estop ? "CLEAR E-STOP" : "EMERGENCY STOP";
+  $("events").textContent = s.events.length ? s.events.slice().reverse().join("\n") : "–";
+
+  if (s.estop) { banner.textContent = "EMERGENCY STOP"; banner.className = "show bad"; }
+  else if (!s.link) { banner.textContent = "Controller not answering"; banner.className = "show bad"; }
+  else if (s.fallen) { banner.textContent = "Fallen: stand me up, then press Stand"; banner.className = "show warn"; }
+  else if (s.imu_fault) { banner.textContent = "IMU fault: legs relaxed"; banner.className = "show warn"; }
+
+  const cap = $("caption");
+  if (voice.error && voice.status !== "listening") cap.innerHTML = `<span class="err">${esc(voice.error)}</span>`;
+  else if (voice.reply || voice.heard) cap.innerHTML = (voice.heard ? `<span class="you">${esc(voice.heard)}</span>` : "") + esc(voice.reply);
+  else cap.textContent = "";
+}
+function esc(t) { const d = document.createElement("div"); d.textContent = t || ""; return d.innerHTML; }
+let toastTimer = 0;
+function toast(text) {
+  const t = $("toast"); t.textContent = text; t.classList.add("show");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 4000);
+}
+
+// ------------------------------------------------------------------ controls
+document.querySelectorAll("[data-cmd]").forEach((b) => b.addEventListener("click", () => send({ type: "cmd", cmd: b.dataset.cmd })));
+$("estop").addEventListener("click", () => send({ type: state && state.estop ? "clear" : "estop" }));
+$("btn-level").addEventListener("click", () => {
+  if (confirm("Level-calibrate the IMU?\n\nHold the robot upright, as it should stand, and keep it still. " +
+              "The servos switch off and stay off until you press Stand.")) send({ type: "cmd", cmd: "calibrate" });
+});
+const talk = $("talk");
+talk.addEventListener("pointerdown", (e) => { e.preventDefault(); talk.setPointerCapture(e.pointerId); startRecording(); });
+talk.addEventListener("pointerup", () => stopRecording());
+talk.addEventListener("pointercancel", () => stopRecording());
+function typing(e) { return ["INPUT", "TEXTAREA"].includes(e.target.tagName); }
+document.addEventListener("keydown", (e) => {
+  if (typing(e)) return;
+  if (e.key === "Escape") { send({ type: "estop" }); return; }
+  if (e.code === "Space" && !e.repeat && voiceKeys()) { e.preventDefault(); startRecording(); }
+  if (e.key === "f" || e.key === "F") toggleFull();
+  if (e.key === "p" || e.key === "P") document.body.classList.toggle("face-only");
+});
+document.addEventListener("keyup", (e) => { if (e.code === "Space" && !typing(e) && rec) { e.preventDefault(); stopRecording(); } });
+$("ask-form").addEventListener("submit", (e) => { e.preventDefault(); ask($("ask-text").value); });
+function toggleFull() {
+  if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen().catch(() => {});
+}
+$("btn-full").addEventListener("click", toggleFull);
+$("btn-panel").addEventListener("click", () => document.body.classList.toggle("face-only"));
+$("btn-cam").addEventListener("click", () => { if (cam) stopCamera(); else startCamera(); });
+$("start").addEventListener("click", () => { ensureAudio(); $("overlay").classList.add("hidden"); });
+if (!window.isSecureContext) {
+  $("overlay-note").textContent = "This page isn't on https:// or localhost, so the browser will block the microphone. " +
+    "Open it through the SSH tunnel: ssh -L 8080:localhost:8080 <pi>, then http://localhost:8080";
+}
+connect();
+render();
+</script>
+</body>
+</html>

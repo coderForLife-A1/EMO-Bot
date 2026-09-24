@@ -11,6 +11,8 @@ def test_main_runs_in_sim_mode(monkeypatch, caplog):
     monkeypatch.setattr(config, "ENABLE_VISION", False)
     monkeypatch.setattr(config, "ENABLE_AUDIO", False)
     monkeypatch.setattr(config, "MQTT_PORT", 1)  # no broker: paho retries quietly in the background
+    monkeypatch.setattr(config, "CONSOLE_PORT", 0)  # any free port: the console starts too
+    monkeypatch.setattr(config, "CALIBRATION_FILE", "/nonexistent/calibration.json")
 
     async def run():
         task = asyncio.create_task(main.main())

@@ -6,7 +6,7 @@
 //   change I2C_SDA_PIN / I2C_SCL_PIN below). Set TOF_ENABLED to 0 to build without the VL53L0X.
 //   Channel 0 = left hip, 1 = right hip, 2 = left knee, 3 = right knee.
 //   Mount the MPU6050 flat on the pelvis with its X arrow pointing forward.
-//   Pi link: the board's USB port (Serial) by default; see LINK_UART2 below for the Pi's GPIO UART.
+//   Pi link: the Pi's GPIO UART on GPIO16/17 (Serial2) by default; see LINK_UART2 below for USB instead.
 // Flash it with arduino-cli (FQBN esp32:esp32:esp32; RUNNING.md, section 4), set it up with the robot held
 // in the air (section 5) and tune it (section 11).
 //
@@ -52,11 +52,12 @@ VL53L0X tof;
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40); // PCA9685_ADDR
 
 // ---------------------------------------------------------------- board
-// Serial link to the Pi. 0 = USB (Serial; CP2102/CH340 on the DevKit, /dev/ttyUSB0 on the Pi).
-// 1 = the Pi's GPIO UART (/dev/serial0) on Serial2, GPIO16 (RX) / GPIO17 (TX): both sides are 3.3 V,
-// so no level shifter, and the ESP32's boot messages stay off the Pi's line. The pins are set
+// Serial link to the Pi. 1 = the Pi's GPIO UART (/dev/serial0) on Serial2, GPIO16 (RX) / GPIO17 (TX):
+// Pi GPIO14/TXD -> GPIO16, GPIO17 -> Pi GPIO15/RXD. Both sides are 3.3 V, so no level shifter, and the
+// ESP32's boot messages stay off the Pi's line (the USB port still flashes the board and shows them).
+// 0 = USB (Serial; CP2102/CH340 on the DevKit, /dev/ttyUSB0 on the Pi). The pins are set
 // explicitly: core 3.x defaults Serial2 to GPIO4/25. WROVER modules use GPIO16/17 for PSRAM: pick others.
-#define LINK_UART2 0
+#define LINK_UART2 1
 #if LINK_UART2
 #define LINK Serial2
 static const int8_t LINK_RX_PIN = 16;

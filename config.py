@@ -47,7 +47,7 @@ TOPIC_DISTANCE = "robot/sensor/distance"  # <mm> from the ESP32's VL53L0X, -1 = 
 TOPIC_VISION_STATE = "robot/vision/state"  # UP / DOWN when the camera starts or stops delivering frames
 
 # Pi <-> controller (ESP32 or Nano) serial link. "sim" logs commands instead of opening a port.
-SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/ttyUSB0")
+SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/serial0")
 SERIAL_BAUD = int(os.getenv("SERIAL_BAUD", "115200"))
 
 # Subsystem switches (the robot keeps running in degraded mode if an optional one fails)
@@ -59,7 +59,34 @@ FACE_DETECTION = _env_bool("FACE_DETECTION", False)
 # Only for bench tests: keep it off on a real robot.
 ALLOW_NO_IMU = _env_bool("ALLOW_NO_IMU", False)
 
-# "picamera2" (Pi CSI camera), a V4L2 path such as "/dev/video0", or a webcam index such as "0"
+# Start with the servos off ("rest") instead of standing up: for bench tests, or a robot that must not move
+# until someone sends "stand" (console button or robot/locomotion/cmd).
+START_RESTING = _env_bool("START_RESTING", False)
+# Poll the ToF sensor this often (seconds) and publish on robot/sensor/distance; 0 = only on request.
+# Backs off to DISTANCE_BACKOFF_S while the controller answers NACK,D,NOTOF.
+DISTANCE_POLL_S = _env_float("DISTANCE_POLL_S", 0.5)
+DISTANCE_BACKOFF_S = _env_float("DISTANCE_BACKOFF_S", 10.0)
+
+# Per-robot sensor calibration written by tools/calibrate_sensors.py (see calibration.py)
+CALIBRATION_FILE = os.getenv("CALIBRATION_FILE", "").strip() or str(REPO_ROOT / "calibration.json")
+
+# Laptop console (console_server.py): a web page that is the robot's face and status display, its
+# microphone (push-to-talk) and its speaker. Default: Pi-only, reached from the laptop through an SSH tunnel
+# (ssh -L 8080:localhost:8080 <pi>), which also counts as a secure origin, so the browser allows the mic.
+# CONSOLE_HOST=0.0.0.0 opens it to the network: that requires CONSOLE_TOKEN, and the mic needs HTTPS
+# (CONSOLE_CERT / CONSOLE_KEY, e.g. from tools/make_console_cert.sh).
+ENABLE_CONSOLE = _env_bool("ENABLE_CONSOLE", True)
+CONSOLE_HOST = os.getenv("CONSOLE_HOST", "127.0.0.1").strip() or "127.0.0.1"
+CONSOLE_PORT = int(os.getenv("CONSOLE_PORT", "").strip() or "8080")
+CONSOLE_TOKEN = os.getenv("CONSOLE_TOKEN", "").strip()
+CONSOLE_CERT = os.getenv("CONSOLE_CERT", "").strip()
+CONSOLE_KEY = os.getenv("CONSOLE_KEY", "").strip()
+# Where the robot's voice plays: "auto" = the console while one is open, else the Pi's speaker (aplay);
+# "console" = only the console; "local" = only aplay.
+AUDIO_OUTPUT = (os.getenv("AUDIO_OUTPUT", "").strip().lower() or "auto")
+
+# "auto" (the first USB webcam, whatever /dev/videoN it gets), "picamera2" (Pi CSI camera),
+# a V4L2 path such as "/dev/video0", a webcam index such as "0", or "console" (the laptop console's webcam)
 CAMERA_SOURCE = os.getenv("CAMERA_SOURCE", "/dev/video0")
 
 # Microphone for sounddevice (name substring or index); empty = system default.
@@ -67,6 +94,9 @@ CAMERA_SOURCE = os.getenv("CAMERA_SOURCE", "/dev/video0")
 AUDIO_INPUT_DEVICE = os.getenv("AUDIO_INPUT_DEVICE", "").strip() or None
 # ALSA playback device for aplay, e.g. "plughw:0"; empty = default
 AUDIO_OUTPUT_DEVICE = os.getenv("AUDIO_OUTPUT_DEVICE", "").strip() or None
+# Which mic the console's talk button records: "robot" = the Pi's own (e.g. the USB webcam's mic, picked
+# automatically unless AUDIO_INPUT_DEVICE says otherwise), "console" = the laptop's, through the browser.
+MIC_SOURCE = os.getenv("MIC_SOURCE", "").strip().lower() or "console"
 
 # Microphone level (RMS of 16-bit samples) that counts as speech after the wake word. Too high = speech is
 # missed; too low = room noise keeps the recording going. "No speech ... loudest RMS" in the log helps tune it.
@@ -119,6 +149,11 @@ LOG_CONVERSATIONS = _env_bool("LOG_CONVERSATIONS", False)
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_TTS_URL = os.getenv("ELEVENLABS_TTS_URL", "https://api.elevenlabs.io/v1/text-to-speech")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
+
+# Typed questions on the console (text in, text out: no speech either way)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
 
 # Budget for the whole Whisper -> LLM (all tiers) -> TTS cascade (playback is not included)
 API_TIMEOUT_SECONDS = _env_float("API_TIMEOUT_SECONDS", 15.0)

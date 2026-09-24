@@ -133,8 +133,19 @@ coverage.xml
 .pytest_cache/
 
 # ========================
+# Per-robot data (tools/calibrate_sensors.py) and console TLS files (tools/make_console_cert.sh)
+# ========================
+calibration.json
+.calibration-*.json
+deploy/certs/
+
+# ========================
 # Local Claude workspace (not shared)
 # ========================
 .claude/
 CLAUDE.md
 docs/
+
+# python robot_mic.py test recording
+mic_test.wav
+.env.bak

@@ -578,8 +578,11 @@ SUBSCRIBED_TOPICS = (
 Deliver = Callable[[str, str], None]
 
 
-def build_mqtt_client(deliver: Deliver) -> mqtt.Client:
+def build_mqtt_client(deliver: Deliver, topics: tuple = SUBSCRIBED_TOPICS) -> mqtt.Client:
     """MQTT client that passes (topic, payload) of every subscribed message to ``deliver``.
+
+    ``topics`` defaults to all of SUBSCRIBED_TOPICS; main.py leaves out the ones its own tasks deliver
+    in-process, so each message is applied exactly once.
 
     ``deliver`` runs on paho's network thread; it must hand the message to the tick thread
     rather than touching SharedState itself.
@@ -588,7 +591,7 @@ def build_mqtt_client(deliver: Deliver) -> mqtt.Client:
 
     def on_connect(client: mqtt.Client, _userdata, _flags, reason_code, _properties) -> None:
         if reason_code == 0:  # failures are logged by mqtt_client.make_client
-            for topic in SUBSCRIBED_TOPICS:
+            for topic in topics:
                 client.subscribe(topic)
 
     def on_message(_client: mqtt.Client, _userdata, msg: mqtt.MQTTMessage) -> None:
