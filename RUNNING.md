@@ -351,7 +351,7 @@ access once.
 | `PORCUPINE_KEYWORD_PATH` | *(built-in "porcupine")* | Custom `.ppn` wake word (Linux aarch64 build for the Pi) |
 | `ELEVENLABS_VOICE_ID` | `EXAVITQu4vr4xnSDxMaL` | Any voice ID from your ElevenLabs library |
 | `CHAT_MODEL` / `WHISPER_MODEL` | `gpt-4o` / `whisper-1` | `CHAT_MODEL` is the cloud reply model: the fallback when `LOCAL_LLM_URL` is set |
-| `LOCAL_LLM_URL` | empty | Laptop Ollama, e.g. `http://192.168.43.20:11434` (section 7a). Empty = cloud replies only |
+| `LOCAL_LLM_URL` | empty | Laptop Ollama, e.g. `http://10.252.137.x:11434` (section 7a). Empty = cloud replies only |
 | `LOCAL_LLM_MODEL` / `LOCAL_LLM_ESCALATE_MODEL` | `gemma4:e4b` / `off` | When the first is unsure, the second local model is asked, or the cloud with `off`. A second local model only helps if both fit in GPU memory together; otherwise each escalation reloads a model (4-7 s). The first must not be a thinking model (the current `qwen3:4b` tag is one: it reasons out loud and takes ~10 s) |
 | `LOCAL_LLM_CONNECT_TIMEOUT` / `LOCAL_LLM_TIMEOUT` | `1` / `5` | Seconds: to connect, and longest wait for the next piece of a reply. Past either, the cloud answers |
 | `LOCAL_LLM_KEEP_ALIVE` / `LOCAL_LLM_CONTEXT` | `30m` / `4096` | How long Ollama keeps the model loaded; context window (Ollama's default for `gemma3:4b` is 131k tokens, which spills onto the CPU of an 8 GB GPU). The model is loaded at start-up and again after an escalation |
@@ -383,8 +383,8 @@ a phone hotspot). Speech to text stays on the cloud API.
 1. Laptop: `ollama pull gemma4:e4b`.
 2. Laptop: `setx OLLAMA_HOST 0.0.0.0:11434`, then quit and restart Ollama so it listens on the network.
 3. Laptop: set the hotspot network to **Private** in Windows, and allow TCP 11434 only from the hotspot's subnet
-   (Ollama has no login: anyone who can reach the port can use it). Admin PowerShell, for a `192.168.43.x` hotspot:
-   `New-NetFirewallRule -DisplayName "Ollama (robot)" -Direction Inbound -Protocol TCP -LocalPort 11434 -RemoteAddress 192.168.43.0/24 -Profile Private -Action Allow`
+   (Ollama has no login: anyone who can reach the port can use it). Admin PowerShell, using the subnet the Pi reports (`ip -4 addr show wlan0`; e.g. `10.252.137.0/24`):
+   `New-NetFirewallRule -DisplayName "Ollama (robot)" -Direction Inbound -Protocol TCP -LocalPort 11434 -RemoteAddress 10.252.137.0/24 -Profile Private -Action Allow`
 4. Pi: `curl http://<laptop-ip>:11434/api/tags` should list the models.
 5. Pi `.env`: `LOCAL_LLM_URL=http://<laptop-ip>:11434`.
 6. Pi: set the timezone (`sudo timedatectl set-timezone Asia/Kolkata`); the model is told the Pi's local time.
