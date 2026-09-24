@@ -41,7 +41,7 @@ from api_routing_task import (
     LOCAL_SPEAKER,
     MAX_QUESTION_CHARS,
     LocalSpeaker,
-    listen_with_gemini,
+    can_listen,
 )
 from frame_mailbox import CONSOLE_FRAMES, MAX_FRAME_BYTES
 from netutil import is_local_host
@@ -216,8 +216,8 @@ class Console:
             "voice": self.voice,
             "events": [f"{t} {line}" for t, line in list(st.events)[-8:]],
             "keys": {"openai": bool(config.OPENAI_API_KEY), "elevenlabs": bool(config.ELEVENLABS_API_KEY),
-                     "gemini": bool(config.GEMINI_API_KEY)},
-            "can_listen": listen_with_gemini() or bool(config.OPENAI_API_KEY and config.ELEVENLABS_API_KEY),
+                     "gemini": bool(config.GEMINI_API_KEY), "stt": bool(config.STT_URL)},
+            "can_listen": can_listen(),
             "robot_mic": self.mic is not None,
             "mic_level": round(self.mic.level, 2) if self.mic is not None and self.mic.recording else 0,
             "calibration": {

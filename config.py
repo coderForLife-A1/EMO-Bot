@@ -153,8 +153,14 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_TTS_URL = os.getenv("ELEVENLABS_TTS_URL", "https://api.elevenlabs.io/v1/text-to-speech")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 
+# Speech to text on the laptop (tools/laptop_stt.py), e.g. http://10.252.137.20:8765/v1: the recording stays on the
+# local network instead of going over the phone's mobile data. Tried first; if it can't be reached, OpenAI Whisper
+# (OPENAI_API_KEY) or Gemini is used. Empty = cloud only.
+STT_URL = os.getenv("STT_URL", "").strip().rstrip("/")
+STT_TIMEOUT_SECONDS = _env_float("STT_TIMEOUT_SECONDS", 5.0)  # an 8 s recording takes well under 1 s on the GPU
+
 # Gemini: the cloud reply model (CLOUD_LLM=gemini), typed questions on the console, and speech to text
-# when OPENAI_API_KEY is empty
+# when neither STT_URL nor OPENAI_API_KEY can do it
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")

@@ -1,9 +1,10 @@
-"""Speech pipeline: Whisper (speech to text) -> reply (llm_client: laptop LLM, cloud fallback)
+"""Speech pipeline: speech to text -> reply (llm_client: laptop LLM, cloud fallback)
 -> ElevenLabs (text to speech) -> aplay.
 
+Speech to text: the laptop's Whisper (STT_URL, tools/laptop_stt.py) first, then OpenAI Whisper, then Gemini.
 Typed questions from the console (ASK_JOB) go to Gemini instead and the answer is shown as plain text,
-with no speech either way. Without the Whisper/ElevenLabs keys, spoken questions (LISTEN_JOB) go to Gemini
-too: it transcribes the recording and answers in one call, and both are shown as text.
+with no speech either way. Without the ElevenLabs key, spoken questions (LISTEN_JOB) are answered the same
+way: what was heard and the reply are both shown as text.
 The preset EXAMPLES have canned answers used when Gemini can't be reached.
 
 Also speaks short cues from the behavior tree ("I fell over", posture reminder), caching them.
@@ -68,24 +69,51 @@ EXAMPLES: dict[str, str] = {
 _phrase_cache: dict[str, bytes] = {}
 
 
-async def _transcribe(client: httpx.AsyncClient, wav_bytes: bytes) -> str:
-    require_https(config.OPENAI_BASE_URL)
+class NoSpeech(RuntimeError):
+    """The recording had no words in it (silence, noise, or a Whisper phantom phrase)."""
+
+
+async def _whisper(client: httpx.AsyncClient, wav_bytes: bytes, base_url: str, headers: dict,
+                   request_timeout=httpx.USE_CLIENT_DEFAULT) -> str:
+    """OpenAI's /audio/transcriptions request; the laptop server (tools/laptop_stt.py) takes the same one."""
     data = {"model": config.WHISPER_MODEL, "temperature": "0"}
     if config.WHISPER_LANGUAGE:
         data["language"] = config.WHISPER_LANGUAGE  # no guessing the language from a few words
     if config.WHISPER_PROMPT:
         data["prompt"] = config.WHISPER_PROMPT  # spelling/vocabulary hint, e.g. the robot's name
     response = await client.post(
-        f"{config.OPENAI_BASE_URL}/audio/transcriptions",
-        headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
+        f"{base_url}/audio/transcriptions",
+        headers=headers,
         files={"file": ("speech.wav", wav_bytes, "audio/wav")},
         data=data,
+        timeout=request_timeout,
     )
     response.raise_for_status()
     text = str(response.json().get("text", "")).strip()
     if text.lower() in WHISPER_PHANTOMS:
-        raise RuntimeError(f"Whisper heard no speech ({text!r})")
+        raise NoSpeech(f"Whisper heard no speech ({text!r})")
     return text
+
+
+async def _transcribe(client: httpx.AsyncClient, wav_bytes: bytes) -> str:
+    """Laptop Whisper (STT_URL) -> OpenAI Whisper -> Gemini. Raises NoSpeech if nothing was said."""
+    if config.STT_URL:
+        require_https(config.STT_URL, allow_lan=True)  # no key sent; plain http only on the local network
+        try:
+            return await _whisper(client, wav_bytes, config.STT_URL, {}, httpx.Timeout(
+                config.STT_TIMEOUT_SECONDS, connect=config.LOCAL_LLM_CONNECT_TIMEOUT))
+        except httpx.HTTPError as exc:
+            if not (config.OPENAI_API_KEY or config.GEMINI_API_KEY):
+                raise
+            logger.warning("Laptop speech to text failed (%r); using the cloud", exc)
+    if config.OPENAI_API_KEY:
+        require_https(config.OPENAI_BASE_URL)
+        return await _whisper(client, wav_bytes, config.OPENAI_BASE_URL,
+                              {"Authorization": f"Bearer {config.OPENAI_API_KEY}"})
+    heard = await _hear_gemini(client, wav_bytes)
+    if not heard:
+        raise NoSpeech(f"{config.GEMINI_MODEL} heard no speech")
+    return heard
 
 
 def plain_text(text: str) -> str:
@@ -133,10 +161,14 @@ async def _hear_gemini(client: httpx.AsyncClient, wav_bytes: bytes) -> str:
     return " ".join(str(data.get("heard", "")).split())
 
 
-def listen_with_gemini() -> bool:
-    """Spoken questions are transcribed by Gemini and answered as text (no voice) unless the Whisper and
-    ElevenLabs keys are both set."""
-    return bool(config.GEMINI_API_KEY) and not (config.OPENAI_API_KEY and config.ELEVENLABS_API_KEY)
+def can_listen() -> bool:
+    """Something can turn speech into text: the laptop, OpenAI Whisper or Gemini."""
+    return bool(config.STT_URL or config.OPENAI_API_KEY or config.GEMINI_API_KEY)
+
+
+def listen_as_text() -> bool:
+    """Spoken questions are answered as text on the display (no voice) when there is no ElevenLabs key."""
+    return can_listen() and not config.ELEVENLABS_API_KEY
 
 
 async def _reply(client: httpx.AsyncClient, transcript: str) -> str:
@@ -150,8 +182,9 @@ async def _reply(client: httpx.AsyncClient, transcript: str) -> str:
 
 
 async def _hear_and_reply(client: httpx.AsyncClient, wav_bytes: bytes, sink: "LocalSpeaker") -> bool:
-    heard = await _hear_gemini(client, wav_bytes)
-    if not heard:
+    try:
+        heard = await _transcribe(client, wav_bytes)
+    except NoSpeech:
         return False
     sink.event("heard", heard)
     sink.event("reply", await _reply(client, heard))
@@ -280,8 +313,10 @@ LOCAL_SPEAKER = LocalSpeaker()
 
 
 def _missing_keys(kind: str = LISTEN_JOB) -> list[str]:
-    needed = ("OPENAI_API_KEY", "ELEVENLABS_API_KEY") if kind == LISTEN_JOB else ("ELEVENLABS_API_KEY",)
-    return [name for name in needed if not getattr(config, name)]
+    missing = [] if config.ELEVENLABS_API_KEY else ["ELEVENLABS_API_KEY"]
+    if kind == LISTEN_JOB and not can_listen():
+        missing.append("STT_URL, OPENAI_API_KEY or GEMINI_API_KEY")
+    return missing
 
 
 async def _cascade(client: httpx.AsyncClient, wav_bytes: bytes, sink: LocalSpeaker) -> bytes:
@@ -368,7 +403,7 @@ async def api_routing_task(
             try:
                 if kind == ASK_JOB:
                     await handle_ask(client, value, sink)
-                elif kind == LISTEN_JOB and listen_with_gemini():
+                elif kind == LISTEN_JOB and listen_as_text():
                     await handle_heard(client, value, sink)
                 else:
                     await handle_job(client, kind, value, sink)

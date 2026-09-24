@@ -74,7 +74,7 @@ keeps the robot safe even if the Pi stalls.
 | `calibration.py` | **Per-robot sensor calibration** in `calibration.json`: ToF straight-line fit (applied to every distance), IMU level offset copy, pitch-sign check, noise figures. Atomic writes; a bad file falls back to "uncalibrated". |
 | `frame_mailbox.py` | Latest-frame hand-off from the console's webcam to the vision thread (`CAMERA_SOURCE=console`). |
 | `api_routing_task.py` | **Speech pipeline.** Whisper (speech → text) → reply (`llm_client.py`) → ElevenLabs (text → speech) → speaker. Also speaks the robot's cues ("I fell over"). Plays a fallback beep on any failure. `python api_routing_task.py "Hello"` checks keys and speaker. |
-| `llm_client.py` | **Reply model.** `gemma4:e4b` on the laptop's Ollama (streamed over Wi-Fi) answers first; if it replies `ESCALATE`, refuses or returns nothing, the cloud model is asked (Gemini by default, `CLOUD_LLM`; or a second local model, `LOCAL_LLM_ESCALATE_MODEL`); if the laptop can't answer, the cloud does. Without an OpenAI key, Gemini also does the speech to text. Every prompt carries the current date and time and the last 3 exchanges (forgotten after 2 min of quiet), so follow-up questions work. Reply only: it never controls the robot. |
+| `llm_client.py` | **Reply model.** `gemma4:e4b` on the laptop's Ollama (streamed over Wi-Fi) answers first; if it replies `ESCALATE`, refuses or returns nothing, the cloud model is asked (Gemini by default, `CLOUD_LLM`; or a second local model, `LOCAL_LLM_ESCALATE_MODEL`); if the laptop can't answer, the cloud does. Speech to text: the laptop's Whisper (`STT_URL`) first, then OpenAI Whisper, then Gemini. Every prompt carries the current date and time and the last 3 exchanges (forgotten after 2 min of quiet), so follow-up questions work. Reply only: it never controls the robot. |
 
 ### Microcontroller firmware
 
@@ -89,6 +89,7 @@ keeps the robot safe even if the Pi stalls.
 | --- | --- |
 | `tools/sim_nano.py` | **Simulated controller.** Compiles the real firmware (ESP32 by default, `--firmware nano` for the Nano) for your PC, runs it against a simulated robot (laggy servos, noisy IMU) and serves it as a serial port on `socket://127.0.0.1:7777`. Type `tilt 8` or `tilt 70 200` to put it on a slope or knock it over. Needs `g++`. |
 | `tools/leg_test.py` | **One-leg bench test.** Moves one leg's hip and knee through the ESP32 with raw servo moves (no IMU, MQTT or Pi software needed): straight leg, stance, sweeps, steps in the air, and an interactive prompt to find each servo's trim and direction. `python tools/leg_test.py --side left demo`. |
+| `tools/laptop_stt.py` | **Laptop speech to text.** faster-whisper on the laptop's GPU behind OpenAI's `/v1/audio/transcriptions` request, so the Pi's recording stays on the local network (`STT_URL`, RUNNING.md 7a). |
 | `tools/calibrate_sensors.py` | **Sensor calibration** (RUNNING.md 5b): `status`, `imu` (noise), `imu-sign`, `imu-level` (stores `C` with sanity checks), `tof --target-mm N --save` (offset/scale fit). Never moves a servo. |
 | `tools/make_console_cert.sh` | Self-signed HTTPS certificate and `.env` lines for a console reachable from the network. |
 | `assets/network_error.wav` | Three descending beeps, played when the cloud speech pipeline fails. |

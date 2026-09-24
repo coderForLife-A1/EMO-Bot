@@ -389,6 +389,7 @@ access once.
 | `CLOUD_LLM` | `gemini` | Cloud reply model, used when `LOCAL_LLM_URL` is empty or the laptop can't answer: `gemini` = `GEMINI_MODEL`, `openai` = `CHAT_MODEL` |
 | `CHAT_MODEL` / `WHISPER_MODEL` | `gpt-4o` / `whisper-1` | OpenAI reply model (only with `CLOUD_LLM=openai`); Whisper speech to text |
 | `LOCAL_LLM_URL` | empty | Laptop Ollama, e.g. `http://10.252.137.x:11434` (section 7a). Empty = cloud replies only |
+| `STT_URL` / `STT_TIMEOUT_SECONDS` | empty / `5` | Laptop speech to text (`tools/laptop_stt.py`), e.g. `http://10.252.137.x:8765/v1` (section 7a). Tried first; unreachable = OpenAI Whisper, then Gemini |
 | `LOCAL_LLM_MODEL` / `LOCAL_LLM_ESCALATE_MODEL` | `gemma4:e4b` / `off` | When the first is unsure, the second local model is asked, or the cloud with `off`. A second local model only helps if both fit in GPU memory together; otherwise each escalation reloads a model (4-7 s). The first must not be a thinking model (the current `qwen3:4b` tag is one: it reasons out loud and takes ~10 s) |
 | `LOCAL_LLM_CONNECT_TIMEOUT` / `LOCAL_LLM_TIMEOUT` | `1` / `5` | Seconds: to connect, and longest wait for the next piece of a reply. Past either, the cloud answers |
 | `LOCAL_LLM_KEEP_ALIVE` / `LOCAL_LLM_CONTEXT` | `30m` / `4096` | How long Ollama keeps the model loaded; context window (Ollama's default for `gemma3:4b` is 131k tokens, which spills onto the CPU of an 8 GB GPU). The model is loaded at start-up and again after an escalation |
@@ -421,22 +422,28 @@ access once.
 
 Never commit `.env` (it is in `.gitignore`).
 
-### 7a. Laptop LLM over Wi-Fi (optional)
+### 7a. Laptop LLM and speech to text over Wi-Fi (optional)
 
-The reply model runs on a laptop with Ollama; the Pi streams replies from it over a shared network (for example
-a phone hotspot). Speech to text stays on the cloud API.
+The reply model (Ollama) and speech to text (faster-whisper) run on a laptop's GPU; the Pi reaches both over a
+shared network (for example a phone hotspot). The recording then never goes over the phone's mobile data, which
+is too slow and lossy to upload it reliably.
 
 1. Laptop: `ollama pull gemma4:e4b`.
 2. Laptop: `setx OLLAMA_HOST 0.0.0.0:11434`, then quit and restart Ollama so it listens on the network.
 3. Laptop: set the hotspot network to **Private** in Windows, and allow TCP 11434 only from the hotspot's subnet
    (Ollama has no login: anyone who can reach the port can use it). Admin PowerShell, using the subnet the Pi reports (`ip -4 addr show wlan0`; e.g. `10.252.137.0/24`):
    `New-NetFirewallRule -DisplayName "Ollama (robot)" -Direction Inbound -Protocol TCP -LocalPort 11434 -RemoteAddress 10.252.137.0/24 -Profile Private -Action Allow`
-4. Pi: `curl http://<laptop-ip>:11434/api/tags` should list the models.
-5. Pi `.env`: `LOCAL_LLM_URL=http://<laptop-ip>:11434`.
-6. Pi: set the timezone (`sudo timedatectl set-timezone Asia/Kolkata`); the model is told the Pi's local time.
+4. Laptop, speech to text: `pip install faster-whisper nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"` in the venv,
+   then `python tools/laptop_stt.py` (first run downloads `large-v3-turbo`, ~1.6 GB; ~1 GB of GPU memory).
+   Same firewall rule for its port:
+   `New-NetFirewallRule -DisplayName "EMO speech to text" -Direction Inbound -Protocol TCP -LocalPort 8765 -RemoteAddress 10.252.137.0/24 -Profile Private -Action Allow`
+5. Pi: `curl http://<laptop-ip>:11434/api/tags` should list the models; `curl http://<laptop-ip>:8765/health`
+   should name the Whisper model.
+6. Pi `.env`: `LOCAL_LLM_URL=http://<laptop-ip>:11434` and `STT_URL=http://<laptop-ip>:8765/v1`.
+7. Pi: set the timezone (`sudo timedatectl set-timezone Asia/Kolkata`); the model is told the Pi's local time.
 
 A phone hotspot may hand out a new IP on reconnect. If the laptop can't be reached the cloud model answers,
-so nothing breaks; update `LOCAL_LLM_URL` (or use `http://<laptop-name>.local:11434` if mDNS resolves on the Pi).
+so nothing breaks; update `LOCAL_LLM_URL` and `STT_URL` (or use `<laptop-name>.local` if mDNS resolves on the Pi).
 
 ---
 
@@ -723,5 +730,5 @@ A remote *Python* client using this repo's code sets `MQTT_HOST=<pi-address>`, `
 
 The API keys in `.env` are only ever sent over HTTPS: an `http://` `OPENAI_BASE_URL` or `ELEVENLABS_TTS_URL`
 is refused unless it points at this machine (`localhost` or any loopback address). Cached phrases need no
-request, so they still play. `LOCAL_LLM_URL` gets no API key; it may use plain `http://` only to a private-network
-IP or a `.local` name, so a transcript never crosses the internet unencrypted.
+request, so they still play. `LOCAL_LLM_URL` and `STT_URL` get no API key; they may use plain `http://` only to a
+private-network IP or a `.local` name, so a transcript or recording never crosses the internet unencrypted.

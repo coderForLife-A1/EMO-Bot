@@ -34,6 +34,8 @@ def env(monkeypatch):
     monkeypatch.setattr(config, "ELEVENLABS_TTS_URL", "https://api.elevenlabs.io/v1/text-to-speech")
     monkeypatch.setattr(config, "LOCAL_LLM_URL", "")  # cloud reply path; the laptop LLM is in test_llm_client.py
     monkeypatch.setattr(config, "CLOUD_LLM", "openai")
+    monkeypatch.setattr(config, "STT_URL", "")
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "")
     api._phrase_cache.clear()
     llm_client.clear_history()
     played = []  # (source, data): source "-" means WAV bytes piped to aplay's stdin
@@ -342,6 +344,9 @@ def gemini(monkeypatch):
     monkeypatch.setattr(config, "GEMINI_MODEL", "gemini-test")
     monkeypatch.setattr(config, "CLOUD_LLM", "gemini")
     monkeypatch.setattr(config, "LOCAL_LLM_URL", "")
+    monkeypatch.setattr(config, "STT_URL", "")
+    monkeypatch.setattr(config, "OPENAI_API_KEY", "")
+    monkeypatch.setattr(config, "ELEVENLABS_API_KEY", "")
     llm_client.clear_history()
 
     async def no_sleep(_):
@@ -405,10 +410,15 @@ def test_ask_job_releases_busy_after_answer(gemini):
     assert not busy.is_set()
 
 
-def heard_client(requests, heard, laptop=None):
-    """Gemini transcribes (audio in -> {"heard"}) and answers text; ``laptop``: Ollama NDJSON reply bytes."""
+def heard_client(requests, heard, laptop=None, stt=None):
+    """Gemini transcribes (audio in -> {"heard"}) and answers text; ``laptop``: Ollama NDJSON reply bytes;
+    ``stt``: what the laptop's Whisper hears (None = unreachable)."""
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+        if request.url.path.endswith("/audio/transcriptions"):
+            if stt is None:
+                raise httpx.ConnectError("laptop unreachable")
+            return httpx.Response(200, json={"text": stt})
         if request.url.path.endswith("/api/chat"):
             if laptop is None:
                 raise httpx.ConnectError("laptop unreachable")
@@ -422,11 +432,11 @@ def heard_client(requests, heard, laptop=None):
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
-def run_listen(requests, sink, heard, laptop=None):
+def run_listen(requests, sink, heard, laptop=None, stt=None):
     async def main():
         queue = asyncio.Queue()
         await queue.put((api.LISTEN_JOB, wav_bytes()))
-        async with heard_client(requests, heard, laptop) as client:
+        async with heard_client(requests, heard, laptop, stt) as client:
             task = asyncio.create_task(api.api_routing_task(queue, client=client, sink=sink))
             await queue.join()
             task.cancel()
@@ -477,5 +487,50 @@ def test_heard_silence_is_an_error_not_a_question(gemini):
     assert not any(kind == "reply" for kind, _ in sink.events)
 
 
+def test_heard_speech_goes_to_the_laptop_whisper_first(gemini, monkeypatch):
+    monkeypatch.setattr(config, "STT_URL", "http://10.252.137.20:8765/v1")
+    requests, sink = [], RecordingSink()
+    run_listen(requests, sink, "never used", stt="what is the capital of Japan")
+    stt, answer = requests
+    assert str(stt.url) == "http://10.252.137.20:8765/v1/audio/transcriptions"
+    assert b"RIFF" in stt.content
+    assert "authorization" not in stt.headers  # no key ever goes to the laptop
+    assert json.loads(answer.content)["contents"][-1]["parts"][0]["text"] == "what is the capital of Japan"
+    assert ("heard", "what is the capital of Japan") in sink.events
+    assert ("reply", "It is Tokyo.") in sink.events
+
+
+def test_unreachable_laptop_whisper_falls_back_to_gemini(gemini, monkeypatch):
+    monkeypatch.setattr(config, "STT_URL", "http://10.252.137.20:8765/v1")
+    requests, sink = [], RecordingSink()
+    run_listen(requests, sink, "what is the capital of Japan")
+    assert [r.url.path.rsplit("/", 1)[-1] for r in requests] == [
+        "transcriptions", "gemini-test:generateContent", "gemini-test:generateContent"]
+    assert ("reply", "It is Tokyo.") in sink.events
+
+
+def test_laptop_whisper_phantom_is_no_speech(gemini, monkeypatch):
+    monkeypatch.setattr(config, "STT_URL", "http://10.252.137.20:8765/v1")
+    requests, sink = [], RecordingSink()
+    run_listen(requests, sink, "never used", stt="Thanks for watching!")
+    assert len(requests) == 1  # not retried in the cloud, not answered
+    assert any(kind == "error" and "didn't catch" in text for kind, text in sink.events)
+
+
+def test_public_http_stt_url_is_refused(gemini, monkeypatch):
+    monkeypatch.setattr(config, "STT_URL", "http://8.8.8.8:8765/v1")
+    requests, sink = [], RecordingSink()
+    run_listen(requests, sink, "never used", stt="hello")
+    assert requests == []
+    assert any(kind == "error" and "https" in text for kind, text in sink.events)
+
+
+def test_laptop_whisper_alone_can_listen(gemini, monkeypatch):
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "")
+    assert not api.can_listen()
+    monkeypatch.setattr(config, "STT_URL", "http://10.252.137.20:8765/v1")
+    assert api.can_listen() and api.listen_as_text()
+
+
 def test_whisper_path_still_used_when_voice_keys_are_set(gemini, env):
-    assert not api.listen_with_gemini()
+    assert not api.listen_as_text()
