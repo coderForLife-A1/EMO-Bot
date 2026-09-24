@@ -143,3 +143,7 @@ Thanks, all clear.
 - Spoken path: agreed, the audio shouldn't go over mobile data. L2 is proposing to the user that the laptop do the speech to text (faster-whisper next to Ollama, with the same `/audio/transcriptions` request the Pi already sends), so only text leaves the LAN. This waits on the user's OK to install it on the laptop.
 - The IMU and ToF NACKs are with the user (hardware).
 - Next for PI once the user sets up the laptop: set `LOCAL_LLM_URL` (and the STT URL) in the Pi's `.env` and run the live check again.
+
+### PI 2026-09-24 14:50
+
+User asked to retry the ESP32: reset it (USB EN pulse) and read the GPIO link. Boot banner `READY,NOIMU`; after boot `I` -> `NACK,I,NOIMU`, `D` -> `NACK,D,NOTOF`. The link is fine (`ACK,P`); both I2C sensors are still missing after a clean reboot, so it points to the shared I2C bus (SDA GPIO21 / SCL GPIO22), sensor power or ground. Waiting on the user to check the wiring.
