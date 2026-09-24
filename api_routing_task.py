@@ -30,6 +30,14 @@ SAY_JOB = "say"  # (SAY_JOB, text): speak a fixed phrase (behavior tree cues)
 TTS_OUTPUT_FORMAT = "pcm_16000"
 TTS_SAMPLE_RATE = 16_000
 
+# What Whisper tends to invent from near-silent audio (YouTube-subtitle phrases); treated as "nothing heard"
+# ("thank you" and "bye" are real things to say to a robot, so they are kept)
+WHISPER_PHANTOMS = {
+    "", "you", "you.", "thanks for watching", "thanks for watching!", "thank you for watching",
+    "thank you for watching.", "thank you for watching!", "thank you so much for watching!",
+    "please subscribe", "please subscribe.", ".", "...",
+}
+
 _phrase_cache: dict[str, bytes] = {}
 
 
@@ -39,16 +47,21 @@ def _missing_keys() -> list[str]:
 
 async def _transcribe(client: httpx.AsyncClient, wav_bytes: bytes) -> str:
     require_https(config.OPENAI_BASE_URL)
+    data = {"model": config.WHISPER_MODEL, "temperature": "0"}
+    if config.WHISPER_LANGUAGE:
+        data["language"] = config.WHISPER_LANGUAGE  # no guessing the language from a few words
+    if config.WHISPER_PROMPT:
+        data["prompt"] = config.WHISPER_PROMPT  # spelling/vocabulary hint, e.g. the robot's name
     response = await client.post(
         f"{config.OPENAI_BASE_URL}/audio/transcriptions",
         headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
         files={"file": ("speech.wav", wav_bytes, "audio/wav")},
-        data={"model": config.WHISPER_MODEL},
+        data=data,
     )
     response.raise_for_status()
     text = str(response.json().get("text", "")).strip()
-    if not text:
-        raise RuntimeError("Whisper returned empty text")
+    if text.lower() in WHISPER_PHANTOMS:
+        raise RuntimeError(f"Whisper heard no speech ({text!r})")
     return text
 
 

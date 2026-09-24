@@ -1,4 +1,7 @@
-"""Wake-word listener: Porcupine hears the wake word, then 5 s of speech is recorded to a WAV file.
+"""Wake-word listener: Porcupine hears the wake word, then speech is recorded until the user stops talking.
+
+Recording ends after END_SILENCE_SECONDS of quiet once speech started, or at RECORD_SECONDS at most.
+If nobody speaks within NO_SPEECH_SECONDS nothing is sent, so Whisper never transcribes silence.
 
 Publishes robot/audio/wake_flag=1 so the robot stands still, and hands the recording to
 api_routing_task. Run standalone with `python audio_trigger_task.py` to test the microphone.
@@ -12,6 +15,7 @@ import threading
 import wave
 from typing import Optional
 
+import numpy as np
 import paho.mqtt.client as mqtt
 
 import config
@@ -22,7 +26,9 @@ logger = logging.getLogger(__name__)
 SAMPLE_RATE = 16_000
 CHANNELS = 1
 SAMPLE_WIDTH_BYTES = 2
-RECORD_SECONDS = 5
+RECORD_SECONDS = 8  # longest recording
+NO_SPEECH_SECONDS = 3.0  # nobody spoke by then: give up
+END_SILENCE_SECONDS = 0.8  # this much quiet after speech ends the recording
 
 LISTEN_JOB = "listen"  # must match api_routing_task.LISTEN_JOB (kept here to avoid importing httpx)
 
@@ -54,15 +60,42 @@ def _write_wav_to_memory(samples: bytes) -> bytes:
     return wav_buffer.getvalue()
 
 
-def _record_after_wake(stream, frame_length: int) -> bytes:
-    """Record RECORD_SECONDS of audio and return it as WAV bytes (kept in memory, never on disk)."""
-    remaining = SAMPLE_RATE * RECORD_SECONDS
+def _rms(chunk: bytes) -> float:
+    samples = np.frombuffer(chunk, dtype="<i2").astype(np.float32)
+    return float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
+
+
+def _record_after_wake(stream, frame_length: int) -> Optional[bytes]:
+    """Record until the user stops talking and return WAV bytes (kept in memory, never on disk).
+
+    Returns None if nobody spoke within NO_SPEECH_SECONDS. A frame counts as speech when its RMS level
+    reaches config.SPEECH_RMS_THRESHOLD.
+    """
+    max_frames = SAMPLE_RATE * RECORD_SECONDS
+    no_speech_frames = int(SAMPLE_RATE * NO_SPEECH_SECONDS)
+    end_silence_frames = int(SAMPLE_RATE * END_SILENCE_SECONDS)
     recorded = bytearray()
-    while remaining > 0:
-        frames_to_read = min(frame_length, remaining)
+    total = quiet = 0
+    heard = False
+    loudest = 0.0
+    while total < max_frames:
+        frames_to_read = min(frame_length, max_frames - total)
         audio_chunk, _overflowed = stream.read(frames_to_read)
         recorded.extend(audio_chunk)
-        remaining -= frames_to_read
+        total += frames_to_read
+        level = _rms(audio_chunk)
+        loudest = max(loudest, level)
+        if level >= config.SPEECH_RMS_THRESHOLD:
+            heard, quiet = True, 0
+        else:
+            quiet += frames_to_read
+        if heard and quiet >= end_silence_frames:
+            break
+        if not heard and total >= no_speech_frames:
+            logger.info("No speech after the wake word (loudest RMS %.0f, threshold %.0f)",
+                        loudest, config.SPEECH_RMS_THRESHOLD)
+            return None
+    logger.debug("Recorded %.1f s (loudest RMS %.0f)", total / SAMPLE_RATE, loudest)
     return _write_wav_to_memory(bytes(recorded))
 
 
@@ -113,7 +146,7 @@ async def audio_trigger_task(
     llm_processing_queue: asyncio.Queue,
     busy_event: Optional[threading.Event] = None,
 ) -> None:
-    """Wake word -> record 5 s -> queue (LISTEN_JOB, wav_bytes) for api_routing_task.
+    """Wake word -> record until quiet -> queue (LISTEN_JOB, wav_bytes) for api_routing_task.
 
     ``busy_event`` stays set from the wake word until api_routing_task has finished replying.
     """
@@ -138,9 +171,13 @@ async def audio_trigger_task(
 
             kind, value = getter.result()
             if kind == "wake":
-                logger.info("Wake word detected; recording %ss", RECORD_SECONDS)
+                logger.info("Wake word detected; recording (up to %ss)", RECORD_SECONDS)
                 mqtt_client.publish(config.TOPIC_WAKE_FLAG, "1", qos=0, retain=False)
                 publish_state(mqtt_client, "listening")
+            elif value is None:  # nobody spoke: end the conversation here, nothing to send
+                mqtt_client.publish(config.TOPIC_WAKE_FLAG, "0", qos=0, retain=False)
+                publish_state(mqtt_client, "no_speech")
+                busy_event.clear()
             else:
                 publish_state(mqtt_client, "processing")
                 await llm_processing_queue.put((LISTEN_JOB, value))
@@ -161,7 +198,7 @@ async def _standalone() -> None:
     try:
         while True:
             _, wav_bytes = await jobs.get()
-            print(f"Recorded {len(wav_bytes)} bytes of WAV")
+            print(f"Recorded {len(wav_bytes)} bytes of WAV")  # silence is logged instead, never queued
             busy.clear()
     finally:
         task.cancel()

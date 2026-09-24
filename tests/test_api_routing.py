@@ -12,6 +12,7 @@ import pytest
 import api_routing_task as api
 import audio_trigger_task
 import config
+import llm_client
 
 
 def wav_bytes(frames=1600):
@@ -32,6 +33,7 @@ def env(monkeypatch):
     monkeypatch.setattr(config, "ELEVENLABS_TTS_URL", "https://api.elevenlabs.io/v1/text-to-speech")
     monkeypatch.setattr(config, "LOCAL_LLM_URL", "")  # cloud reply path; the laptop LLM is in test_llm_client.py
     api._phrase_cache.clear()
+    llm_client.clear_history()
     played = []  # (source, data): source "-" means WAV bytes piped to aplay's stdin
 
     async def fake_aplay(source, data=None):
@@ -175,15 +177,110 @@ def test_conversation_text_is_not_logged_at_info(env, caplog):
     assert "hi robot" not in caplog.text and "Hello!" not in caplog.text
 
 
+class FakeMic:
+    """sounddevice stand-in: plays a script of (seconds, amplitude) segments, then silence."""
+    def __init__(self, *segments):
+        self.samples = []
+        for seconds, amplitude in segments:
+            n = int(audio_trigger_task.SAMPLE_RATE * seconds)
+            self.samples += [amplitude if i % 2 else -amplitude for i in range(n)]  # square wave: RMS = amplitude
+
+    def read(self, n):
+        chunk, self.samples = self.samples[:n], self.samples[n:]
+        chunk += [0] * (n - len(chunk))
+        return b"".join(int(v).to_bytes(2, "little", signed=True) for v in chunk), False
+
+
+def recorded_seconds(data):
+    with wave.open(io.BytesIO(data)) as w:
+        return w.getnframes() / w.getframerate()
+
+
 def test_recording_stays_in_memory():
     """#25: the recording is returned as WAV bytes, not written to /dev/shm."""
-    class Stream:
-        def read(self, n):
-            return b"\x01\x00" * n, False
-
-    data = audio_trigger_task._record_after_wake(Stream(), 512)
+    data = audio_trigger_task._record_after_wake(FakeMic((1.0, 3000)), 512)
     with wave.open(io.BytesIO(data)) as w:
-        assert w.getnframes() == audio_trigger_task.SAMPLE_RATE * audio_trigger_task.RECORD_SECONDS
+        assert (w.getframerate(), w.getnchannels()) == (16000, 1)
+
+
+def test_recording_stops_when_the_user_stops_talking(monkeypatch):
+    monkeypatch.setattr(config, "SPEECH_RMS_THRESHOLD", 500.0)
+    data = audio_trigger_task._record_after_wake(FakeMic((0.3, 50), (1.5, 3000), (5, 50)), 512)
+    assert 0.3 + 1.5 + audio_trigger_task.END_SILENCE_SECONDS <= recorded_seconds(data) < 3.0
+
+
+def test_silence_after_wake_word_sends_nothing(monkeypatch):
+    """Whisper invents text from silence ("Thanks for watching!"), so a silent recording is never sent."""
+    monkeypatch.setattr(config, "SPEECH_RMS_THRESHOLD", 500.0)
+    assert audio_trigger_task._record_after_wake(FakeMic((10, 100)), 512) is None
+
+
+def test_long_speech_is_capped(monkeypatch):
+    monkeypatch.setattr(config, "SPEECH_RMS_THRESHOLD", 500.0)
+    data = audio_trigger_task._record_after_wake(FakeMic((20, 3000)), 512)
+    assert recorded_seconds(data) == audio_trigger_task.RECORD_SECONDS
+
+
+def test_no_speech_ends_the_conversation_without_a_job(monkeypatch):
+    """Nothing was said: no job, wake flag back to 0, and the listener re-arms by itself."""
+    published = []
+
+    class Pub:
+        def publish(self, topic, payload, **_):
+            published.append((topic, payload))
+
+    def fake_worker(stop_event, busy_event, loop, events):
+        busy_event.set()
+        loop.call_soon_threadsafe(events.put_nowait, ("wake", None))
+        loop.call_soon_threadsafe(events.put_nowait, ("recorded", None))
+        stop_event.wait(5)
+
+    monkeypatch.setattr(audio_trigger_task, "_audio_worker", fake_worker)
+
+    async def run():
+        jobs, busy = asyncio.Queue(), threading.Event()
+        task = asyncio.create_task(audio_trigger_task.audio_trigger_task(Pub(), jobs, busy))
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if (config.TOPIC_WAKE_FLAG, "0") in published:
+                break
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return jobs.qsize(), busy.is_set()
+
+    assert asyncio.run(run()) == (0, False)
+    assert (config.TOPIC_AUDIO_STATE, '{"status": "no_speech"}') in published
+
+
+def test_whisper_gets_language_and_prompt_hints(env, monkeypatch):
+    monkeypatch.setattr(config, "WHISPER_LANGUAGE", "en")
+    monkeypatch.setattr(config, "WHISPER_PROMPT", "EMO is a robot.")
+    requests = []
+
+    async def run():
+        async with mock_client(requests) as client:
+            return await api.handle_job(client, api.LISTEN_JOB, wav_bytes())
+
+    assert asyncio.run(run()) is True
+    form = requests[0].content
+    for field, value in [(b"language", b"en"), (b"prompt", b"EMO is a robot."), (b"temperature", b"0")]:
+        assert b'name="' + field + b'"\r\n\r\n' + value in form
+
+
+@pytest.mark.parametrize("heard", ["Thanks for watching!", "you", "  ", "..."])
+def test_whisper_phantom_text_is_not_answered(env, heard):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"text": heard})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await api.handle_job(client, api.LISTEN_JOB, wav_bytes())
+
+    assert asyncio.run(run()) is False
+    assert len(requests) == 1  # no reply was asked for
 
 
 def test_cached_phrase_plays_even_with_an_http_url(env, monkeypatch):

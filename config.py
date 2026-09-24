@@ -68,12 +68,22 @@ AUDIO_INPUT_DEVICE = os.getenv("AUDIO_INPUT_DEVICE", "").strip() or None
 # ALSA playback device for aplay, e.g. "plughw:0"; empty = default
 AUDIO_OUTPUT_DEVICE = os.getenv("AUDIO_OUTPUT_DEVICE", "").strip() or None
 
+# Microphone level (RMS of 16-bit samples) that counts as speech after the wake word. Too high = speech is
+# missed; too low = room noise keeps the recording going. "No speech ... loudest RMS" in the log helps tune it.
+SPEECH_RMS_THRESHOLD = _env_float("SPEECH_RMS_THRESHOLD", 500.0)
+
 PORCUPINE_ACCESS_KEY = os.getenv("PORCUPINE_ACCESS_KEY", "")
 PORCUPINE_KEYWORD_PATH = os.getenv("PORCUPINE_KEYWORD_PATH", "")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
+# Spoken language (ISO 639-1, e.g. "en", "hi", "ta"); "auto" = let Whisper guess, which is unreliable on short clips
+_whisper_language = os.getenv("WHISPER_LANGUAGE", "").strip() or "en"
+WHISPER_LANGUAGE = "" if _whisper_language.lower() == "auto" else _whisper_language
+# Vocabulary hint for Whisper (names it should spell right); "off" = none
+_whisper_prompt = os.getenv("WHISPER_PROMPT", "").strip() or "EMO is a small desktop robot. The user is talking to EMO."
+WHISPER_PROMPT = "" if _whisper_prompt.lower() == "off" else _whisper_prompt
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o")  # cloud reply model: the fallback when the laptop LLM is set
 
 # Reply model on the laptop's Ollama, e.g. http://192.168.43.20:11434 (llm_client.py).
@@ -86,6 +96,14 @@ LOCAL_LLM_ESCALATE_MODEL = "" if _escalate.lower() in {"off", "none", "0"} else 
 LOCAL_LLM_CONNECT_TIMEOUT = _env_float("LOCAL_LLM_CONNECT_TIMEOUT", 1.0)  # laptop unreachable -> cloud quickly
 LOCAL_LLM_TIMEOUT = _env_float("LOCAL_LLM_TIMEOUT", 5.0)  # longest wait for the next piece of a reply
 LOCAL_LLM_KEEP_ALIVE = os.getenv("LOCAL_LLM_KEEP_ALIVE", "").strip() or "30m"  # keep the model loaded on the laptop
+
+# Reply tuning (laptop and cloud models). Low temperature = fewer made-up facts; a reply cut by the token
+# limit is trimmed back to its last full sentence.
+LLM_TEMPERATURE = _env_float("LLM_TEMPERATURE", 0.4)
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "").strip() or "150")
+# Follow-up questions: remember this many exchanges, forgotten after this many seconds without talking
+CONVERSATION_TURNS = int(os.getenv("CONVERSATION_TURNS", "").strip() or "3")
+CONVERSATION_MEMORY_SECONDS = _env_float("CONVERSATION_MEMORY_SECONDS", 120.0)
 
 # Told to the reply model with the date and time, e.g. "Chennai, India"; empty = not mentioned
 ROBOT_LOCATION = os.getenv("ROBOT_LOCATION", "").strip()

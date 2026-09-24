@@ -5,11 +5,13 @@
    LOCAL_LLM_ESCALATE_MODEL (gemma4:e4b). The stream is cut as soon as the first sentence shows this.
 3. If the laptop can't be reached, errors, or neither local model answers, the cloud CHAT_MODEL replies.
 
-Every prompt carries the current date and time, because a model has no clock.
+Every prompt carries the current date and time, because a model has no clock, and the last few exchanges
+(CONVERSATION_TURNS, forgotten after CONVERSATION_MEMORY_SECONDS of silence) so follow-up questions work.
 """
 import json
 import logging
 import re
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -21,8 +23,6 @@ from netutil import require_https
 logger = logging.getLogger(__name__)
 
 ESCALATE_TOKEN = "ESCALATE"
-TEMPERATURE = 0.6
-MAX_TOKENS = 100
 
 BASE_PROMPT = (
     "You are EMO, a small two-legged desktop companion robot. You hear the user through a microphone and your "
@@ -35,6 +35,7 @@ ESCALATE_RULE = f" If you are not confident you can answer correctly, reply with
 _ESCALATE_RE = re.compile(rf"\b{ESCALATE_TOKEN}\b")
 _THINK_RE = re.compile(r"<think>.*?(?:</think>|$)", re.S)  # an unclosed block is still being generated
 _SENTENCE_END_RE = re.compile(r"[.!?](?:\s|$)")
+_LAST_SENTENCE_END_RE = re.compile(r".*[.!?]", re.S)
 _REFUSAL_RE = re.compile(
     r"\b(?:i can't|i cannot|i can not|i'm unable|i am unable|i'm not able|i am not able|i don't know|i do not know"
     r"|i don't have access|i do not have access|as an ai)\b")
@@ -48,8 +49,39 @@ def system_prompt(escalate: bool = False, now: Optional[datetime] = None) -> str
     return prompt + (ESCALATE_RULE if escalate else "")
 
 
+_history: list[tuple[float, str, str]] = []  # (monotonic time, what the user said, reply)
+
+
+def clear_history() -> None:
+    _history.clear()
+
+
+def _recent_history() -> list[dict]:
+    if _history and time.monotonic() - _history[-1][0] > config.CONVERSATION_MEMORY_SECONDS:
+        _history.clear()  # a new conversation: old context would only confuse the model
+    messages = []
+    for _, said, reply in _history:
+        messages += [{"role": "user", "content": said}, {"role": "assistant", "content": reply}]
+    return messages
+
+
+def _remember(transcript: str, reply: str) -> None:
+    _history.append((time.monotonic(), transcript, reply))
+    del _history[:max(len(_history) - config.CONVERSATION_TURNS, 0)]  # keep the newest CONVERSATION_TURNS
+
+
 def _messages(transcript: str, escalate: bool = False) -> list[dict]:
-    return [{"role": "system", "content": system_prompt(escalate)}, {"role": "user", "content": transcript}]
+    return ([{"role": "system", "content": system_prompt(escalate)}] + _recent_history()
+            + [{"role": "user", "content": transcript}])
+
+
+def trim_to_sentence(text: str) -> str:
+    """Cut a reply that hit the token limit back to its last full sentence, so it isn't spoken half-finished."""
+    text = text.strip()
+    if not text or text[-1] in ".!?\"')":
+        return text
+    match = _LAST_SENTENCE_END_RE.match(text)
+    return match.group(0) if match else text
 
 
 def strip_think(text: str) -> str:
@@ -82,7 +114,7 @@ async def _ollama_chat(client: httpx.AsyncClient, model: str, transcript: str, f
         "stream": True,
         "think": False,
         "keep_alive": config.LOCAL_LLM_KEEP_ALIVE,
-        "options": {"temperature": TEMPERATURE, "num_predict": MAX_TOKENS},
+        "options": {"temperature": config.LLM_TEMPERATURE, "num_predict": config.LLM_MAX_TOKENS},
     }
     timeout = httpx.Timeout(config.LOCAL_LLM_TIMEOUT, connect=config.LOCAL_LLM_CONNECT_TIMEOUT)
     text = ""
@@ -118,8 +150,8 @@ async def _cloud_chat(client: httpx.AsyncClient, transcript: str) -> str:
         json={
             "model": config.CHAT_MODEL,
             "messages": _messages(transcript),
-            "temperature": TEMPERATURE,
-            "max_tokens": MAX_TOKENS,
+            "temperature": config.LLM_TEMPERATURE,
+            "max_tokens": config.LLM_MAX_TOKENS,
         },
     )
     response.raise_for_status()
@@ -146,11 +178,14 @@ async def _local_reply(client: httpx.AsyncClient, transcript: str) -> Optional[t
 
 async def get_reply(client: httpx.AsyncClient, transcript: str) -> tuple[str, str]:
     """Return (reply, model that answered). Raises only if the cloud fallback fails too."""
+    result = None
     if config.LOCAL_LLM_URL:
         try:
             result = await _local_reply(client, transcript)
-            if result is not None:
-                return result
         except (httpx.HTTPError, RuntimeError, ValueError) as exc:  # unreachable, timeout, bad JSON, model error
             logger.warning("Laptop LLM failed (%r): asking %s", exc, config.CHAT_MODEL)
-    return await _cloud_chat(client, transcript), config.CHAT_MODEL
+    if result is None:
+        result = await _cloud_chat(client, transcript), config.CHAT_MODEL
+    reply, model = trim_to_sentence(result[0]), result[1]
+    _remember(transcript, reply)
+    return reply, model

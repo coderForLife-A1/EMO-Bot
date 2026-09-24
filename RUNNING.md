@@ -54,7 +54,7 @@ shuffle, and turning uses different stride lengths per leg.
 | `serial_task` | `serial_module.py` | yes | Sends commands to the controller, matches each reply to its command, gives the E-stop priority, forwards events/telemetry, parks the servos on shutdown, reconnects forever. |
 | `behavior_tree_task` | `behavior_tree_module.py` | yes | 10 Hz priority tree: E-stop > IMU fault > fallen > rest > conversation > posture reminder > walk > stand. |
 | `vision_task` | `vision_posture_module.py` | no | Camera → MediaPipe pose → posture events; reopens the camera if it drops out (face detection optional). |
-| `audio_trigger_task` | `audio_trigger_task.py` | no | Porcupine wake word → records 5 s → hands the WAV to the API task. |
+| `audio_trigger_task` | `audio_trigger_task.py` | no | Porcupine wake word → records until you stop talking (max 8 s; nothing sent if you don't speak within 3 s) → hands the WAV to the API task. |
 | `api_routing_task` | `api_routing_task.py` | no | Whisper → GPT → ElevenLabs → `aplay`, plus spoken cues ("I fell over"). |
 
 If a **critical** task crashes, the robot shuts down. If an **optional** task crashes (no camera,
@@ -355,6 +355,10 @@ access once.
 | `LOCAL_LLM_MODEL` / `LOCAL_LLM_ESCALATE_MODEL` | `qwen3:4b` / `gemma4:e4b` | Second model is asked when the first is unsure; `off` = go to the cloud instead |
 | `LOCAL_LLM_CONNECT_TIMEOUT` / `LOCAL_LLM_TIMEOUT` | `1` / `5` | Seconds: to connect, and longest wait for the next piece of a reply. Past either, the cloud answers |
 | `LOCAL_LLM_KEEP_ALIVE` | `30m` | How long Ollama keeps the model loaded |
+| `WHISPER_LANGUAGE` / `WHISPER_PROMPT` | `en` / a line naming EMO | Language (`auto` = guess) and a vocabulary hint (`off` = none) |
+| `LLM_TEMPERATURE` / `LLM_MAX_TOKENS` | `0.4` / `150` | Reply tuning; a reply cut by the limit is trimmed to its last full sentence |
+| `CONVERSATION_TURNS` / `CONVERSATION_MEMORY_SECONDS` | `3` / `120` | Exchanges remembered for follow-up questions (`0` = off), forgotten after that long without talking |
+| `SPEECH_RMS_THRESHOLD` | `500` | Mic level that counts as speech after the wake word. Raise it if room noise keeps recordings going; lower it if "No speech after the wake word" is logged while you talk |
 | `ROBOT_LOCATION` | empty | Told to the model with the date and time, e.g. `Chennai, India` |
 | `LOG_CONVERSATIONS` | `0` | `1` = log what was said and the reply at INFO (they land in the journal) |
 | `OPENAI_BASE_URL`, `ELEVENLABS_TTS_URL` | official endpoints | Change for a proxy / compatible API |

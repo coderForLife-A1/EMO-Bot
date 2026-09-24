@@ -26,6 +26,7 @@ def env(monkeypatch):
         "ROBOT_LOCATION": "", "LOG_CONVERSATIONS": False,
     }.items():
         monkeypatch.setattr(config, name, value)
+    llm_client.clear_history()
 
 
 def ndjson(*pieces):
@@ -192,6 +193,66 @@ def test_lan_http_check(url, allowed):
 def test_api_keys_still_need_https_on_the_lan():
     with pytest.raises(RuntimeError, match="refusing"):
         netutil.require_https("http://192.168.43.20:8080/v1")
+
+
+def last_request_contents(requests):
+    return [m["content"] for m in json.loads(requests[0].content)["messages"][1:]]
+
+
+def test_follow_up_questions_see_the_last_exchanges(env, monkeypatch):
+    monkeypatch.setattr(config, "CONVERSATION_TURNS", 2)
+    for question in ["one", "two", "three"]:
+        _, requests = run_reply({QWEN: ndjson(f"Answer {question}.")}, transcript=question)
+    assert last_request_contents(requests) == ["one", "Answer one.", "two", "Answer two.", "three"]
+
+
+def test_memory_keeps_only_the_newest_turns(env, monkeypatch):
+    monkeypatch.setattr(config, "CONVERSATION_TURNS", 1)
+    for question in ["one", "two", "three"]:
+        _, requests = run_reply({QWEN: ndjson(f"Answer {question}.")}, transcript=question)
+    assert last_request_contents(requests) == ["two", "Answer two.", "three"]
+
+
+def test_memory_off(env, monkeypatch):
+    monkeypatch.setattr(config, "CONVERSATION_TURNS", 0)
+    run_reply({QWEN: ndjson("First.")}, transcript="one")
+    _, requests = run_reply({QWEN: ndjson("Second.")}, transcript="two")
+    assert last_request_contents(requests) == ["two"]
+
+
+def test_memory_is_forgotten_after_a_pause(env, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(llm_client.time, "monotonic", lambda: clock[0])
+    run_reply({QWEN: ndjson("First.")}, transcript="one")
+    clock[0] += config.CONVERSATION_MEMORY_SECONDS + 1
+    _, requests = run_reply({QWEN: ndjson("Second.")}, transcript="two")
+    assert last_request_contents(requests) == ["two"]
+
+
+def test_only_the_final_answer_is_remembered(env):
+    run_reply({QWEN: ndjson("ESCALATE"), GEMMA: ndjson("Thursday.")}, transcript="day?")
+    _, requests = run_reply({QWEN: ndjson("Sure.")}, transcript="thanks")
+    assert last_request_contents(requests) == ["day?", "Thursday.", "thanks"]
+
+
+@pytest.mark.parametrize("text, trimmed", [
+    ("It is Thursday. The weather looks", "It is Thursday."),
+    ("It is Thursday.", "It is Thursday."),
+    ("Sure thing", "Sure thing"),  # nothing to trim back to
+    ("Is it? Yes! And then", "Is it? Yes!"),
+    ('He said "hi."', 'He said "hi."'),
+])
+def test_cut_off_reply_is_trimmed_to_a_full_sentence(text, trimmed):
+    assert llm_client.trim_to_sentence(text) == trimmed
+
+
+def test_tuning_values_are_sent(env, monkeypatch):
+    monkeypatch.setattr(config, "LLM_TEMPERATURE", 0.3)
+    monkeypatch.setattr(config, "LLM_MAX_TOKENS", 77)
+    _, requests = run_reply({QWEN: ndjson("ESCALATE"), GEMMA: ndjson(""), "gpt-4o": "Hi."})
+    assert json.loads(requests[0].content)["options"] == {"temperature": 0.3, "num_predict": 77}
+    cloud = json.loads(requests[-1].content)
+    assert (cloud["temperature"], cloud["max_tokens"]) == (0.3, 77)
 
 
 def _full_job(monkeypatch, caplog):
