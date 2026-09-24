@@ -117,3 +117,21 @@ PI, please:
 1. Pull, then `.venv/bin/python -m pytest -q`: full suite including test_console. Log the count.
 2. **Live check with the real GEMINI_API_KEY** (`LOCAL_LLM_URL` empty for this): run `llm_client.get_reply` for "what day is it" and "who are you", then push-to-talk one question on the console. Log the replies, the model that answered and the latency. Check the answers aren't cut short: `LLM_MAX_TOKENS`=150 includes any thinking tokens of `gemini-flash-lite-latest`.
 3. Then continue the firmware steps from my 13:45 entry (wiring check, flash from the Pi, `SERIAL_PORT`) and log them.
+
+### PI 2026-09-24 14:35
+
+- Merge pushed as **10adc0f** (redone on top of cb1259d with the same resolutions, firmware change included). The Pi rebooted at 13:22 (power?), which left two empty git objects. I restored them from origin and `git fsck` is clean.
+- Q1 (tests, at 8a615a5): `.venv/bin/python -m pytest -q`: **314 passed**, test_console and test_robot_mic included. `ruff check`: all checks passed.
+- Q2 (live, `LOCAL_LLM_URL` empty, CLOUD_LLM=gemini, gemini-flash-lite-latest, LLM_MAX_TOKENS=150, no OpenAI key):
+  - `get_reply("what day is it")` -> gemini-flash-lite-latest, 10.9 s cold / 5.7 s: "Today is Thursday, September twenty-fourth, twenty twenty-six. It is currently afternoon."
+  - `get_reply("who are you")` -> 2.5 s: "I am EMO, your small desktop companion robot. I am here to chat and keep you company."
+  - `get_reply("tell me about the moon")` -> 4.3 s: "The moon is Earth's only natural satellite and it lights up the night sky. My knowledge does not include any recent discoveries about it."
+  - No answer was cut short at 150 tokens.
+  - **Spoken path fails on the network:** `handle_heard` with mic_test.wav (3.0 s, 16 kHz mono, 96 KB; ~128 KB as base64) failed 3 times out of 3: WriteTimeout at 15 s (twice), then ConnectError. It's the phone's mobile data, not the Pi: Wi-Fi to the hotspot is -57 dBm at 72 Mbit/s, but the internet has 40% packet loss and ~430 ms RTT, and a test upload ran at ~20 KB/s. I didn't do a real push-to-talk on the console (nobody here to talk); handle_heard is what it runs.
+  - Idea for L2: the laptop (RTX 4060) could transcribe (faster-whisper next to Ollama) so the audio only crosses the LAN and just text goes to the cloud. Or send FLAC/Opus instead of WAV to cut the upload by half or more.
+- Q3 (firmware):
+  - **The link already works over the GPIO UART.** `/dev/ttyAMA0`: `P` -> `ACK,P` in ~1 ms (4 out of 4). So the ESP32 already runs `LINK_UART2 1` firmware and the wiring is right both ways. Firmware on Fixes = origin/leg-test (last firmware commit dc98a26), which matches how the board behaves.
+  - **Not flashed:** `arduino-cli` isn't installed on the Pi. Per your step 3 I'm asking the user before installing it (the esp32 core is ~hundreds of MB).
+  - **SERIAL_PORT stays `/dev/ttyAMA0`, not `/dev/serial0`.** On the Pi 5, `/dev/serial0` -> `ttyAMA10`, the debug connector (RUNNING.md troubleshooting already says so). `.env` already has `/dev/ttyAMA0` with `dtparam=uart0=on`; the Pi's UART login shell is off.
+  - **Sensors:** `I` -> `NACK,I,NOIMU` and `D` -> `NACK,D,NOTOF`: the ESP32 sees neither the MPU6050 nor the VL53L0X on I2C (GPIO21/22). Wiring or power to check; asked the user.
+  - Opening `/dev/ttyUSB0` (CP2102) rebooted the ESP32 once, even with DTR/RTS set low. Harmless (servos stay off until `S`), but nobody should open USB while the robot is standing.
