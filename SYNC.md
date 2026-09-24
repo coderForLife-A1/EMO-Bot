@@ -74,3 +74,18 @@ Steps (PI):
 7. Add an entry here: conflicts and how you resolved them, test count, anything left for L2.
 
 L2 then reviews the merge and fixes the pipeline integration.
+
+### PI 2026-09-24 13:30
+
+**Stopped at step 2: the branch changes firmware.** Nothing merged into `Fixes` or pushed except this entry.
+
+- `firmware/emo_esp32/emo_esp32.ino` (+6/-5, from dc98a26, which is also on `origin/leg-test`): `#define LINK_UART2 0` -> `1`, so the ESP32 talks to the Pi over the GPIO UART (Serial2, GPIO16/17) instead of USB. Only that define and its comments change. Waiting for the user's OK on this.
+- The merge is ready locally on the Pi as branch `merge-console` (cfbbc83, not pushed):
+  - Step 1: stash committed on `laptop-console-calibration` as de21f73 ("Console: robot mic push-to-talk, Gemini for spoken and typed questions, posture tweaks"), with the untracked `robot_mic.py` and `tests/test_robot_mic.py`. `calibration.json` and `mic_test.wav` were already gitignored. I added `.env.bak` to .gitignore (it's a copy of `.env`).
+  - Step 3: `git merge --no-ff` onto 1b13815. Conflicts: .env.example, README.md, api_routing_task.py, config.py.
+  - api_routing_task.py: dropped the branch's own `require_https` (netutil's is used) and HEAD's one-argument `_missing_keys` (the branch's `_missing_keys(kind)` does the same for LISTEN_JOB). Dropped `_request_response`. Kept `plain_text`, `_gemini`, `_ask_gemini`, `_hear_gemini`, `listen_with_gemini`, `handle_heard`, `handle_ask`. `_cascade` = `_transcribe` -> `sink.event("heard")` -> `llm_client.get_reply` (with the LOG_CONVERSATIONS logging) -> `sink.event("reply")` -> `_synthesize`.
+  - POST /api/listen needed no rewiring: it queues `(LISTEN_JOB, wav)`, which goes `handle_job` -> `_speech_for` -> `_cascade`, the same as the wake word, so it gets the laptop LLM and memory. **Left for L2:** when `listen_with_gemini()` is true (GEMINI_API_KEY set and the OpenAI or ElevenLabs key missing, which is the Pi's `.env` today), spoken questions skip Whisper and llm_client and go to Gemini as text only. You may want the laptop LLM to take priority there.
+  - config.py / .env.example: both sides kept (Gemini block before the timeout budget, all LOCAL_LLM_* settings).
+  - README.md: Conversation row mentions console push-to-talk and the laptop LLM. The file and test tables keep both sides.
+- Step 5: `.venv/bin/python -m pytest -q`: **308 passed**. `ruff check`: one E501 at `llm_client.py:38` (124 chars), already on `Fixes`.
+- Once the user OKs the firmware change I'll push the merge to `Fixes` with the requested message. Alternatively I can revert `firmware/` to Fixes' version inside the merge and push without it.
