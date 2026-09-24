@@ -96,25 +96,12 @@ def plain_text(text: str) -> str:
 
 
 async def _gemini(client: httpx.AsyncClient, parts: list[dict], generation: Optional[dict] = None) -> str:
-    """One generateContent call; returns the answer's text (thinking parts dropped)."""
-    require_https(config.GEMINI_BASE_URL)
-    url = f"{config.GEMINI_BASE_URL}/models/{config.GEMINI_MODEL}:generateContent"
-    body = {
+    """One generateContent call as EMO; returns the answer's text (thinking parts dropped)."""
+    return await llm_client.gemini_generate(client, {
         "systemInstruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT}]},
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"temperature": 0.6, "maxOutputTokens": 300, **(generation or {})},
-    }
-    for attempt in range(2):  # the free tier answers 503 "high demand" now and then: one retry
-        response = await client.post(url, headers={"x-goog-api-key": config.GEMINI_API_KEY}, json=body)
-        if response.status_code not in (429, 500, 503) or attempt:
-            break
-        await asyncio.sleep(1.0)
-    response.raise_for_status()
-    try:
-        answer_parts = response.json()["candidates"][0]["content"]["parts"]
-    except (KeyError, IndexError, ValueError) as exc:
-        raise RuntimeError(f"{config.GEMINI_MODEL} returned no answer") from exc
-    return "".join(str(p.get("text", "")) for p in answer_parts if not p.get("thought"))
+    })
 
 
 async def _ask_gemini(client: httpx.AsyncClient, question: str) -> str:
@@ -125,34 +112,50 @@ async def _ask_gemini(client: httpx.AsyncClient, question: str) -> str:
 
 
 HEAR_INSTRUCTION = (
-    "The audio is a person talking to you. Return JSON: \"heard\" is exactly what they said (empty if there "
-    "is no speech, only noise or silence), \"reply\" is your answer to it."
+    "The audio is a person talking to you. Return JSON: \"heard\" is exactly what they said, word for word "
+    "(empty if there is no speech, only noise or silence). Do not answer it."
 )
-HEAR_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {"heard": {"type": "STRING"}, "reply": {"type": "STRING"}},
-    "required": ["heard", "reply"],
-}
+HEAR_SCHEMA = {"type": "OBJECT", "properties": {"heard": {"type": "STRING"}}, "required": ["heard"]}
 
 
-async def _hear_gemini(client: httpx.AsyncClient, wav_bytes: bytes) -> tuple[str, str]:
-    """Speech to text and the answer in one call: (what was heard, reply). Heard is empty for silence."""
+async def _hear_gemini(client: httpx.AsyncClient, wav_bytes: bytes) -> str:
+    """Speech to text with Gemini (no OpenAI key for Whisper). Empty for silence."""
     raw = await _gemini(
         client,
         [{"inlineData": {"mimeType": "audio/wav", "data": base64.b64encode(wav_bytes).decode()}},
          {"text": HEAR_INSTRUCTION}],
-        {"responseMimeType": "application/json", "responseSchema": HEAR_SCHEMA},
+        {"temperature": 0, "responseMimeType": "application/json", "responseSchema": HEAR_SCHEMA},
     )
     try:
         data = json.loads(raw)
     except ValueError as exc:
         raise RuntimeError(f"{config.GEMINI_MODEL} returned malformed JSON") from exc
-    return " ".join(str(data.get("heard", "")).split()), plain_text(str(data.get("reply", "")))
+    return " ".join(str(data.get("heard", "")).split())
 
 
 def listen_with_gemini() -> bool:
-    """Spoken questions go to Gemini (text answer, no voice) unless the Whisper/ElevenLabs keys are both set."""
+    """Spoken questions are transcribed by Gemini and answered as text (no voice) unless the Whisper and
+    ElevenLabs keys are both set."""
     return bool(config.GEMINI_API_KEY) and not (config.OPENAI_API_KEY and config.ELEVENLABS_API_KEY)
+
+
+async def _reply(client: httpx.AsyncClient, transcript: str) -> str:
+    """Laptop LLM first, cloud model as the fallback (llm_client)."""
+    response_text, model = await llm_client.get_reply(client, transcript)
+    logger.info("Reply from %s", model)
+    # Conversation text stays out of the system journal unless LOG_CONVERSATIONS=1
+    log_level = logging.INFO if config.LOG_CONVERSATIONS else logging.DEBUG
+    logger.log(log_level, "Heard %r, replying %r", transcript, response_text)
+    return response_text
+
+
+async def _hear_and_reply(client: httpx.AsyncClient, wav_bytes: bytes, sink: "LocalSpeaker") -> bool:
+    heard = await _hear_gemini(client, wav_bytes)
+    if not heard:
+        return False
+    sink.event("heard", heard)
+    sink.event("reply", await _reply(client, heard))
+    return True
 
 
 async def handle_heard(client: httpx.AsyncClient, wav_bytes: bytes, sink: Optional["LocalSpeaker"] = None) -> bool:
@@ -160,21 +163,17 @@ async def handle_heard(client: httpx.AsyncClient, wav_bytes: bytes, sink: Option
     sink = sink or LOCAL_SPEAKER
     sink.event("thinking")
     try:
-        heard, answer = await asyncio.wait_for(_hear_gemini(client, wav_bytes), timeout=config.API_TIMEOUT_SECONDS)
+        answered = await asyncio.wait_for(_hear_and_reply(client, wav_bytes, sink),
+                                          timeout=config.API_TIMEOUT_SECONDS)
     except Exception as exc:  # noqa: BLE001 - shown on the console instead
-        logger.warning("Gemini listen failed: %r", exc)
+        logger.warning("Spoken question failed: %r", exc)
         sink.event("error", _short_reason(exc))
         sink.event("idle")
         return False
-    if not heard:
+    if not answered:
         sink.event("error", "I didn't catch that: hold the button while you speak")
-        sink.event("idle")
-        return False
-    logger.debug("Heard: %r, answer: %r", heard, answer)
-    sink.event("heard", heard)
-    sink.event("reply", answer or EXAMPLES.get(heard, "Sorry, I have no answer for that."))
     sink.event("idle")
-    return True
+    return answered
 
 
 async def handle_ask(client: httpx.AsyncClient, question: str, sink: Optional["LocalSpeaker"] = None) -> bool:
@@ -288,11 +287,7 @@ def _missing_keys(kind: str = LISTEN_JOB) -> list[str]:
 async def _cascade(client: httpx.AsyncClient, wav_bytes: bytes, sink: LocalSpeaker) -> bytes:
     transcript = await _transcribe(client, wav_bytes)
     sink.event("heard", transcript)
-    response_text, model = await llm_client.get_reply(client, transcript)
-    logger.info("Reply from %s", model)
-    # Conversation text stays out of the system journal unless LOG_CONVERSATIONS=1
-    log_level = logging.INFO if config.LOG_CONVERSATIONS else logging.DEBUG
-    logger.log(log_level, "Heard %r, replying %r", transcript, response_text)
+    response_text = await _reply(client, transcript)
     sink.event("reply", response_text)
     return await _synthesize(client, response_text)
 

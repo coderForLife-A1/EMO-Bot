@@ -7,11 +7,13 @@
    LOCAL_LLM_ESCALATE_MODEL if one is set (off by default), else straight to the cloud. The stream is cut as soon
    as the first sentence shows this. A second local model only helps if both fit in GPU memory at once:
    otherwise every escalation reloads a model (4-7 s on an 8 GB laptop GPU).
-3. If the laptop can't be reached, errors, or no local model answers, the cloud CHAT_MODEL replies.
+3. If the laptop can't be reached, errors, or no local model answers, the cloud model replies:
+   GEMINI_MODEL (CLOUD_LLM=gemini, the default) or OpenAI's CHAT_MODEL (CLOUD_LLM=openai).
 
 Every prompt carries the current date and time, because a model has no clock, and the last few exchanges
 (CONVERSATION_TURNS, forgotten after CONVERSATION_MEMORY_SECONDS of silence) so follow-up questions work.
 """
+import asyncio
 import json
 import logging
 import re
@@ -35,7 +37,8 @@ BASE_PROMPT = (
     "and may be out of date: for recent events or anything that changes, say so instead of stating it as current. "
     "If you do not know something, say so briefly instead of guessing."
 )
-ESCALATE_RULE = f" If you are not confident you can answer correctly, reply with exactly {ESCALATE_TOKEN} and nothing else."
+ESCALATE_RULE = (f" If you are not confident you can answer correctly, reply with exactly {ESCALATE_TOKEN}"
+                 " and nothing else.")
 
 _ESCALATE_RE = re.compile(rf"\b{ESCALATE_TOKEN}\b")
 _THINK_RE = re.compile(r"<think>.*?(?:</think>|$)", re.S)  # an unclosed block is still being generated
@@ -167,7 +170,46 @@ async def _ollama_chat(client: httpx.AsyncClient, model: str, transcript: str, f
     return strip_think(text).strip()
 
 
+def cloud_model() -> str:
+    return config.CHAT_MODEL if config.CLOUD_LLM == "openai" else config.GEMINI_MODEL
+
+
+async def gemini_generate(client: httpx.AsyncClient, body: dict) -> str:
+    """One Gemini generateContent call; returns the answer's text (thinking parts dropped)."""
+    if not config.GEMINI_API_KEY:
+        raise RuntimeError("missing GEMINI_API_KEY in .env")
+    require_https(config.GEMINI_BASE_URL)
+    url = f"{config.GEMINI_BASE_URL}/models/{config.GEMINI_MODEL}:generateContent"
+    for attempt in range(2):  # the free tier answers 503 "high demand" now and then: one retry
+        response = await client.post(url, headers={"x-goog-api-key": config.GEMINI_API_KEY}, json=body)
+        if response.status_code not in (429, 500, 503) or attempt:
+            break
+        await asyncio.sleep(1.0)
+    response.raise_for_status()
+    try:
+        parts = response.json()["candidates"][0]["content"]["parts"]
+    except (KeyError, IndexError, ValueError) as exc:
+        raise RuntimeError(f"{config.GEMINI_MODEL} returned no answer") from exc
+    return "".join(str(p.get("text", "")) for p in parts if not p.get("thought"))
+
+
+async def _gemini_chat(client: httpx.AsyncClient, transcript: str) -> str:
+    system, *turns = _messages(transcript)
+    reply = await gemini_generate(client, {
+        "systemInstruction": {"parts": [{"text": system["content"]}]},
+        "contents": [{"role": "model" if m["role"] == "assistant" else "user", "parts": [{"text": m["content"]}]}
+                     for m in turns],
+        "generationConfig": {"temperature": config.LLM_TEMPERATURE, "maxOutputTokens": config.LLM_MAX_TOKENS},
+    })
+    reply = " ".join(re.sub(r"[*_`#]+", "", reply).split())  # spoken: no markdown
+    if not reply:
+        raise RuntimeError(f"{config.GEMINI_MODEL} returned empty text")
+    return reply
+
+
 async def _cloud_chat(client: httpx.AsyncClient, transcript: str) -> str:
+    if config.CLOUD_LLM != "openai":
+        return await _gemini_chat(client, transcript)
     require_https(config.OPENAI_BASE_URL)
     response = await client.post(
         f"{config.OPENAI_BASE_URL}/chat/completions",
@@ -191,7 +233,7 @@ async def _local_reply(client: httpx.AsyncClient, transcript: str) -> Optional[t
     if not needs_escalation(reply):
         return reply, config.LOCAL_LLM_MODEL
     if not config.LOCAL_LLM_ESCALATE_MODEL:
-        logger.info("%s unsure and no escalation model: asking %s", config.LOCAL_LLM_MODEL, config.CHAT_MODEL)
+        logger.info("%s unsure and no escalation model: asking %s", config.LOCAL_LLM_MODEL, cloud_model())
         return None
     global _escalated
     logger.info("%s unsure: escalating to %s", config.LOCAL_LLM_MODEL, config.LOCAL_LLM_ESCALATE_MODEL)
@@ -199,7 +241,7 @@ async def _local_reply(client: httpx.AsyncClient, transcript: str) -> Optional[t
     reply = await _ollama_chat(client, config.LOCAL_LLM_ESCALATE_MODEL, transcript, first_tier=False)
     if reply and not _ESCALATE_RE.search(reply):
         return reply, config.LOCAL_LLM_ESCALATE_MODEL
-    logger.info("%s gave no answer: asking %s", config.LOCAL_LLM_ESCALATE_MODEL, config.CHAT_MODEL)
+    logger.info("%s gave no answer: asking %s", config.LOCAL_LLM_ESCALATE_MODEL, cloud_model())
     return None
 
 
@@ -226,7 +268,7 @@ async def warm_up(client: httpx.AsyncClient) -> None:
         logger.info("Laptop LLM %s loaded", config.LOCAL_LLM_MODEL)
     except (httpx.HTTPError, RuntimeError) as exc:
         logger.info("Laptop LLM %s not loaded (%r); %s answers until it is", config.LOCAL_LLM_MODEL, exc,
-                    config.CHAT_MODEL)
+                    cloud_model())
 
 
 async def rewarm_after_escalation(client: httpx.AsyncClient) -> None:
@@ -241,9 +283,9 @@ async def get_reply(client: httpx.AsyncClient, transcript: str) -> tuple[str, st
         try:
             result = await _local_reply(client, transcript)
         except (httpx.HTTPError, RuntimeError, ValueError) as exc:  # unreachable, timeout, bad JSON, model error
-            logger.warning("Laptop LLM failed (%r): asking %s", exc, config.CHAT_MODEL)
+            logger.warning("Laptop LLM failed (%r): asking %s", exc, cloud_model())
     if result is None:
-        result = await _cloud_chat(client, transcript), config.CHAT_MODEL
+        result = await _cloud_chat(client, transcript), cloud_model()
     reply, model = trim_to_sentence(result[0]), result[1]
     _remember(transcript, reply)
     return reply, model

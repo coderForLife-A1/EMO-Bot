@@ -381,12 +381,13 @@ access once.
 | `SERIAL_BAUD` | `115200` | Must match the firmware |
 | `OPENAI_API_KEY` | – | Whisper + chat. Without it, conversations play the fallback sound |
 | `ELEVENLABS_API_KEY` | – | Text to speech |
-| `GEMINI_API_KEY` | – | Typed questions on the console (text in, plain-text answer out, no voice). Preset examples fall back to canned answers without it |
+| `GEMINI_API_KEY` | – | The cloud reply model (`CLOUD_LLM=gemini`), typed questions on the console, and speech to text when `OPENAI_API_KEY` is empty (spoken questions are then answered as text). Preset examples fall back to canned answers without it |
 | `GEMINI_MODEL` | `gemini-flash-lite-latest` | Any Gemini text model |
 | `PORCUPINE_ACCESS_KEY` | – | Free key at [console.picovoice.ai](https://console.picovoice.ai). Without it, wake word is disabled |
 | `PORCUPINE_KEYWORD_PATH` | *(built-in "porcupine")* | Custom `.ppn` wake word (Linux aarch64 build for the Pi) |
 | `ELEVENLABS_VOICE_ID` | `EXAVITQu4vr4xnSDxMaL` | Any voice ID from your ElevenLabs library |
-| `CHAT_MODEL` / `WHISPER_MODEL` | `gpt-4o` / `whisper-1` | `CHAT_MODEL` is the cloud reply model: the fallback when `LOCAL_LLM_URL` is set |
+| `CLOUD_LLM` | `gemini` | Cloud reply model, used when `LOCAL_LLM_URL` is empty or the laptop can't answer: `gemini` = `GEMINI_MODEL`, `openai` = `CHAT_MODEL` |
+| `CHAT_MODEL` / `WHISPER_MODEL` | `gpt-4o` / `whisper-1` | OpenAI reply model (only with `CLOUD_LLM=openai`); Whisper speech to text |
 | `LOCAL_LLM_URL` | empty | Laptop Ollama, e.g. `http://10.252.137.x:11434` (section 7a). Empty = cloud replies only |
 | `LOCAL_LLM_MODEL` / `LOCAL_LLM_ESCALATE_MODEL` | `gemma4:e4b` / `off` | When the first is unsure, the second local model is asked, or the cloud with `off`. A second local model only helps if both fit in GPU memory together; otherwise each escalation reloads a model (4-7 s). The first must not be a thinking model (the current `qwen3:4b` tag is one: it reasons out loud and takes ~10 s) |
 | `LOCAL_LLM_CONNECT_TIMEOUT` / `LOCAL_LLM_TIMEOUT` | `1` / `5` | Seconds: to connect, and longest wait for the next piece of a reply. Past either, the cloud answers |

@@ -114,10 +114,13 @@ WHISPER_LANGUAGE = "" if _whisper_language.lower() == "auto" else _whisper_langu
 # Vocabulary hint for Whisper (names it should spell right); "off" = none
 _whisper_prompt = os.getenv("WHISPER_PROMPT", "").strip() or "EMO is a small desktop robot. The user is talking to EMO."
 WHISPER_PROMPT = "" if _whisper_prompt.lower() == "off" else _whisper_prompt
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o")  # cloud reply model: the fallback when the laptop LLM is set
+# Cloud reply model (used when LOCAL_LLM_URL is empty or the laptop can't answer): "gemini" (GEMINI_MODEL,
+# default) or "openai" (CHAT_MODEL)
+CLOUD_LLM = (os.getenv("CLOUD_LLM", "").strip() or "gemini").lower()
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o")
 
 # Reply model on the laptop's Ollama, e.g. http://192.168.43.20:11434 (llm_client.py).
-# Empty = skip it and always use CHAT_MODEL. Plain http is allowed only to a LAN address; Ollama gets no API key.
+# Empty = skip it and always use the cloud model. Plain http is allowed only to a LAN address; Ollama gets no API key.
 LOCAL_LLM_URL = os.getenv("LOCAL_LLM_URL", "").strip()
 # Must not be a thinking model (they reason out loud and are slow). gemma4:e4b: 3.2 GB of GPU memory at a
 # 4096 context, about 0.5-1.7 s per reply, and says when its knowledge may be out of date.
@@ -150,7 +153,8 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_TTS_URL = os.getenv("ELEVENLABS_TTS_URL", "https://api.elevenlabs.io/v1/text-to-speech")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 
-# Typed questions on the console (text in, text out: no speech either way)
+# Gemini: the cloud reply model (CLOUD_LLM=gemini), typed questions on the console, and speech to text
+# when OPENAI_API_KEY is empty
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")

@@ -23,7 +23,7 @@ def env(monkeypatch):
         "OPENAI_API_KEY": "sk-test", "ELEVENLABS_API_KEY": "el-test",
         "OPENAI_BASE_URL": "https://api.openai.com/v1", "CHAT_MODEL": "gpt-4o",
         "LOCAL_LLM_URL": LAPTOP, "LOCAL_LLM_MODEL": FIRST, "LOCAL_LLM_ESCALATE_MODEL": GEMMA,
-        "ROBOT_LOCATION": "", "LOG_CONVERSATIONS": False,
+        "ROBOT_LOCATION": "", "LOG_CONVERSATIONS": False, "CLOUD_LLM": "openai",
     }.items():
         monkeypatch.setattr(config, name, value)
     llm_client.clear_history()
@@ -358,3 +358,65 @@ def test_log_conversations_switch(env, monkeypatch, caplog):
     monkeypatch.setattr(config, "LOG_CONVERSATIONS", True)
     _full_job(monkeypatch, caplog)
     assert "hi robot" in caplog.text and "Hello there." in caplog.text
+
+
+def run_gemini_reply(monkeypatch, parts, transcript="what day is it", status=200):
+    monkeypatch.setattr(config, "CLOUD_LLM", "gemini")
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "g-test")
+    monkeypatch.setattr(config, "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
+    monkeypatch.setattr(config, "GEMINI_MODEL", "gemini-test")
+    monkeypatch.setattr(config, "LOCAL_LLM_URL", "")
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if status != 200:
+            return httpx.Response(status, json={"error": {"code": status}})
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": parts}}]})
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await llm_client.get_reply(client, transcript)
+
+    return asyncio.run(go()), requests
+
+
+def test_gemini_is_the_cloud_fallback(env, monkeypatch):
+    (reply, model), requests = run_gemini_reply(monkeypatch, [{"text": "It is **Thursday**."}])
+    assert (reply, model) == ("It is Thursday.", "gemini-test")
+    assert requests[0].url.path.endswith("/models/gemini-test:generateContent")
+    assert requests[0].headers["x-goog-api-key"] == "g-test"
+    body = json.loads(requests[0].content)
+    assert "Current local date and time" in body["systemInstruction"]["parts"][0]["text"]
+    assert "ESCALATE" not in body["systemInstruction"]["parts"][0]["text"]
+    assert body["contents"] == [{"role": "user", "parts": [{"text": "what day is it"}]}]
+    assert body["generationConfig"] == {"temperature": config.LLM_TEMPERATURE,
+                                        "maxOutputTokens": config.LLM_MAX_TOKENS}
+
+
+def test_gemini_gets_history_as_model_turns(env, monkeypatch):
+    run_gemini_reply(monkeypatch, [{"text": "Thursday."}])
+    _, requests = run_gemini_reply(monkeypatch, [{"text": "Friday."}], transcript="and tomorrow?")
+    roles = [c["role"] for c in json.loads(requests[0].content)["contents"]]
+    assert roles == ["user", "model", "user"]
+
+
+def test_gemini_thinking_parts_are_dropped(env, monkeypatch):
+    (reply, _), _ = run_gemini_reply(monkeypatch, [{"text": "Let me think", "thought": True}, {"text": "Thursday."}])
+    assert reply == "Thursday."
+
+
+def test_gemini_retries_once_on_503(env, monkeypatch):
+    async def no_sleep(_):
+        pass
+    monkeypatch.setattr(llm_client.asyncio, "sleep", no_sleep)
+    with pytest.raises(httpx.HTTPStatusError):
+        run_gemini_reply(monkeypatch, [], status=503)
+
+
+def test_gemini_without_key_fails_before_sending(env, monkeypatch):
+    monkeypatch.setattr(config, "CLOUD_LLM", "gemini")
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "")
+    monkeypatch.setattr(config, "LOCAL_LLM_URL", "")
+    with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
+        run_reply({})

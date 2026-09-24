@@ -74,7 +74,7 @@ keeps the robot safe even if the Pi stalls.
 | `calibration.py` | **Per-robot sensor calibration** in `calibration.json`: ToF straight-line fit (applied to every distance), IMU level offset copy, pitch-sign check, noise figures. Atomic writes; a bad file falls back to "uncalibrated". |
 | `frame_mailbox.py` | Latest-frame hand-off from the console's webcam to the vision thread (`CAMERA_SOURCE=console`). |
 | `api_routing_task.py` | **Speech pipeline.** Whisper (speech → text) → reply (`llm_client.py`) → ElevenLabs (text → speech) → speaker. Also speaks the robot's cues ("I fell over"). Plays a fallback beep on any failure. `python api_routing_task.py "Hello"` checks keys and speaker. |
-| `llm_client.py` | **Reply model.** `gemma4:e4b` on the laptop's Ollama (streamed over Wi-Fi) answers first; if it replies `ESCALATE`, refuses or returns nothing, the cloud `CHAT_MODEL` is asked (or a second local model, `LOCAL_LLM_ESCALATE_MODEL`); if the laptop can't answer, the cloud does. Every prompt carries the current date and time and the last 3 exchanges (forgotten after 2 min of quiet), so follow-up questions work. Reply only: it never controls the robot. |
+| `llm_client.py` | **Reply model.** `gemma4:e4b` on the laptop's Ollama (streamed over Wi-Fi) answers first; if it replies `ESCALATE`, refuses or returns nothing, the cloud model is asked (Gemini by default, `CLOUD_LLM`; or a second local model, `LOCAL_LLM_ESCALATE_MODEL`); if the laptop can't answer, the cloud does. Without an OpenAI key, Gemini also does the speech to text. Every prompt carries the current date and time and the last 3 exchanges (forgotten after 2 min of quiet), so follow-up questions work. Reply only: it never controls the robot. |
 
 ### Microcontroller firmware
 

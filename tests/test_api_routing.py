@@ -33,6 +33,7 @@ def env(monkeypatch):
     monkeypatch.setattr(config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
     monkeypatch.setattr(config, "ELEVENLABS_TTS_URL", "https://api.elevenlabs.io/v1/text-to-speech")
     monkeypatch.setattr(config, "LOCAL_LLM_URL", "")  # cloud reply path; the laptop LLM is in test_llm_client.py
+    monkeypatch.setattr(config, "CLOUD_LLM", "openai")
     api._phrase_cache.clear()
     llm_client.clear_history()
     played = []  # (source, data): source "-" means WAV bytes piped to aplay's stdin
@@ -339,6 +340,9 @@ def gemini(monkeypatch):
     monkeypatch.setattr(config, "GEMINI_API_KEY", "g-test")
     monkeypatch.setattr(config, "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
     monkeypatch.setattr(config, "GEMINI_MODEL", "gemini-test")
+    monkeypatch.setattr(config, "CLOUD_LLM", "gemini")
+    monkeypatch.setattr(config, "LOCAL_LLM_URL", "")
+    llm_client.clear_history()
 
     async def no_sleep(_):
         pass
@@ -401,35 +405,74 @@ def test_ask_job_releases_busy_after_answer(gemini):
     assert not busy.is_set()
 
 
-def test_heard_speech_shows_transcript_and_answer_without_audio(gemini, monkeypatch):
-    monkeypatch.setattr(config, "OPENAI_API_KEY", "")
-    requests, sink = [], RecordingSink()
-    reply = '{"heard": "what is the capital of Japan", "reply": "It is **Tokyo**."}'
+def heard_client(requests, heard, laptop=None):
+    """Gemini transcribes (audio in -> {"heard"}) and answers text; ``laptop``: Ollama NDJSON reply bytes."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/api/chat"):
+            if laptop is None:
+                raise httpx.ConnectError("laptop unreachable")
+            return httpx.Response(200, content=laptop)
+        body = json.loads(request.content)
+        if "inlineData" in body["contents"][-1]["parts"][0]:
+            text = json.dumps({"heard": heard})
+        else:
+            text = "It is **Tokyo**."
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": text}]}}]})
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
+
+def run_listen(requests, sink, heard, laptop=None):
     async def main():
         queue = asyncio.Queue()
         await queue.put((api.LISTEN_JOB, wav_bytes()))
-        async with gemini_client(requests, text=reply) as client:
+        async with heard_client(requests, heard, laptop) as client:
             task = asyncio.create_task(api.api_routing_task(queue, client=client, sink=sink))
             await queue.join()
             task.cancel()
 
     asyncio.run(main())
-    body = json.loads(requests[0].content)
-    assert body["contents"][0]["parts"][0]["inlineData"]["mimeType"] == "audio/wav"
-    assert body["generationConfig"]["responseMimeType"] == "application/json"
+
+
+def test_heard_speech_is_transcribed_by_gemini_and_answered_by_cloud(gemini, monkeypatch):
+    monkeypatch.setattr(config, "OPENAI_API_KEY", "")
+    requests, sink = [], RecordingSink()
+    run_listen(requests, sink, "what is the capital of Japan")
+    hear, answer = (json.loads(r.content) for r in requests)
+    assert hear["contents"][0]["parts"][0]["inlineData"]["mimeType"] == "audio/wav"
+    assert hear["generationConfig"]["responseMimeType"] == "application/json"
+    assert hear["generationConfig"]["temperature"] == 0
+    assert answer["contents"][-1]["parts"][0]["text"] == "what is the capital of Japan"
+    assert "Current local date and time" in answer["systemInstruction"]["parts"][0]["text"]
     assert ("heard", "what is the capital of Japan") in sink.events
     assert ("reply", "It is Tokyo.") in sink.events
+
+
+def test_heard_speech_goes_to_the_laptop_llm_first(gemini, monkeypatch):
+    monkeypatch.setattr(config, "OPENAI_API_KEY", "")
+    monkeypatch.setattr(config, "LOCAL_LLM_URL", "http://10.252.137.20:11434")
+    monkeypatch.setattr(llm_client, "warm_up", _no_warm_up)
+    laptop = (json.dumps({"message": {"content": "Tokyo."}, "done": False}) + "\n"
+              + json.dumps({"done": True}) + "\n").encode()
+    requests, sink = [], RecordingSink()
+    run_listen(requests, sink, "what is the capital of Japan", laptop)
+    assert [r.url.path.rsplit("/", 1)[-1] for r in requests] == ["gemini-test:generateContent", "chat"]
+    assert ("reply", "Tokyo.") in sink.events
+
+
+async def _no_warm_up(client):
+    pass
 
 
 def test_heard_silence_is_an_error_not_a_question(gemini):
     requests, sink = [], RecordingSink()
 
     async def main():
-        async with gemini_client(requests, text='{"heard": "", "reply": "Hello?"}') as client:
+        async with heard_client(requests, "") as client:
             return await api.handle_heard(client, wav_bytes(), sink)
 
     assert asyncio.run(main()) is False
+    assert len(requests) == 1  # silence is never sent to a reply model
     assert any(kind == "error" and "didn't catch" in text for kind, text in sink.events)
     assert not any(kind == "reply" for kind, _ in sink.events)
 

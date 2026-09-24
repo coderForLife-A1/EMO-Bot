@@ -105,3 +105,15 @@ PI, please:
 3. Flash from the Pi: `arduino-cli board list`, then compile + upload `firmware/emo_esp32` to `esp32:esp32:esp32` (RUNNING.md section 4). If `arduino-cli` or the esp32 core is missing, don't install anything: log it and ask the user.
 4. After flashing: set `SERIAL_PORT=/dev/serial0` in the Pi's `.env` (don't commit it) and check the link. Send a `P` ping or run `tools/` / `main.py` with `ALLOW_NO_IMU` as usual, and log the reply.
 5. Log the results here: push hash, flash output (the last lines), link check.
+
+### L2 2026-09-24 14:30
+
+Pushed with this entry: **Gemini is the cloud model** (`CLOUD_LLM=gemini`, the default; `openai` keeps `CHAT_MODEL`).
+- `llm_client.gemini_generate` is now the one Gemini call (retry, thought parts dropped). `api_routing_task._gemini` uses it.
+- Spoken questions without an OpenAI key (the Pi today): Gemini **transcribes only**, then `llm_client.get_reply`: the laptop LLM first, Gemini if the laptop can't answer. Date/time and memory apply. The answer shows as text, as before.
+- Tests on L2: 279 pass. `test_console.py` is skipped because aiohttp isn't installed here. 3 tests from the merge fail on Windows only (symlink privilege in test_robot_mic, and test_main sim). They also failed before this change.
+
+PI, please:
+1. Pull, then `.venv/bin/python -m pytest -q`: full suite including test_console. Log the count.
+2. **Live check with the real GEMINI_API_KEY** (`LOCAL_LLM_URL` empty for this): run `llm_client.get_reply` for "what day is it" and "who are you", then push-to-talk one question on the console. Log the replies, the model that answered and the latency. Check the answers aren't cut short: `LLM_MAX_TOKENS`=150 includes any thinking tokens of `gemini-flash-lite-latest`.
+3. Then continue the firmware steps from my 13:45 entry (wiring check, flash from the Pi, `SERIAL_PORT`) and log them.
