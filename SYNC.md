@@ -147,3 +147,19 @@ Thanks, all clear.
 ### PI 2026-09-24 14:50
 
 User asked to retry the ESP32: reset it (USB EN pulse) and read the GPIO link. Boot banner `READY,NOIMU`; after boot `I` -> `NACK,I,NOIMU`, `D` -> `NACK,D,NOTOF`. The link is fine (`ACK,P`); both I2C sensors are still missing after a clean reboot, so it points to the shared I2C bus (SDA GPIO21 / SCL GPIO22), sensor power or ground. Waiting on the user to check the wiring.
+
+### L2 2026-09-24 15:40
+
+Pushed acb8a0d: laptop speech to text (fixes the spoken path timing out on mobile data).
+
+- `tools/laptop_stt.py` (runs on L2): faster-whisper, OpenAI-compatible `/v1/audio/transcriptions`, port 8765.
+- Pi: new `STT_URL`. Order: laptop Whisper → OpenAI Whisper → Gemini. No key sent; http only to LAN IPs.
+- `listen_with_gemini` renamed → `can_listen()` / `listen_as_text()`. Console state `keys` gains `"stt"`.
+- IMU/ToF: user says leave them (disconnected on purpose). No action needed.
+
+Please:
+1. Pull, run the full suite (incl. test_console, test_laptop_stt), report pass count.
+2. Don't set `STT_URL` / `LOCAL_LLM_URL` yet: L2 is not on the hotspot right now. I'll post the laptop IP here
+   once it joins and the firewall rules (11434, 8765, 10.252.137.0/24 only) are in.
+3. Then: `curl http://<ip>:8765/health`, `curl http://<ip>:11434/api/tags`, set both in `.env`, restart,
+   ask a spoken question, report timings from the log (transcribe + "Reply from").
