@@ -5,10 +5,13 @@ open http://localhost:8080 on the laptop (through an SSH tunnel, see RUNNING.md 
 
 - the page shows EMO's animated eyes, which follow the robot's state (idle, listening, thinking, speaking,
   resting, fallen, E-stop, posture reminder), plus link/IMU/pitch/distance status and recent events;
-- hold the talk button (or the space bar) to speak: the browser records the laptop mic, uploads a WAV
-  (POST /api/listen) and the normal Whisper -> GPT -> ElevenLabs pipeline answers;
+- hold the talk button (or the space bar) to speak: with MIC_SOURCE=robot the Pi records its own mic (the
+  USB webcam's, robot_mic.py); otherwise the browser records the laptop mic and uploads a WAV (POST
+  /api/listen). Either way the recording goes through the normal LISTEN_JOB pipeline;
+- type a question, or click one of the preset examples: Gemini answers in plain text under the face
+  (no speech either way);
 - the robot's voice plays in the browser (ConsoleSink); cues it can't voice without an ElevenLabs key
-  are spoken by the browser's own speech synthesis;
+  are shown as text instead;
 - buttons send the same commands as robot/locomotion/cmd and robot/error (stand, rest, walk, E-stop...).
 
 Security: by default it listens on 127.0.0.1 only. Binding it to the network requires CONSOLE_TOKEN, and
@@ -31,7 +34,15 @@ from urllib.parse import urlsplit
 from aiohttp import WSMsgType, web
 
 import config
-from api_routing_task import LISTEN_JOB, LOCAL_SPEAKER, LocalSpeaker
+from api_routing_task import (
+    ASK_JOB,
+    EXAMPLES,
+    LISTEN_JOB,
+    LOCAL_SPEAKER,
+    MAX_QUESTION_CHARS,
+    LocalSpeaker,
+    listen_with_gemini,
+)
 from frame_mailbox import CONSOLE_FRAMES, MAX_FRAME_BYTES
 from netutil import is_local_host
 
@@ -141,6 +152,7 @@ class Console:
         busy_event: threading.Event,
         publisher=None,
         token: str = "",
+        mic=None,
     ):
         self.state = state  # behavior_tree_module.SharedState (read-only here; changes go through deliver)
         self.status = status  # robot_status.RobotStatus
@@ -151,7 +163,8 @@ class Console:
         self.token = token
         self.pages: set[_Page] = set()
         self.voice = {"status": "idle", "heard": "", "reply": "", "error": ""}
-        self.recording = False  # a page is recording right now
+        self.recording = False  # a page (or the robot's mic, for a page) is recording right now
+        self.mic = mic  # robot_mic.RobotMic when MIC_SOURCE=robot: the Pi records, not the browser
         self.camera_wanted = config.ENABLE_VISION and config.CAMERA_SOURCE == "console"
 
     # ------------------------------------------------------------ to the pages
@@ -171,7 +184,7 @@ class Console:
             self.voice[kind] = text
         else:
             self.voice["status"] = kind
-            if kind == "listening":  # a new question: the last exchange's captions go
+            if kind in ("listening", "thinking"):  # a new question or cue: the last exchange's captions go
                 self.voice.update(heard="", reply="", error="")
         self.broadcast({"type": "voice", **self.voice})
 
@@ -202,7 +215,11 @@ class Console:
             "camera": self.camera_wanted,
             "voice": self.voice,
             "events": [f"{t} {line}" for t, line in list(st.events)[-8:]],
-            "keys": {"openai": bool(config.OPENAI_API_KEY), "elevenlabs": bool(config.ELEVENLABS_API_KEY)},
+            "keys": {"openai": bool(config.OPENAI_API_KEY), "elevenlabs": bool(config.ELEVENLABS_API_KEY),
+                     "gemini": bool(config.GEMINI_API_KEY)},
+            "can_listen": listen_with_gemini() or bool(config.OPENAI_API_KEY and config.ELEVENLABS_API_KEY),
+            "robot_mic": self.mic is not None,
+            "mic_level": round(self.mic.level, 2) if self.mic is not None and self.mic.recording else 0,
             "calibration": {
                 "tof": bool(cal.tof_points),
                 "tof_scale": cal.tof_scale,
@@ -252,17 +269,49 @@ class Console:
         if kind == "listening":  # a page started recording: stand still and show the listening face
             if self.busy.is_set():
                 return "busy: still answering the last question"
+            if self.mic is not None:
+                try:
+                    self.mic.start()
+                except Exception as exc:  # noqa: BLE001 - no mic, device busy...: tell the page
+                    logger.warning("Robot microphone failed: %s", exc)
+                    return f"robot mic: {exc}"
             self.recording = True
             self._set_conversation(True)
             self.voice_event("listening")
             return None
+        if kind == "stop":  # talk button released: the robot's recording goes to the pipeline
+            if self.mic is None or not self.mic.recording:
+                return None
+            return self.queue_recording(self.mic.stop())
+        if kind == "ask":  # a typed question (or a preset example): answered as text by api_routing_task
+            return self._ask(message.get("text", ""))
         if kind == "cancel":  # recording aborted (too short, mic error)
+            if self.mic is not None:
+                self.mic.cancel()
             self.recording = False
             if not self.busy.is_set():
                 self._set_conversation(False)
                 self.voice_event("idle")
             return None
         return f"unknown message type {kind!r}"
+
+    def _ask(self, text) -> Optional[str]:
+        question = " ".join(str(text).split())
+        if not question:
+            return "type a question first"
+        if len(question) > MAX_QUESTION_CHARS:
+            return f"question too long (max {MAX_QUESTION_CHARS} characters)"
+        if self.busy.is_set() or self.recording:
+            return "busy: still answering the last question"
+        self.busy.set()  # released by api_routing_task once the answer is shown
+        self._set_conversation(True)
+        try:
+            self.speech_queue.put_nowait((ASK_JOB, question))
+        except asyncio.QueueFull:
+            self.busy.clear()
+            self._set_conversation(False)
+            return "speech queue full, try again"
+        return None
 
     def _level_refusal(self, now: Optional[float] = None) -> Optional[str]:
         """Why a level calibration would store a bad offset right now, or None if it looks sane."""
@@ -299,6 +348,7 @@ class Console:
         logger.info("Console opened from %s (%d open)", request.remote, len(self.pages))
         page.send(("json", self.snapshot()))
         page.send(("json", {"type": "voice", **self.voice}))
+        page.send(("json", {"type": "examples", "items": list(EXAMPLES)}))
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
@@ -341,6 +391,12 @@ class Console:
             raise web.HTTPBadRequest(text=f"recording must be {MIN_RECORDING_S}-{MAX_RECORDING_S:.0f} s long")
         if self.busy.is_set():
             raise web.HTTPConflict(text="busy: still answering the last question")
+        if not self._queue_listen(data):
+            raise web.HTTPServiceUnavailable(text="speech queue full, try again")
+        logger.info("Console recording queued (%.1f s)", seconds)
+        return web.json_response({"ok": True, "seconds": round(seconds, 2)})
+
+    def _queue_listen(self, data: bytes) -> bool:
         self.busy.set()  # released by api_routing_task once the answer has played
         self._set_conversation(True)
         try:
@@ -348,10 +404,22 @@ class Console:
         except asyncio.QueueFull:
             self.busy.clear()
             self._set_conversation(False)
-            raise web.HTTPServiceUnavailable(text="speech queue full, try again") from None
+            return False
         self.voice_event("thinking")
-        logger.info("Console recording queued (%.1f s)", seconds)
-        return web.json_response({"ok": True, "seconds": round(seconds, 2)})
+        return True
+
+    def queue_recording(self, data: bytes) -> Optional[str]:
+        """Hand the robot mic's recording (WAV) to api_routing_task. Returns an error text, or None if queued."""
+        self.recording = False
+        seconds = wav_duration_s(data)
+        if seconds < MIN_RECORDING_S:
+            self.handle_message({"type": "cancel"})
+            return "hold the button while you speak"
+        if not self._queue_listen(data):
+            self.handle_message({"type": "cancel"})
+            return "speech queue full, try again"
+        logger.info("Robot mic recording queued (%.1f s)", seconds)
+        return None
 
     def build_app(self) -> web.Application:
         app = web.Application(client_max_size=MAX_UPLOAD_BYTES)
@@ -398,10 +466,11 @@ class ConsoleSink(LocalSpeaker):
         await self.play_wav(data)
 
     async def speak_text(self, text: str) -> bool:
+        """No cloud voice: show the cue as text under the face for as long as it would take to say it."""
         if not self._to_console() or not self.console.has_pages():
             return False
-        self.console.voice_event("speaking")
-        self.console.broadcast({"type": "say", "text": text})
+        self.console.voice_event("heard", "")
+        self.console.voice_event("reply", text)
         await asyncio.sleep(len(text) / SPEECH_CHARS_PER_S + PLAYBACK_MARGIN_S)
         return True
 
@@ -442,6 +511,10 @@ async def console_task(
             logger.warning("Console is plain HTTP on the network: browsers only allow the mic on https:// or "
                            "localhost (use an SSH tunnel, or set CONSOLE_CERT/CONSOLE_KEY)")
         while True:
+            if console.mic is not None and console.mic.too_long():  # talk button held too long: answer now
+                error = console.handle_message({"type": "stop"})
+                if error:
+                    console.broadcast({"type": "error", "text": error})
             if console.pages:
                 console.broadcast(console.snapshot(), droppable=True)
             await asyncio.sleep(SNAPSHOT_PERIOD_S)

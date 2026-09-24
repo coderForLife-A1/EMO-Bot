@@ -180,7 +180,7 @@ def test_sink_uses_the_pi_speaker_until_a_page_is_open(monkeypatch):
 
     async def main():
         await sink.play_wav(wav(0.01))
-        assert await sink.speak_text("hi") is False  # no page: can't use the browser's voice
+        assert await sink.speak_text("hi") is False  # no page: nowhere to show it
         rig.console.pages.add(page)
         await sink.play_wav(wav(0.01))
         assert await sink.speak_text("hi") is True
@@ -192,7 +192,9 @@ def test_sink_uses_the_pi_speaker_until_a_page_is_open(monkeypatch):
         sent.append(page.queue.get_nowait())
     kinds = [k for k, _ in sent]
     assert kinds.count("bytes") == 1
-    assert {"type": "say", "text": "hi"} in [p for k, p in sent if k == "json"]
+    shown = [p for k, p in sent if k == "json" and p.get("type") == "voice"]
+    assert shown and shown[-1]["reply"] == "hi"  # no voice: the cue is shown as text
+    assert not [p for k, p in sent if k == "json" and p.get("type") == "say"]
 
 
 def test_console_only_mode_never_uses_the_pi_speaker(monkeypatch):
@@ -226,3 +228,76 @@ def test_console_refuses_a_level_calibration_that_would_store_a_bad_offset():
     rig.status.on_line("T,20,3,0,O")
     assert rig.console.handle_message({"type": "cmd", "cmd": "calibrate"}) is None
     assert (config.TOPIC_LOCOMOTION_CMD, "calibrate") in rig.delivered
+
+
+def test_ask_queues_a_text_question_and_holds_busy():
+    rig = Rig()
+    assert rig.console.handle_message({"type": "ask", "text": "  Tell me   a joke. "}) is None
+    assert rig.queue.get_nowait() == (cs.ASK_JOB, "Tell me a joke.")
+    assert rig.busy.is_set()  # released by api_routing_task once the answer is shown
+    assert "busy" in rig.console.handle_message({"type": "ask", "text": "again"})
+    assert rig.queue.empty()
+
+
+def test_ask_refuses_empty_and_long_questions():
+    rig = Rig()
+    assert rig.console.handle_message({"type": "ask", "text": "   "}) == "type a question first"
+    assert "too long" in rig.console.handle_message({"type": "ask", "text": "x" * 1000})
+    assert rig.queue.empty() and not rig.busy.is_set()
+
+
+class FakeRobotMic:
+    def __init__(self, seconds=1.0, fail=None):
+        self.recording, self.level, self.seconds, self.fail = False, 0.0, seconds, fail
+
+    def start(self):
+        if self.fail:
+            raise RuntimeError(self.fail)
+        self.recording = True
+
+    def stop(self):
+        if not self.recording:
+            return None
+        self.recording = False
+        return wav(self.seconds)
+
+    def cancel(self):
+        self.recording = False
+
+    def too_long(self):
+        return False
+
+
+def test_robot_mic_push_to_talk_queues_the_recording():
+    rig = Rig()
+    rig.console.mic = FakeRobotMic()
+    assert rig.console.handle_message({"type": "listening"}) is None
+    assert rig.console.mic.recording and rig.state.conversation_active
+    assert rig.console.snapshot()["robot_mic"] is True
+    assert rig.console.handle_message({"type": "stop"}) is None
+    kind, data = rig.queue.get_nowait()
+    assert kind == cs.LISTEN_JOB and cs.wav_duration_s(data) == pytest.approx(1.0)
+    assert rig.busy.is_set() and not rig.console.recording
+
+
+def test_robot_mic_errors_reach_the_page():
+    rig = Rig()
+    rig.console.mic = FakeRobotMic(fail="no microphone found on the robot: is the webcam plugged in?")
+    assert "webcam plugged in" in rig.console.handle_message({"type": "listening"})
+    assert not rig.console.recording and rig.queue.empty()
+
+
+def test_robot_mic_too_short_is_dropped():
+    rig = Rig()
+    rig.console.mic = FakeRobotMic(seconds=0.1)
+    rig.console.handle_message({"type": "listening"})
+    assert rig.console.handle_message({"type": "stop"}) == "hold the button while you speak"
+    assert rig.queue.empty() and not rig.busy.is_set() and not rig.state.conversation_active
+
+
+def test_robot_mic_cancel_stops_recording():
+    rig = Rig()
+    rig.console.mic = FakeRobotMic()
+    rig.console.handle_message({"type": "listening"})
+    rig.console.handle_message({"type": "cancel"})
+    assert not rig.console.mic.recording and rig.queue.empty()

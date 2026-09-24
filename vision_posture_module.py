@@ -9,9 +9,11 @@ with `python vision_posture_module.py`.
 """
 import bisect
 import collections
+import contextlib
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -34,6 +36,7 @@ POSTURE_ABSENT_RESET_S = 10.0  # user out of view this long -> POSTURE_OK
 POSTURE_ABSENT_GRACE_S = 1.0  # out of view this long -> slouch/good timers restart (ignores dropouts)
 
 CONSOLE_SOURCE = "console"
+AUTO_SOURCE = "auto"
 CONSOLE_FRAME_WAIT_S = 0.5  # the page sends ~5 frames/s while its camera is on
 
 MIN_FRAME_WAIT_S = 0.002  # a grab() faster than this didn't wait for a frame (run_vision then sleeps)
@@ -140,9 +143,35 @@ def _configure_capture(cap: cv2.VideoCapture) -> cv2.VideoCapture:
     return cap
 
 
+def find_usb_camera(sys_root: str = "/sys/class/video4linux") -> Optional[str]:
+    """/dev/videoN of the first USB (UVC) webcam. Its number changes with what else is plugged in, and the
+    Pi 5's own image-processor nodes (/dev/video19+) aren't cameras; UVC's second node (index 1) is metadata."""
+    root = Path(sys_root)
+    if not root.is_dir():
+        return None
+    nodes = sorted(root.glob("video*"), key=lambda p: int(p.name[5:]) if p.name[5:].isdigit() else 1 << 30)
+    for node in nodes:
+        driver = node / "device" / "driver"
+        if not driver.exists() or driver.resolve().name != "uvcvideo":
+            continue
+        with contextlib.suppress(OSError, ValueError):
+            if int((node / "index").read_text().strip() or 0) != 0:
+                continue
+        return f"/dev/{node.name}"
+    return None
+
+
 def open_camera(source: Optional[str] = None):
-    """Open "picamera2", "console" (the laptop console's webcam), a webcam index such as "0", or a V4L2 path."""
+    """Open "auto" (the USB webcam, wherever it is), "picamera2", "console" (the laptop console's webcam),
+    a webcam index such as "0", or a V4L2 path."""
     source = source if source is not None else config.CAMERA_SOURCE
+    if source == AUTO_SOURCE:
+        device = find_usb_camera()
+        if device is None:
+            raise RuntimeError("no USB webcam found (CAMERA_SOURCE=auto): is it plugged in? "
+                               "Check `v4l2-ctl --list-devices`")
+        logger.info("USB webcam found at %s", device)
+        return open_v4l2_camera(device)
     if source == CONSOLE_SOURCE:
         return _ConsoleCapture()
     if source == "picamera2":

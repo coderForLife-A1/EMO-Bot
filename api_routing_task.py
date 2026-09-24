@@ -1,13 +1,21 @@
 """Cloud speech pipeline: Whisper (speech to text) -> GPT (reply) -> ElevenLabs (text to speech) -> aplay.
 
+Typed questions from the console (ASK_JOB) go to Gemini instead and the answer is shown as plain text,
+with no speech either way. Without the Whisper/ElevenLabs keys, spoken questions (LISTEN_JOB) go to Gemini
+too: it transcribes the recording and answers in one call, and both are shown as text.
+The preset EXAMPLES have canned answers used when Gemini can't be reached.
+
 Also speaks short cues from the behavior tree ("I fell over", posture reminder), caching them.
 On any failure it plays assets/network_error.wav. Test keys and speaker with
 `python api_routing_task.py "Hello"`.
 """
 import asyncio
+import base64
 import contextlib
 import io
+import json
 import logging
+import re
 import sys
 import threading
 import wave
@@ -23,6 +31,8 @@ logger = logging.getLogger(__name__)
 
 LISTEN_JOB = "listen"  # (LISTEN_JOB, wav_bytes): full Whisper -> LLM -> TTS cascade
 SAY_JOB = "say"  # (SAY_JOB, text): speak a fixed phrase (behavior tree cues)
+ASK_JOB = "ask"  # (ASK_JOB, text): typed question -> Gemini -> text reply on the console, no audio
+CONVERSATION_JOBS = (LISTEN_JOB, ASK_JOB)  # hold the conversation flag and busy_event until answered
 
 # ElevenLabs returns MP3 unless output_format is set; the Accept header is ignored.
 # Raw 16 kHz PCM is available on every plan and is wrapped into a WAV for aplay.
@@ -33,6 +43,23 @@ SYSTEM_PROMPT = (
     "You are a concise, helpful assistant inside a desktop companion robot. "
     "Respond in one or two short sentences."
 )
+
+GEMINI_SYSTEM_PROMPT = (
+    "You are EMO, a small, friendly desk robot with two legs and a face on a laptop screen. You can stand, walk, "
+    "turn, do a knee bob and remind people to sit up straight. Answer in plain text only: no markdown, "
+    "no asterisks, no bullet points, no emoji. Keep it to one or two short sentences."
+)
+MAX_QUESTION_CHARS = 300
+
+# Preset questions for demos: the console shows them as buttons. The canned answer is shown if Gemini fails.
+EXAMPLES: dict[str, str] = {
+    "Hi EMO, who are you?": "Hi! I'm EMO, a little desk robot who keeps you company and reminds you to sit up.",
+    "What can you do?": "I can stand, walk, turn, do a knee bob, and nudge you when you slouch.",
+    "Tell me a joke.": "Why did the robot go on holiday? It needed to recharge its batteries.",
+    "Give me a posture tip.": "Keep your screen at eye level and your feet flat on the floor.",
+    "What is 12 times 8?": "12 times 8 is 96.",
+    "Say something nice.": "You're doing great today, and I'm happy to be on your desk.",
+}
 
 _phrase_cache: dict[str, bytes] = {}
 
@@ -85,6 +112,118 @@ async def _request_response(client: httpx.AsyncClient, transcript: str) -> str:
     if not response_text:
         raise RuntimeError(f"{config.CHAT_MODEL} returned empty text")
     return response_text
+
+
+def plain_text(text: str) -> str:
+    """Strip the markdown Gemini sometimes adds anyway, so the console shows clean text."""
+    text = re.sub(r"[*_`#]+", "", text)
+    text = re.sub(r"^\s*[-•]\s+", "", text, flags=re.MULTILINE)
+    return " ".join(text.split())
+
+
+async def _gemini(client: httpx.AsyncClient, parts: list[dict], generation: Optional[dict] = None) -> str:
+    """One generateContent call; returns the answer's text (thinking parts dropped)."""
+    require_https(config.GEMINI_BASE_URL)
+    url = f"{config.GEMINI_BASE_URL}/models/{config.GEMINI_MODEL}:generateContent"
+    body = {
+        "systemInstruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"temperature": 0.6, "maxOutputTokens": 300, **(generation or {})},
+    }
+    for attempt in range(2):  # the free tier answers 503 "high demand" now and then: one retry
+        response = await client.post(url, headers={"x-goog-api-key": config.GEMINI_API_KEY}, json=body)
+        if response.status_code not in (429, 500, 503) or attempt:
+            break
+        await asyncio.sleep(1.0)
+    response.raise_for_status()
+    try:
+        answer_parts = response.json()["candidates"][0]["content"]["parts"]
+    except (KeyError, IndexError, ValueError) as exc:
+        raise RuntimeError(f"{config.GEMINI_MODEL} returned no answer") from exc
+    return "".join(str(p.get("text", "")) for p in answer_parts if not p.get("thought"))
+
+
+async def _ask_gemini(client: httpx.AsyncClient, question: str) -> str:
+    answer = plain_text(await _gemini(client, [{"text": question}]))
+    if not answer:
+        raise RuntimeError(f"{config.GEMINI_MODEL} returned empty text")
+    return answer
+
+
+HEAR_INSTRUCTION = (
+    "The audio is a person talking to you. Return JSON: \"heard\" is exactly what they said (empty if there "
+    "is no speech, only noise or silence), \"reply\" is your answer to it."
+)
+HEAR_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {"heard": {"type": "STRING"}, "reply": {"type": "STRING"}},
+    "required": ["heard", "reply"],
+}
+
+
+async def _hear_gemini(client: httpx.AsyncClient, wav_bytes: bytes) -> tuple[str, str]:
+    """Speech to text and the answer in one call: (what was heard, reply). Heard is empty for silence."""
+    raw = await _gemini(
+        client,
+        [{"inlineData": {"mimeType": "audio/wav", "data": base64.b64encode(wav_bytes).decode()}},
+         {"text": HEAR_INSTRUCTION}],
+        {"responseMimeType": "application/json", "responseSchema": HEAR_SCHEMA},
+    )
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{config.GEMINI_MODEL} returned malformed JSON") from exc
+    return " ".join(str(data.get("heard", "")).split()), plain_text(str(data.get("reply", "")))
+
+
+def listen_with_gemini() -> bool:
+    """Spoken questions go to Gemini (text answer, no voice) unless the Whisper/ElevenLabs keys are both set."""
+    return bool(config.GEMINI_API_KEY) and not (config.OPENAI_API_KEY and config.ELEVENLABS_API_KEY)
+
+
+async def handle_heard(client: httpx.AsyncClient, wav_bytes: bytes, sink: Optional["LocalSpeaker"] = None) -> bool:
+    """Answer a spoken question as text on ``sink``'s display (no audio played). False if only an error was shown."""
+    sink = sink or LOCAL_SPEAKER
+    sink.event("thinking")
+    try:
+        heard, answer = await asyncio.wait_for(_hear_gemini(client, wav_bytes), timeout=config.API_TIMEOUT_SECONDS)
+    except Exception as exc:  # noqa: BLE001 - shown on the console instead
+        logger.warning("Gemini listen failed: %r", exc)
+        sink.event("error", _short_reason(exc))
+        sink.event("idle")
+        return False
+    if not heard:
+        sink.event("error", "I didn't catch that: hold the button while you speak")
+        sink.event("idle")
+        return False
+    logger.debug("Heard: %r, answer: %r", heard, answer)
+    sink.event("heard", heard)
+    sink.event("reply", answer or EXAMPLES.get(heard, "Sorry, I have no answer for that."))
+    sink.event("idle")
+    return True
+
+
+async def handle_ask(client: httpx.AsyncClient, question: str, sink: Optional["LocalSpeaker"] = None) -> bool:
+    """Answer a typed question as text on ``sink``'s display. Returns False if only an error was shown."""
+    sink = sink or LOCAL_SPEAKER
+    question = " ".join(str(question).split())[:MAX_QUESTION_CHARS]
+    sink.event("thinking")
+    sink.event("heard", question)
+    try:
+        if not config.GEMINI_API_KEY:
+            raise RuntimeError("missing GEMINI_API_KEY in .env")
+        answer = await asyncio.wait_for(_ask_gemini(client, question), timeout=config.API_TIMEOUT_SECONDS)
+    except Exception as exc:  # noqa: BLE001 - a preset question still gets its canned answer
+        logger.warning("Gemini question failed: %r", exc)
+        answer = EXAMPLES.get(question)
+        if answer is None:
+            sink.event("error", _short_reason(exc))
+            sink.event("idle")
+            return False
+    logger.debug("Answer: %r", answer)
+    sink.event("reply", answer)
+    sink.event("idle")
+    return True
 
 
 def pcm_to_wav(pcm: bytes, sample_rate: int = TTS_SAMPLE_RATE) -> bytes:
@@ -244,9 +383,9 @@ async def api_routing_task(
     client: Optional[httpx.AsyncClient] = None,
     sink: Optional[LocalSpeaker] = None,
 ) -> None:
-    """Consume (LISTEN_JOB, wav_bytes) and (SAY_JOB, text) jobs.
+    """Consume (LISTEN_JOB, wav_bytes), (ASK_JOB, text) and (SAY_JOB, text) jobs.
 
-    After each LISTEN_JOB the conversation flag is cleared on MQTT and ``busy_event`` is released
+    After each LISTEN_JOB or ASK_JOB the conversation flag is cleared on MQTT and ``busy_event`` is released
     so the wake-word listener re-arms. ``sink`` plays the result (default: the Pi's speaker).
     """
     owns_client = client is None
@@ -255,9 +394,14 @@ async def api_routing_task(
         while True:
             kind, value = await job_queue.get()
             try:
-                await handle_job(client, kind, value, sink)
+                if kind == ASK_JOB:
+                    await handle_ask(client, value, sink)
+                elif kind == LISTEN_JOB and listen_with_gemini():
+                    await handle_heard(client, value, sink)
+                else:
+                    await handle_job(client, kind, value, sink)
             finally:
-                if kind == LISTEN_JOB:
+                if kind in CONVERSATION_JOBS:
                     if mqtt_client is not None:
                         mqtt_client.publish(config.TOPIC_WAKE_FLAG, "0", qos=0, retain=False)
                     if busy_event is not None:
@@ -275,6 +419,22 @@ async def _say_once(text: str) -> None:
     print("Spoke via ElevenLabs" if ok else "Failed (reason logged above); fallback sound attempted")
 
 
+class _PrintSink(LocalSpeaker):
+    def event(self, kind: str, text: str = "") -> None:
+        if kind in ("reply", "error"):
+            print(f"EMO: {text}" if kind == "reply" else f"Error: {text}")
+
+
+async def _ask_once(question: str) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(config.API_TIMEOUT_SECONDS)) as client:
+        await handle_ask(client, question, _PrintSink())
+
+
 if __name__ == "__main__":
     # Quick check of keys + speaker: python api_routing_task.py "Hello, I am EMO"
-    asyncio.run(_say_once(" ".join(sys.argv[1:]) or "Hello, I am EMO."))
+    # Gemini text answer, no audio:   python api_routing_task.py --ask "Tell me a joke."
+    if sys.argv[1:2] == ["--ask"]:
+        asyncio.run(_ask_once(" ".join(sys.argv[2:]) or "Hi EMO, who are you?"))
+    else:
+        asyncio.run(_say_once(" ".join(sys.argv[1:]) or "Hello, I am EMO."))

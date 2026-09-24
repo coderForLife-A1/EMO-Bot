@@ -85,7 +85,8 @@ CONSOLE_KEY = os.getenv("CONSOLE_KEY", "").strip()
 # "console" = only the console; "local" = only aplay.
 AUDIO_OUTPUT = (os.getenv("AUDIO_OUTPUT", "").strip().lower() or "auto")
 
-# "picamera2" (Pi CSI camera), a V4L2 path such as "/dev/video0", or a webcam index such as "0"
+# "auto" (the first USB webcam, whatever /dev/videoN it gets), "picamera2" (Pi CSI camera),
+# a V4L2 path such as "/dev/video0", a webcam index such as "0", or "console" (the laptop console's webcam)
 CAMERA_SOURCE = os.getenv("CAMERA_SOURCE", "/dev/video0")
 
 # Microphone for sounddevice (name substring or index); empty = system default.
@@ -93,6 +94,9 @@ CAMERA_SOURCE = os.getenv("CAMERA_SOURCE", "/dev/video0")
 AUDIO_INPUT_DEVICE = os.getenv("AUDIO_INPUT_DEVICE", "").strip() or None
 # ALSA playback device for aplay, e.g. "plughw:0"; empty = default
 AUDIO_OUTPUT_DEVICE = os.getenv("AUDIO_OUTPUT_DEVICE", "").strip() or None
+# Which mic the console's talk button records: "robot" = the Pi's own (e.g. the USB webcam's mic, picked
+# automatically unless AUDIO_INPUT_DEVICE says otherwise), "console" = the laptop's, through the browser.
+MIC_SOURCE = os.getenv("MIC_SOURCE", "").strip().lower() or "console"
 
 PORCUPINE_ACCESS_KEY = os.getenv("PORCUPINE_ACCESS_KEY", "")
 PORCUPINE_KEYWORD_PATH = os.getenv("PORCUPINE_KEYWORD_PATH", "")
@@ -105,6 +109,11 @@ CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_TTS_URL = os.getenv("ELEVENLABS_TTS_URL", "https://api.elevenlabs.io/v1/text-to-speech")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
+
+# Typed questions on the console (text in, text out: no speech either way)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
 
 # Budget for the whole Whisper -> LLM -> TTS cascade (playback is not included)
 API_TIMEOUT_SECONDS = _env_float("API_TIMEOUT_SECONDS", 15.0)

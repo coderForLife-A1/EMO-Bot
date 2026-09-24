@@ -290,8 +290,14 @@ async def main() -> None:
     if config.ENABLE_CONSOLE:
         from console_server import Console, ConsoleSink
 
+        mic = None
+        if config.MIC_SOURCE == "robot":
+            from robot_mic import RobotMic
+
+            mic = RobotMic()
+            logger.info("Talk button records the robot's microphone (MIC_SOURCE=robot)")
         console = Console(state, status, deliver, speech_queue, conversation_busy, speech_publisher,
-                          token=config.CONSOLE_TOKEN)
+                          token=config.CONSOLE_TOKEN, mic=mic)
         sink = ConsoleSink(console, config.AUDIO_OUTPUT)
 
     def controller_connected() -> None:

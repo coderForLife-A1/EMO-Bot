@@ -145,3 +145,7 @@ deploy/certs/
 .claude/
 CLAUDE.md
 docs/
+
+# python robot_mic.py test recording
+mic_test.wav
+.env.bak

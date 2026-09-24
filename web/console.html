@@ -28,7 +28,7 @@
 
   #stage { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center;
     min-width: 0; padding: 16px; }
-  #face { width: min(100%, 1100px); aspect-ratio: 16 / 9; max-height: calc(100vh - 170px); display: block; }
+  #face { width: min(100%, 1100px); aspect-ratio: 16 / 9; max-height: calc(100vh - 260px); display: block; }
   #caption { min-height: 3.2em; max-width: 900px; text-align: center; font-size: clamp(16px, 2.2vw, 26px);
     color: var(--text); padding: 0 16px; }
   #caption .you { color: var(--muted); display: block; font-size: .75em; }
@@ -50,6 +50,20 @@
   #talk.rec { transform: scale(1.08); box-shadow: 0 0 0 calc(var(--level, 0) * 26px + 4px) rgba(63, 240, 255, .25);
     border-color: #fff; color: #fff; }
   #talk-hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+
+  #ask { width: min(100%, 900px); margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+  #examples { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; }
+  .chip { background: var(--panel-2); border: 1px solid var(--line); color: var(--text); border-radius: 999px;
+    padding: 7px 14px; cursor: pointer; font-size: 14px; }
+  .chip:hover:not(:disabled) { border-color: var(--eye); color: var(--eye); }
+  .chip:disabled { opacity: .4; cursor: not-allowed; }
+  #ask-form { display: flex; gap: 8px; }
+  #ask-text { flex: 1; min-width: 0; background: var(--panel); border: 1px solid var(--line); color: var(--text);
+    border-radius: 12px; padding: 10px 14px; font: inherit; }
+  #ask-text:focus { outline: none; border-color: var(--eye); }
+  #ask-send { background: #0f2a30; border: 2px solid var(--eye); color: var(--eye); border-radius: 12px; padding: 0 18px;
+    font-weight: 700; cursor: pointer; }
+  #ask-send:disabled { opacity: .4; cursor: not-allowed; }
 
   #panel { background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto; padding: 14px;
     display: flex; flex-direction: column; gap: 12px; }
@@ -104,8 +118,15 @@
   </div>
   <canvas id="face" width="1600" height="900" aria-label="EMO's face"></canvas>
   <div id="caption" aria-live="polite"></div>
-  <button id="talk" disabled aria-label="Hold to talk">HOLD<br>TO TALK</button>
-  <div id="talk-hint">hold the button or the space bar &middot; Esc = emergency stop</div>
+  <section id="ask" aria-label="Ask EMO">
+    <div id="examples"></div>
+    <form id="ask-form" autocomplete="off">
+      <input id="ask-text" maxlength="300" placeholder="Type a question for EMO&hellip;" aria-label="Question for EMO">
+      <button id="ask-send" type="submit">Ask</button>
+    </form>
+  </section>
+  <button id="talk" disabled aria-label="Hold to talk" hidden>HOLD<br>TO TALK</button>
+  <div id="talk-hint">click an example, type a question, or hold the button (or space bar) and speak &middot; Esc = emergency stop</div>
 </main>
 
 <aside id="panel">
@@ -151,7 +172,7 @@
 
 <div id="overlay">
   <h1>EMO console</h1>
-  <p>This laptop is EMO's face, microphone and speaker. Click start so the browser lets the page play sound.</p>
+  <p>This laptop is EMO's face and screen. Click an example question (or type your own) and EMO answers in text.</p>
   <button id="start">Start</button>
   <p id="overlay-note"></p>
 </div>
@@ -171,6 +192,7 @@ try { token = sessionStorage.getItem("emo-token") || ""; } catch (e) {}
 let ws = null, wsUp = false, retry = 500;
 let state = null;
 let voice = { status: "idle", heard: "", reply: "", error: "" };
+let examples = [];
 
 function connect() {
   const url = new URL("ws", location.href);
@@ -179,14 +201,15 @@ function connect() {
   ws = new WebSocket(url);
   ws.binaryType = "arraybuffer";
   ws.onopen = () => { wsUp = true; retry = 500; render(); };
-  ws.onclose = () => { wsUp = false; state = null; render(); setTimeout(connect, retry); retry = Math.min(retry * 2, 5000); };
+  ws.onclose = () => { wsUp = false; state = null; if (rec && rec.robot) rec = null; render(); setTimeout(connect, retry); retry = Math.min(retry * 2, 5000); };
   ws.onmessage = (ev) => {
     if (typeof ev.data !== "string") { playWav(ev.data); return; }
     const msg = JSON.parse(ev.data);
-    if (msg.type === "state") { state = msg; voice = msg.voice; render(); }
+    if (msg.type === "state") { state = msg; voice = msg.voice; if (rec && rec.robot) rec.level = msg.mic_level; render(); }
     else if (msg.type === "voice") { voice = msg; render(); }
     else if (msg.type === "say") { sayWithBrowser(msg.text); }
-    else if (msg.type === "error") { toast(msg.text); }
+    else if (msg.type === "examples") { examples = msg.items || []; renderExamples(); render(); }
+    else if (msg.type === "error") { toast(msg.text); if (rec && rec.robot) { rec = null; render(); } }
   };
 }
 function send(obj) {
@@ -244,6 +267,12 @@ registerProcessor("tap", Tap);`;
 
 async function startRecording() {
   if (rec || !canTalk()) return;
+  if (state.robot_mic) { // the Pi records its own mic (the webcam's); the page only says start/stop
+    rec = { robot: true, started: performance.now(), level: 0 };
+    if (!send({ type: "listening" })) rec = null;
+    render();
+    return;
+  }
   if (!window.isSecureContext || !navigator.mediaDevices) {
     toast("The browser only allows the mic on https:// or localhost: open the console through the SSH tunnel");
     return;
@@ -284,6 +313,14 @@ function teardown() {
 }
 async function stopRecording() {
   if (!rec) return;
+  if (rec.robot) {
+    const held = (performance.now() - rec.started) / 1000;
+    rec = null;
+    if (held < MIN_S) { send({ type: "cancel" }); toast("Hold the button while you speak"); }
+    else send({ type: "stop" });
+    render();
+    return;
+  }
   if (rec.pending) { rec.stopRequested = true; return; }
   const { chunks, rate } = rec;
   teardown();
@@ -325,8 +362,27 @@ function encodeWav(samples, rate) {
   }
   return new Blob([buf], { type: "audio/wav" });
 }
+function voiceKeys() { return !!(state && state.can_listen); }
+function canAsk() {
+  return wsUp && state && !state.busy && !state.estop && !rec;
+}
+function ask(text) {
+  text = (text || "").trim();
+  if (!text || !canAsk()) return;
+  if (send({ type: "ask", text })) $("ask-text").value = "";
+}
+function renderExamples() {
+  const box = $("examples");
+  box.textContent = "";
+  for (const q of examples) {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "chip"; b.textContent = q;
+    b.addEventListener("click", () => ask(q));
+    box.appendChild(b);
+  }
+}
 function canTalk() {
-  return wsUp && state && state.keys.openai && state.keys.elevenlabs && !state.busy && !state.estop;
+  return wsUp && state && state.can_listen && !state.busy && !state.estop;
 }
 
 // ------------------------------------------------------------------ webcam for posture monitoring (opt-in)
@@ -476,6 +532,10 @@ function render() {
   document.querySelectorAll("[data-cmd]").forEach((b) => { b.disabled = disabled || s.estop; });
   $("btn-level").disabled = disabled || s.estop;
   $("talk").disabled = !canTalk() && !rec;
+  $("talk").hidden = !voiceKeys() && !rec;
+  const askOk = canAsk();
+  $("ask-send").disabled = !askOk;
+  document.querySelectorAll("#examples .chip").forEach((b) => { b.disabled = !askOk; });
   const camBtn = $("btn-cam");
   camBtn.hidden = !(s && s.camera);
   camBtn.textContent = cam ? "Camera: on" : "Camera: off";
@@ -499,8 +559,7 @@ function render() {
   $("s-dist").innerHTML = s.tof_missing ? dot("bad") + "sensor missing" : s.distance == null ? "–" :
     s.distance < 0 ? dot("ok") + "nothing in range" : dot(cal.tof ? "ok" : "warn") + `${s.distance} mm` + (cal.tof ? "" : " (uncal.)");
   $("s-voice").textContent = rec ? "recording…" : voice.status;
-  const missing = [!s.keys.openai && "OPENAI_API_KEY", !s.keys.elevenlabs && "ELEVENLABS_API_KEY"].filter(Boolean);
-  $("s-keys").textContent = missing.length ? `Talking needs ${missing.join(" and ")} in .env. Cues use the browser's voice.` : "";
+  $("s-keys").textContent = s.keys.gemini ? "" : "Typed questions need GEMINI_API_KEY in .env (preset examples still get canned answers).";
 
   const estop = $("estop");
   estop.classList.toggle("latched", s.estop);
@@ -539,11 +598,12 @@ function typing(e) { return ["INPUT", "TEXTAREA"].includes(e.target.tagName); }
 document.addEventListener("keydown", (e) => {
   if (typing(e)) return;
   if (e.key === "Escape") { send({ type: "estop" }); return; }
-  if (e.code === "Space" && !e.repeat) { e.preventDefault(); startRecording(); }
+  if (e.code === "Space" && !e.repeat && voiceKeys()) { e.preventDefault(); startRecording(); }
   if (e.key === "f" || e.key === "F") toggleFull();
   if (e.key === "p" || e.key === "P") document.body.classList.toggle("face-only");
 });
-document.addEventListener("keyup", (e) => { if (e.code === "Space" && !typing(e)) { e.preventDefault(); stopRecording(); } });
+document.addEventListener("keyup", (e) => { if (e.code === "Space" && !typing(e) && rec) { e.preventDefault(); stopRecording(); } });
+$("ask-form").addEventListener("submit", (e) => { e.preventDefault(); ask($("ask-text").value); });
 function toggleFull() {
   if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen().catch(() => {});
 }

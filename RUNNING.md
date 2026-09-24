@@ -381,14 +381,17 @@ access once.
 | `SERIAL_BAUD` | `115200` | Must match the firmware |
 | `OPENAI_API_KEY` | – | Whisper + chat. Without it, conversations play the fallback sound |
 | `ELEVENLABS_API_KEY` | – | Text to speech |
+| `GEMINI_API_KEY` | – | Typed questions on the console (text in, plain-text answer out, no voice). Preset examples fall back to canned answers without it |
+| `GEMINI_MODEL` | `gemini-flash-lite-latest` | Any Gemini text model |
 | `PORCUPINE_ACCESS_KEY` | – | Free key at [console.picovoice.ai](https://console.picovoice.ai). Without it, wake word is disabled |
 | `PORCUPINE_KEYWORD_PATH` | *(built-in "porcupine")* | Custom `.ppn` wake word (Linux aarch64 build for the Pi) |
 | `ELEVENLABS_VOICE_ID` | `EXAVITQu4vr4xnSDxMaL` | Any voice ID from your ElevenLabs library |
 | `CHAT_MODEL` / `WHISPER_MODEL` | `gpt-4o` / `whisper-1` | |
 | `OPENAI_BASE_URL`, `ELEVENLABS_TTS_URL` | official endpoints | Change for a proxy / compatible API |
 | `API_TIMEOUT_SECONDS` | `15` | Budget for Whisper → LLM → TTS; playback isn't counted |
-| `CAMERA_SOURCE` | `/dev/video0` | `picamera2` (Pi 5 CSI camera), `/dev/video0` (USB), `0` (a webcam on this machine), `console` (the laptop console's webcam) |
+| `CAMERA_SOURCE` | `/dev/video0` | `auto` (the first USB webcam, whatever `/dev/videoN` it gets), `picamera2` (Pi 5 CSI camera), `/dev/video0` (USB), `0` (a webcam on this machine), `console` (the laptop console's webcam) |
 | `AUDIO_INPUT_DEVICE` | system default | Mic name substring or index from `python -m sounddevice`, e.g. `seeed` |
+| `MIC_SOURCE` | `console` | `robot` = the console's talk button records the Pi's own mic (the USB webcam's, found automatically; test with `python robot_mic.py`), `console` = the laptop's mic in the browser |
 | `AUDIO_OUTPUT_DEVICE` | ALSA default | `aplay -D` device, e.g. `plughw:0` |
 | `ENABLE_VISION` / `ENABLE_AUDIO` | `1` | Set to `0` to skip a subsystem |
 | `FACE_DETECTION` | `0` | Run MediaPipe face detection and publish `robot/vision/face_error`. Off by default: nothing uses it yet and it costs Pi CPU |

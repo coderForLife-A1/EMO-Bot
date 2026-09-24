@@ -2,6 +2,7 @@
 in-memory audio (#25), HTTPS-only API keys (#21), no transcripts at INFO (#22)."""
 import asyncio
 import io
+import json
 import logging
 import threading
 import wave
@@ -213,3 +214,127 @@ def test_one_shared_local_check(host, local):
 
     assert netutil.is_local_host(host) is local
     assert mqtt_client.is_local_host is netutil.is_local_host is api.is_local_host
+
+
+class RecordingSink(api.LocalSpeaker):
+    def __init__(self):
+        self.events = []
+
+    async def play_wav(self, wav_bytes):
+        raise AssertionError("typed questions must never play audio")
+
+    def event(self, kind, text=""):
+        self.events.append((kind, text))
+
+
+def gemini_client(requests, status=200, text="**Hi!** I'm *EMO*."):
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if status != 200:
+            return httpx.Response(status, json={"error": {"code": status}})
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": text}]}}]})
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+@pytest.fixture
+def gemini(monkeypatch):
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "g-test")
+    monkeypatch.setattr(config, "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
+    monkeypatch.setattr(config, "GEMINI_MODEL", "gemini-test")
+
+    async def no_sleep(_):
+        pass
+    monkeypatch.setattr(api.asyncio, "sleep", no_sleep)
+
+
+def test_ask_shows_gemini_answer_as_plain_text(gemini):
+    requests, sink = [], RecordingSink()
+
+    async def main():
+        async with gemini_client(requests) as client:
+            return await api.handle_ask(client, "hello", sink)
+
+    assert asyncio.run(main()) is True
+    assert requests[0].url.path.endswith("/models/gemini-test:generateContent")
+    assert requests[0].headers["x-goog-api-key"] == "g-test"
+    assert ("heard", "hello") in sink.events
+    assert ("reply", "Hi! I'm EMO.") in sink.events
+    assert sink.events[-1] == ("idle", "")
+
+
+def test_ask_preset_example_falls_back_to_canned_answer(gemini):
+    requests, sink = [], RecordingSink()
+    question = next(iter(api.EXAMPLES))
+
+    async def main():
+        async with gemini_client(requests, status=503) as client:
+            return await api.handle_ask(client, question, sink)
+
+    assert asyncio.run(main()) is True
+    assert len(requests) == 2  # one retry on 503
+    assert ("reply", api.EXAMPLES[question]) in sink.events
+
+
+def test_ask_free_question_shows_error_when_gemini_fails(gemini):
+    requests, sink = [], RecordingSink()
+
+    async def main():
+        async with gemini_client(requests, status=403) as client:
+            return await api.handle_ask(client, "what's the weather?", sink)
+
+    assert asyncio.run(main()) is False
+    assert len(requests) == 1
+    assert any(kind == "error" and "403" in text for kind, text in sink.events)
+
+
+def test_ask_job_releases_busy_after_answer(gemini):
+    requests, sink, busy = [], RecordingSink(), threading.Event()
+    busy.set()
+
+    async def main():
+        queue = asyncio.Queue()
+        await queue.put((api.ASK_JOB, "hello"))
+        async with gemini_client(requests) as client:
+            task = asyncio.create_task(api.api_routing_task(queue, busy_event=busy, client=client, sink=sink))
+            await queue.join()
+            task.cancel()
+
+    asyncio.run(main())
+    assert not busy.is_set()
+
+
+def test_heard_speech_shows_transcript_and_answer_without_audio(gemini, monkeypatch):
+    monkeypatch.setattr(config, "OPENAI_API_KEY", "")
+    requests, sink = [], RecordingSink()
+    reply = '{"heard": "what is the capital of Japan", "reply": "It is **Tokyo**."}'
+
+    async def main():
+        queue = asyncio.Queue()
+        await queue.put((api.LISTEN_JOB, wav_bytes()))
+        async with gemini_client(requests, text=reply) as client:
+            task = asyncio.create_task(api.api_routing_task(queue, client=client, sink=sink))
+            await queue.join()
+            task.cancel()
+
+    asyncio.run(main())
+    body = json.loads(requests[0].content)
+    assert body["contents"][0]["parts"][0]["inlineData"]["mimeType"] == "audio/wav"
+    assert body["generationConfig"]["responseMimeType"] == "application/json"
+    assert ("heard", "what is the capital of Japan") in sink.events
+    assert ("reply", "It is Tokyo.") in sink.events
+
+
+def test_heard_silence_is_an_error_not_a_question(gemini):
+    requests, sink = [], RecordingSink()
+
+    async def main():
+        async with gemini_client(requests, text='{"heard": "", "reply": "Hello?"}') as client:
+            return await api.handle_heard(client, wav_bytes(), sink)
+
+    assert asyncio.run(main()) is False
+    assert any(kind == "error" and "didn't catch" in text for kind, text in sink.events)
+    assert not any(kind == "reply" for kind, _ in sink.events)
+
+
+def test_whisper_path_still_used_when_voice_keys_are_set(gemini, env):
+    assert not api.listen_with_gemini()
