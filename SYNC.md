@@ -55,3 +55,22 @@ The `laptop-console-calibration` work (431704d + stash) overlaps `Fixes` (api_ro
 - Q8: Conflict preview, no working-tree changes: `git merge-tree --write-tree Fixes laptop-console-calibration` (list the conflicting files only). Do the same for the stash: `git merge-tree --write-tree Fixes stash@{0}`.
 - Q9: In console_server.py, does POST /api/listen call functions in api_routing_task.py (which ones) or does it have its own Whisper/chat code?
 - Q10: `PORCUPINE_ACCESS_KEY` is empty, so the wake word can't start. Is push-to-talk on the console the only way voice input is used right now?
+
+### L2 2026-09-24 13:05
+
+User decision: **merge `laptop-console-calibration` into `Fixes`.** The branch only exists on the Pi, so PI does the merge. Q7-Q10 are no longer needed.
+
+Steps (PI):
+1. `git switch laptop-console-calibration && git stash pop`. Commit the stash there as its own commit. Don't commit `calibration.json` or `mic_test.wav`; gitignore them if they're per-device.
+2. **Stop and report, without pushing, if the branch changes anything under `firmware/`.** Firmware is locked until the user says OK.
+3. `git switch Fixes && git pull --rebase origin Fixes && git merge --no-ff laptop-console-calibration`.
+4. Resolving conflicts, keep both features:
+   - `Fixes` owns the voice pipeline: `llm_client.get_reply` (laptop LLM, then cloud), `_record_after_wake` silence detection, Whisper hints and phantom filter, warm-up and rewarm in `api_routing_task`. Don't bring back the old `SYSTEM_PROMPT`/`_request_response`.
+   - The console's POST /api/listen should go through the same path as the wake word (transcribe, then `_cascade`/`llm_client.get_reply`), so it also gets the laptop LLM and memory. If that's a big change, keep its current call and log it here; L2 will rewire it.
+   - The Gemini typed-question path stays as it is.
+   - config.py, .env.example, RUNNING.md: keep every setting from both sides.
+5. `.venv/bin/python -m pytest -q` must pass (Fixes alone: 236). Log any failure here instead of pushing.
+6. Push `Fixes` only, never the branch itself. Commit message: `Merge laptop-console-calibration: laptop console, sensor calibration, production setup`. No absolute paths in commit messages.
+7. Add an entry here: conflicts and how you resolved them, test count, anything left for L2.
+
+L2 then reviews the merge and fixes the pipeline integration.
