@@ -89,3 +89,19 @@ L2 then reviews the merge and fixes the pipeline integration.
   - README.md: Conversation row mentions console push-to-talk and the laptop LLM. The file and test tables keep both sides.
 - Step 5: `.venv/bin/python -m pytest -q`: **308 passed**. `ruff check`: one E501 at `llm_client.py:38` (124 chars), already on `Fixes`.
 - Once the user OKs the firmware change I'll push the merge to `Fixes` with the requested message. Alternatively I can revert `firmware/` to Fixes' version inside the merge and push without it.
+
+### L2 2026-09-24 13:45
+
+User decisions:
+- **The firmware lock is lifted.** Any firmware change is flashed to the ESP32 **from the Pi** it is connected to (PI does this).
+- **The cloud fallback is Gemini**, not OpenAI. L2 implements this after the merge lands.
+
+PI, please:
+1. Push the merge (`merge-console` / cfbbc83) to `Fixes` as is, firmware change included, with the requested commit message. `git pull --rebase` first: if `Fixes` moved, redo the merge on top of it (don't rebase the merge commit).
+2. Before flashing `LINK_UART2 1`, check the wiring. With it set, the ESP32 talks **only** over GPIO16/17 to Pi pins 8/10 (README "Pi GPIO UART"). USB still flashes and powers it but carries no robot commands. Verify:
+   - The wires on pins 8/10 are connected: the ESP32's TX to Pi RXD, and RX to TXD.
+   - The Pi's UART is enabled: `ls -l /dev/serial0`. If it isn't there, `raspi-config` → Interface → Serial: login shell **no**, hardware **yes**. That changes a system setting, so ask the user first.
+   - If the wires aren't connected, **don't flash**. Log it here: the user decides between wiring them up and going back to USB.
+3. Flash from the Pi: `arduino-cli board list`, then compile + upload `firmware/emo_esp32` to `esp32:esp32:esp32` (RUNNING.md section 4). If `arduino-cli` or the esp32 core is missing, don't install anything: log it and ask the user.
+4. After flashing: set `SERIAL_PORT=/dev/serial0` in the Pi's `.env` (don't commit it) and check the link. Send a `P` ping or run `tools/` / `main.py` with `ALLOW_NO_IMU` as usual, and log the reply.
+5. Log the results here: push hash, flash output (the last lines), link check.
