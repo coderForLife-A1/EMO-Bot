@@ -21,7 +21,7 @@ through a PCA9685 and reads the VL53L0X time-of-flight distance sensor.
 | Walks and turns | Sinusoidal gait on hips and knees; turning uses different stride lengths per leg |
 | Stays safe | Servos switch off if it falls past 45°, it stops walking if the Pi goes quiet, walks are time-limited, latched E-stop |
 | Posture reminders | Camera + MediaPipe pose; after 3 s of slouching it does a knee bob and says a reminder |
-| Conversation | "Porcupine" wake word → Whisper → GPT → ElevenLabs; the robot stands still while talking |
+| Conversation | "Porcupine" wake word → Whisper → reply (laptop LLM over Wi-Fi, cloud GPT as fallback) → ElevenLabs; the robot stands still while talking |
 | Measures distance | VL53L0X time-of-flight sensor on the ESP32's I2C bus; `distance` on MQTT publishes it in mm on `robot/sensor/distance` |
 | Remote control | Everything is driven over MQTT (`robot/locomotion/cmd`, `robot/error`, ...) |
 
@@ -63,7 +63,8 @@ keeps the robot safe even if the Pi stalls.
 | `serial_module.py` | **Link to the ESP32 (or Nano).** Opens the serial port (or `socket://` for the simulator), waits for the `READY` banner, sends one command at a time and matches each ACK/NACK to its command, gives the E-stop priority, forwards events (`EVT,FALLEN`) and telemetry, detects controller resets, parks the servos on shutdown and reconnects forever. `SERIAL_PORT=sim` only logs commands. |
 | `vision_posture_module.py` | **Camera vision.** MediaPipe pose estimation decides good or poor posture relative to your own upright baseline and publishes `POSTURE_POOR` / `POSTURE_OK`. Reopens the camera if it drops out and publishes `robot/vision/state` `UP`/`DOWN`. Face detection is optional (`FACE_DETECTION=1`). Supports the Pi CSI camera (Picamera2), USB cameras and laptop webcams. Runs standalone. |
 | `audio_trigger_task.py` | **Wake word.** Porcupine listens for the wake word, then records 5 s of speech and hands it to the speech pipeline. Ignores its own voice while replying. Runs standalone to test the microphone. |
-| `api_routing_task.py` | **Speech pipeline.** Whisper (speech → text) → GPT (reply) → ElevenLabs (text → speech) → speaker. Also speaks the robot's cues ("I fell over"). Plays a fallback beep on any failure. `python api_routing_task.py "Hello"` checks keys and speaker. |
+| `api_routing_task.py` | **Speech pipeline.** Whisper (speech → text) → reply (`llm_client.py`) → ElevenLabs (text → speech) → speaker. Also speaks the robot's cues ("I fell over"). Plays a fallback beep on any failure. `python api_routing_task.py "Hello"` checks keys and speaker. |
+| `llm_client.py` | **Reply model.** `qwen3:4b` on the laptop's Ollama (streamed over Wi-Fi) answers first; if it replies `ESCALATE`, refuses or returns nothing, `gemma4:e4b` is asked; if the laptop can't answer, the cloud `CHAT_MODEL` does. Every prompt carries the current date and time. Reply only: it never controls the robot. |
 
 ### Microcontroller firmware
 
@@ -108,6 +109,7 @@ keeps the robot safe even if the Pi stalls.
 | `tests/test_serial.py` | Reply parsing, `READY` banner, event/telemetry forwarding, queueing, stale commands dropped on reconnect or reset, slow-reply timeouts (incl. `D`), sim mode. |
 | `tests/test_vision.py` | Face selection, posture rules at any distance, personal baseline, alert timing, camera pacing between pose frames (no busy loop). |
 | `tests/test_api_routing.py` | The speech pipeline against a mocked HTTP server: WAV output, timeouts, missing keys, fallback, phrase cache, HTTPS-only API keys (cached phrases still play). |
+| `tests/test_llm_client.py` | Reply model against a mocked Ollama/OpenAI server: escalation, early stream cut, cloud fallback (unreachable, timeout, model error), date/time in the prompt, LAN-only plain HTTP, conversation logging switch. |
 | `tests/test_main.py` | The whole runtime starts without hardware and stands the legs up. |
 | `tests/test_round2_misc.py` | Round-2 review checks that span modules: MQTT login/TLS, every module using the shared MQTT client, speech cues never evicting a recording, the simulator's private build directory. Round-3 checks: one shared local-host check, broker connection failures logged once per streak. |
 | `tests/conftest.py` | pytest setup that makes the modules importable. |

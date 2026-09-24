@@ -74,13 +74,29 @@ PORCUPINE_KEYWORD_PATH = os.getenv("PORCUPINE_KEYWORD_PATH", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o")  # cloud reply model: the fallback when the laptop LLM is set
+
+# Reply model on the laptop's Ollama, e.g. http://192.168.43.20:11434 (llm_client.py).
+# Empty = skip it and always use CHAT_MODEL. Plain http is allowed only to a LAN address; Ollama gets no API key.
+LOCAL_LLM_URL = os.getenv("LOCAL_LLM_URL", "").strip()
+LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "").strip() or "qwen3:4b"
+# Asked when LOCAL_LLM_MODEL is unsure; "off" = go straight to CHAT_MODEL instead
+_escalate = os.getenv("LOCAL_LLM_ESCALATE_MODEL", "").strip() or "gemma4:e4b"
+LOCAL_LLM_ESCALATE_MODEL = "" if _escalate.lower() in {"off", "none", "0"} else _escalate
+LOCAL_LLM_CONNECT_TIMEOUT = _env_float("LOCAL_LLM_CONNECT_TIMEOUT", 1.0)  # laptop unreachable -> cloud quickly
+LOCAL_LLM_TIMEOUT = _env_float("LOCAL_LLM_TIMEOUT", 5.0)  # longest wait for the next piece of a reply
+LOCAL_LLM_KEEP_ALIVE = os.getenv("LOCAL_LLM_KEEP_ALIVE", "").strip() or "30m"  # keep the model loaded on the laptop
+
+# Told to the reply model with the date and time, e.g. "Chennai, India"; empty = not mentioned
+ROBOT_LOCATION = os.getenv("ROBOT_LOCATION", "").strip()
+# 1 = log what the user said and the reply at INFO (they land in the system journal); 0 = DEBUG only
+LOG_CONVERSATIONS = _env_bool("LOG_CONVERSATIONS", False)
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_TTS_URL = os.getenv("ELEVENLABS_TTS_URL", "https://api.elevenlabs.io/v1/text-to-speech")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 
-# Budget for the whole Whisper -> LLM -> TTS cascade (playback is not included)
+# Budget for the whole Whisper -> LLM (all tiers) -> TTS cascade (playback is not included)
 API_TIMEOUT_SECONDS = _env_float("API_TIMEOUT_SECONDS", 15.0)
 
 NETWORK_ERROR_FILE = REPO_ROOT / "assets" / "network_error.wav"

@@ -1,4 +1,5 @@
-"""Cloud speech pipeline: Whisper (speech to text) -> GPT (reply) -> ElevenLabs (text to speech) -> aplay.
+"""Speech pipeline: Whisper (speech to text) -> reply (llm_client: laptop LLM, cloud fallback)
+-> ElevenLabs (text to speech) -> aplay.
 
 Also speaks short cues from the behavior tree ("I fell over", posture reminder), caching them.
 On any failure it plays assets/network_error.wav. Test keys and speaker with
@@ -12,12 +13,12 @@ import sys
 import threading
 import wave
 from typing import Optional
-from urllib.parse import urlsplit
 
 import httpx
 
 import config
-from netutil import is_local_host
+import llm_client
+from netutil import is_local_host, require_https  # noqa: F401 - is_local_host re-exported for tests
 
 logger = logging.getLogger(__name__)
 
@@ -29,29 +30,11 @@ SAY_JOB = "say"  # (SAY_JOB, text): speak a fixed phrase (behavior tree cues)
 TTS_OUTPUT_FORMAT = "pcm_16000"
 TTS_SAMPLE_RATE = 16_000
 
-SYSTEM_PROMPT = (
-    "You are a concise, helpful assistant inside a desktop companion robot. "
-    "Respond in one or two short sentences."
-)
-
 _phrase_cache: dict[str, bytes] = {}
 
 
 def _missing_keys() -> list[str]:
     return [name for name in ("OPENAI_API_KEY", "ELEVENLABS_API_KEY") if not getattr(config, name)]
-
-
-def require_https(url: str) -> None:
-    """API keys go in request headers: refuse plain HTTP unless the server is on this machine.
-
-    Called right before each request, so cached phrases (which send nothing) are never blocked.
-    """
-    parts = urlsplit(url)
-    if parts.scheme == "https":
-        return
-    if parts.scheme == "http" and is_local_host(parts.hostname):
-        return
-    raise RuntimeError(f"refusing to send API keys to {parts.scheme}://{parts.hostname}: use https")
 
 
 async def _transcribe(client: httpx.AsyncClient, wav_bytes: bytes) -> str:
@@ -67,28 +50,6 @@ async def _transcribe(client: httpx.AsyncClient, wav_bytes: bytes) -> str:
     if not text:
         raise RuntimeError("Whisper returned empty text")
     return text
-
-
-async def _request_response(client: httpx.AsyncClient, transcript: str) -> str:
-    require_https(config.OPENAI_BASE_URL)
-    response = await client.post(
-        f"{config.OPENAI_BASE_URL}/chat/completions",
-        headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
-        json={
-            "model": config.CHAT_MODEL,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": transcript},
-            ],
-            "temperature": 0.6,
-            "max_tokens": 100,
-        },
-    )
-    response.raise_for_status()
-    response_text = str(response.json()["choices"][0]["message"]["content"]).strip()
-    if not response_text:
-        raise RuntimeError(f"{config.CHAT_MODEL} returned empty text")
-    return response_text
 
 
 def pcm_to_wav(pcm: bytes, sample_rate: int = TTS_SAMPLE_RATE) -> bytes:
@@ -152,9 +113,11 @@ async def _play_fallback() -> None:
 
 async def _cascade(client: httpx.AsyncClient, wav_bytes: bytes) -> bytes:
     transcript = await _transcribe(client, wav_bytes)
-    logger.debug("Heard: %r", transcript)  # DEBUG: keep conversations out of the system journal
-    response_text = await _request_response(client, transcript)
-    logger.debug("Replying: %r", response_text)
+    response_text, model = await llm_client.get_reply(client, transcript)
+    logger.info("Reply from %s", model)
+    # Conversation text stays out of the system journal unless LOG_CONVERSATIONS=1
+    log_level = logging.INFO if config.LOG_CONVERSATIONS else logging.DEBUG
+    logger.log(log_level, "Heard %r, replying %r", transcript, response_text)
     return await _synthesize(client, response_text)
 
 

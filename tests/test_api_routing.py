@@ -30,6 +30,7 @@ def env(monkeypatch):
     monkeypatch.setattr(config, "ELEVENLABS_API_KEY", "el-test")
     monkeypatch.setattr(config, "OPENAI_BASE_URL", "https://api.openai.com/v1")
     monkeypatch.setattr(config, "ELEVENLABS_TTS_URL", "https://api.elevenlabs.io/v1/text-to-speech")
+    monkeypatch.setattr(config, "LOCAL_LLM_URL", "")  # cloud reply path; the laptop LLM is in test_llm_client.py
     api._phrase_cache.clear()
     played = []  # (source, data): source "-" means WAV bytes piped to aplay's stdin
 

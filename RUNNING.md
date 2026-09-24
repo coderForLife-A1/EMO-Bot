@@ -350,7 +350,13 @@ access once.
 | `PORCUPINE_ACCESS_KEY` | – | Free key at [console.picovoice.ai](https://console.picovoice.ai). Without it, wake word is disabled |
 | `PORCUPINE_KEYWORD_PATH` | *(built-in "porcupine")* | Custom `.ppn` wake word (Linux aarch64 build for the Pi) |
 | `ELEVENLABS_VOICE_ID` | `EXAVITQu4vr4xnSDxMaL` | Any voice ID from your ElevenLabs library |
-| `CHAT_MODEL` / `WHISPER_MODEL` | `gpt-4o` / `whisper-1` | |
+| `CHAT_MODEL` / `WHISPER_MODEL` | `gpt-4o` / `whisper-1` | `CHAT_MODEL` is the cloud reply model: the fallback when `LOCAL_LLM_URL` is set |
+| `LOCAL_LLM_URL` | empty | Laptop Ollama, e.g. `http://192.168.43.20:11434` (section 7a). Empty = cloud replies only |
+| `LOCAL_LLM_MODEL` / `LOCAL_LLM_ESCALATE_MODEL` | `qwen3:4b` / `gemma4:e4b` | Second model is asked when the first is unsure; `off` = go to the cloud instead |
+| `LOCAL_LLM_CONNECT_TIMEOUT` / `LOCAL_LLM_TIMEOUT` | `1` / `5` | Seconds: to connect, and longest wait for the next piece of a reply. Past either, the cloud answers |
+| `LOCAL_LLM_KEEP_ALIVE` | `30m` | How long Ollama keeps the model loaded |
+| `ROBOT_LOCATION` | empty | Told to the model with the date and time, e.g. `Chennai, India` |
+| `LOG_CONVERSATIONS` | `0` | `1` = log what was said and the reply at INFO (they land in the journal) |
 | `OPENAI_BASE_URL`, `ELEVENLABS_TTS_URL` | official endpoints | Change for a proxy / compatible API |
 | `API_TIMEOUT_SECONDS` | `15` | Budget for Whisper → LLM → TTS; playback isn't counted |
 | `CAMERA_SOURCE` | `/dev/video0` | `picamera2` (Pi 5 CSI camera), `/dev/video0` (USB), `0` (laptop webcam) |
@@ -364,6 +370,23 @@ access once.
 | `MQTT_TLS` / `MQTT_CA_CERTS` | `0` / empty | Connect with TLS; CA file for a self-signed broker certificate |
 
 Never commit `.env` (it is in `.gitignore`).
+
+### 7a. Laptop LLM over Wi-Fi (optional)
+
+The reply model runs on a laptop with Ollama; the Pi streams replies from it over a shared network (for example
+a phone hotspot). Speech to text stays on the cloud API.
+
+1. Laptop: `ollama pull qwen3:4b` and `ollama pull gemma4:e4b`.
+2. Laptop: `setx OLLAMA_HOST 0.0.0.0:11434`, then quit and restart Ollama so it listens on the network.
+3. Laptop: set the hotspot network to **Private** in Windows, and allow TCP 11434 only from the hotspot's subnet
+   (Ollama has no login: anyone who can reach the port can use it). Admin PowerShell, for a `192.168.43.x` hotspot:
+   `New-NetFirewallRule -DisplayName "Ollama (robot)" -Direction Inbound -Protocol TCP -LocalPort 11434 -RemoteAddress 192.168.43.0/24 -Profile Private -Action Allow`
+4. Pi: `curl http://<laptop-ip>:11434/api/tags` should list the models.
+5. Pi `.env`: `LOCAL_LLM_URL=http://<laptop-ip>:11434`.
+6. Pi: set the timezone (`sudo timedatectl set-timezone Asia/Kolkata`); the model is told the Pi's local time.
+
+A phone hotspot may hand out a new IP on reconnect. If the laptop can't be reached the cloud model answers,
+so nothing breaks; update `LOCAL_LLM_URL` (or use `http://<laptop-name>.local:11434` if mDNS resolves on the Pi).
 
 ---
 
@@ -599,4 +622,5 @@ A remote *Python* client using this repo's code sets `MQTT_HOST=<pi-address>`, `
 
 The API keys in `.env` are only ever sent over HTTPS: an `http://` `OPENAI_BASE_URL` or `ELEVENLABS_TTS_URL`
 is refused unless it points at this machine (`localhost` or any loopback address). Cached phrases need no
-request, so they still play.
+request, so they still play. `LOCAL_LLM_URL` gets no API key; it may use plain `http://` only to a private-network
+IP or a `.local` name, so a transcript never crosses the internet unencrypted.
