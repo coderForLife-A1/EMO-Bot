@@ -13,3 +13,4 @@ opencv-contrib-python>=4.8,<5
 mediapipe==0.10.18
 pvporcupine>=3.0
 sounddevice>=0.4.6
+
